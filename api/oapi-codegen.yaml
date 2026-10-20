@@ -1,0 +1,7 @@
+package: gen
+generate:
+  models: true
+compatibility:
+  always-prefix-enum-values: true
+output-options:
+  skip-prune: true

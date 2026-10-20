@@ -46,6 +46,7 @@ const (
 	CodeMethodNotAllowed     Code = "ZS-1008"
 	CodePayloadTooLarge      Code = "ZS-1009"
 	CodeUnsupportedMediaType Code = "ZS-1010"
+	CodeReasonRequired       Code = "ZS-1011"
 
 	CodeDatabaseUnavailable         Code = "ZS-1100"
 	CodeNotReady                    Code = "ZS-1101"
@@ -72,6 +73,7 @@ const (
 	CodeBrandApplyRejected   Code = "ZS-1501"
 	CodeBrandApplyInProgress Code = "ZS-1502"
 	CodeSecretUnresolved     Code = "ZS-1503"
+	CodeSecretRefInvalid     Code = "ZS-1504"
 )
 
 var definitions = []Definition{
@@ -86,6 +88,7 @@ var definitions = []Definition{
 	{CodeMethodNotAllowed, "method_not_allowed", http.StatusMethodNotAllowed, false, "The method is not allowed for this resource."},
 	{CodePayloadTooLarge, "payload_too_large", http.StatusRequestEntityTooLarge, false, "The request body is too large."},
 	{CodeUnsupportedMediaType, "unsupported_media_type", http.StatusUnsupportedMediaType, false, "The request content type is not supported."},
+	{CodeReasonRequired, "reason_required", http.StatusBadRequest, false, "This change requires a reason."},
 	{CodeDatabaseUnavailable, "database_unavailable", http.StatusServiceUnavailable, true, "The database is unavailable."},
 	{CodeNotReady, "not_ready", http.StatusServiceUnavailable, true, "The service is not ready."},
 	{CodeIdentityProviderUnavailable, "identity_provider_unavailable", http.StatusServiceUnavailable, true, "The identity provider is unavailable."},
@@ -107,6 +110,7 @@ var definitions = []Definition{
 	{CodeBrandApplyRejected, "brand_apply_rejected", http.StatusUnprocessableEntity, false, "An engine rejected part of the brand manifest."},
 	{CodeBrandApplyInProgress, "brand_apply_in_progress", http.StatusConflict, true, "Another apply of this brand is in progress."},
 	{CodeSecretUnresolved, "secret_unresolved", http.StatusUnprocessableEntity, false, "A secret reference in the brand manifest could not be resolved."},
+	{CodeSecretRefInvalid, "secret_ref_invalid", http.StatusUnprocessableEntity, false, "A secret reference in the brand manifest is outside the brand's namespace."},
 }
 
 var byCode = func() map[Code]Definition {

@@ -1,0 +1,100 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/zsoftly/zs-core/internal/config"
+	"github.com/zsoftly/zs-core/internal/httpapi"
+	"github.com/zsoftly/zs-core/internal/keycloak"
+	"github.com/zsoftly/zs-core/internal/killbill"
+	"github.com/zsoftly/zs-core/internal/secrets"
+	"github.com/zsoftly/zs-core/migrations"
+	"github.com/zsoftly/zs-core/pkg/brand"
+	"github.com/zsoftly/zs-core/pkg/identity"
+)
+
+// brandRegistryTTL is how long serve caches the applied brands.
+const brandRegistryTTL = 30 * time.Second
+
+// newAPIOptions wires token verification and brand apply for serve.
+// ZS_KEYCLOAK_URL is required: without it no token can be verified. The
+// admin settings are optional; without them POST /v1/brands/{id}/apply
+// answers 503.
+func newAPIOptions(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, log *slog.Logger) (httpapi.Options, error) {
+	if cfg.KeycloakURL == "" {
+		return httpapi.Options{}, errors.New("serve requires ZS_KEYCLOAK_URL to verify tokens")
+	}
+	registry := brand.NewRegistry(pool, brandRegistryTTL, log)
+	resolver := secrets.Default{Dir: cfg.SecretsDir}
+	opts := httpapi.Options{
+		DB:         pool,
+		Migrations: migrations.FS,
+		Logger:     log,
+		Verifier:   &identity.Verifier{Brands: registry, Keys: keycloak.NewKeySet(cfg.KeycloakURL, keycloak.KeySetOptions{})},
+		Brands:     registry,
+		BrandDeps:  brand.Deps{Secrets: resolver},
+		BrandsDir:  cfg.BrandsDir,
+	}
+	if kc, err := newKeycloak(cfg); err == nil {
+		opts.BrandDeps.Keycloak = kc
+	}
+	if kb, err := newKillBill(cfg); err == nil {
+		opts.BrandDeps.KillBill = kb
+	}
+	if cfg.BrandsDir != "" {
+		if err := checkBrandsDir(ctx, cfg.BrandsDir, resolver, pool, log); err != nil {
+			return httpapi.Options{}, err
+		}
+	}
+	return opts, nil
+}
+
+// checkBrandsDir validates every manifest in dir, including its secret
+// namespaces, and compares it with what was last applied. An invalid
+// manifest stops the start; a manifest that differs from the applied one is
+// reported, because apply stays an explicit step.
+func checkBrandsDir(ctx context.Context, dir string, refs brand.SecretRefChecker, pool *pgxpool.Pool, log *slog.Logger) error {
+	manifests, err := brand.LoadDir(dir)
+	if err != nil {
+		return fmt.Errorf("ZS_BRANDS_DIR: %w", err)
+	}
+	for _, m := range manifests {
+		if err := m.CheckSecretRefs(refs); err != nil {
+			return fmt.Errorf("ZS_BRANDS_DIR: %s: %w", m.Slug, err)
+		}
+	}
+	for _, m := range manifests {
+		rec, err := brand.GetBySlug(ctx, pool, m.Slug)
+		switch {
+		case errors.Is(err, brand.ErrNotFound):
+			log.Warn("brand manifest is not applied; its tokens are refused until `zs-core brand apply` runs", "brand", m.Slug)
+		case err != nil:
+			return fmt.Errorf("check brand %s: %w", m.Slug, err)
+		case rec.AppliedAt.IsZero():
+			log.Warn("brand apply did not complete; run `zs-core brand apply` again", "brand", m.Slug)
+		case rec.ManifestDigest != m.Digest():
+			log.Warn("brand manifest differs from the applied one; tokens are verified against the applied manifest until it is applied",
+				"brand", m.Slug, "applied_digest", rec.ManifestDigest, "file_digest", m.Digest())
+		default:
+			log.Info("brand manifest matches the applied one", "brand", m.Slug, "digest", m.Digest())
+		}
+	}
+	return nil
+}
+
+func newKeycloak(cfg config.Config) (*keycloak.Client, error) {
+	return keycloak.New(keycloak.Config{
+		URL: cfg.KeycloakURL, AdminUser: cfg.KeycloakAdminUser, AdminPassword: cfg.KeycloakAdminPassword,
+		AdminClientID: cfg.KeycloakAdminClientID, AdminClientSecret: cfg.KeycloakAdminClientSecret,
+	})
+}
+
+func newKillBill(cfg config.Config) (*killbill.Client, error) {
+	return killbill.New(killbill.Config{URL: cfg.KillBillURL, AdminUser: cfg.KillBillAdminUser, AdminPassword: cfg.KillBillAdminPassword})
+}

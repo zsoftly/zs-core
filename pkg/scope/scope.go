@@ -87,6 +87,23 @@ func WithContext(ctx context.Context, s Scope) context.Context {
 	return context.WithValue(ctx, contextKey{}, s)
 }
 
+// WithBrand returns a context carrying a brand-level scope: the brand is set
+// and the tenant is not. Tenant-owned queries refuse such a scope, so a
+// brand-level route cannot reach tenant rows by accident.
+func WithBrand(ctx context.Context, brand idgen.UUID) context.Context {
+	return WithContext(ctx, Scope{Brand: brand})
+}
+
+// BrandFromContext returns the brand of the scope in ctx, whether or not a
+// tenant is set. It returns ErrMissing when no brand is present.
+func BrandFromContext(ctx context.Context) (idgen.UUID, error) {
+	s, ok := ctx.Value(contextKey{}).(Scope)
+	if !ok || s.Brand.IsNil() {
+		return idgen.Nil, ErrMissing
+	}
+	return s.Brand, nil
+}
+
 // FromContext returns the scope stored in ctx. It returns ErrMissing when no
 // complete scope is present.
 func FromContext(ctx context.Context) (Scope, error) {

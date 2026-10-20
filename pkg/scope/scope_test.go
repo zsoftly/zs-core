@@ -77,3 +77,18 @@ func TestContext(t *testing.T) {
 		t.Fatalf("FromContext = %v, %v", got, err)
 	}
 }
+
+func TestBrandLevelScope(t *testing.T) {
+	brand := idgen.MustNewV7()
+	ctx := WithBrand(context.Background(), brand)
+	got, err := BrandFromContext(ctx)
+	if err != nil || got != brand {
+		t.Fatalf("BrandFromContext = %v, %v", got, err)
+	}
+	if _, err := FromContext(ctx); err != ErrMissing {
+		t.Fatalf("a brand-level scope must not satisfy FromContext: %v", err)
+	}
+	if _, err := BrandFromContext(context.Background()); err != ErrMissing {
+		t.Fatalf("empty context: %v", err)
+	}
+}

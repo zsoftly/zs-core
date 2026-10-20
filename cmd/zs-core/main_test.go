@@ -29,9 +29,9 @@ func TestRunUsageAndConfigErrors(t *testing.T) {
 	}
 	errOut.Reset()
 	if code := run([]string{"serve"}, []string{"ZS_DATABASE_URL=postgres://u:pw-123@db/x", "ZS_DEV_TRUSTED_SCOPE_HEADERS=true", "ZS_LISTEN_ADDR=0.0.0.0:8080"}, &out, &errOut); code != 2 {
-		t.Fatalf("trusted headers on a public address: exit %d", code)
+		t.Fatalf("removed trusted-header flag: exit %d", code)
 	}
-	if !strings.Contains(errOut.String(), "loopback") || strings.Contains(errOut.String(), "pw-123") {
+	if !strings.Contains(errOut.String(), "ZS_DEV_TRUSTED_SCOPE_HEADERS is not a known variable") || strings.Contains(errOut.String(), "pw-123") {
 		t.Fatalf("config error = %q", errOut.String())
 	}
 }
@@ -175,5 +175,17 @@ func TestDoctorExitCodeTreatsSkipsAsFailureUnlessAllowed(t *testing.T) {
 	}
 	if code := doctorExitCode(doctor.Report{}, false); code != 0 {
 		t.Fatalf("clean report: exit %d", code)
+	}
+}
+
+func TestGrantRevokeUsage(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := run([]string{"grant", "remove", "--brand", "zs-reference"}, nil, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "grant revoke") {
+		t.Fatalf("unknown subcommand: %d %q", code, errOut.String())
+	}
+	errOut.Reset()
+	args := []string{"grant", "revoke", "--brand", "zs-reference", "--subject", "s1", "--scope", "operator", "--operator", "ops"}
+	if code := run(args, nil, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "grant revoke: --subject, --scope, --reason and --operator are required") {
+		t.Fatalf("revoke without a reason: %d %q", code, errOut.String())
 	}
 }

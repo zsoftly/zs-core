@@ -3,12 +3,15 @@
 // Every write in ZSoftly Core appends one audit event in the same transaction
 // as the change, with the actor, brand, tenant, action, reason, outcome and a
 // correlation ID. The table rejects UPDATE, DELETE and TRUNCATE, so a
-// correction is a new event. Queries are always scoped to one brand and one
-// tenant and are paginated with an opaque cursor, newest first.
+// correction is a new event. Tenant events are written and queried with a
+// full brand and tenant scope. Brand events, such as a brand apply or a staff
+// grant, belong to one brand and no tenant, and have their own write and
+// query. Queries are paginated with an opaque cursor, newest first.
 package audit
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -43,6 +46,8 @@ const (
 	MaxCorrelationIDLength = 128
 	// MaxActorIDLength caps the actor ID in bytes.
 	MaxActorIDLength = 255
+	// MaxDetailsBytes caps the encoded details of one event.
+	MaxDetailsBytes = 64 << 10
 )
 
 // Entry is what a caller records.
@@ -54,19 +59,23 @@ type Entry struct {
 	CorrelationID string
 	// OccurredAt defaults to the current time.
 	OccurredAt time.Time
+	// Details is optional structured detail, such as a diff. It must never
+	// hold secrets.
+	Details map[string]any
 }
 
 // Event is a stored audit event.
 type Event struct {
 	ID            string
 	BrandID       string
-	TenantID      string
+	TenantID      string // empty for a brand event
 	Actor         events.Actor
 	Action        string
 	Reason        string
 	Outcome       Outcome
 	CorrelationID string
 	OccurredAt    time.Time
+	Details       map[string]any
 }
 
 func invalid(message string) error {
@@ -94,17 +103,51 @@ func (e Entry) Validate() error {
 	return nil
 }
 
+func encodeDetails(details map[string]any) (any, error) {
+	if details == nil {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(details)
+	if err != nil {
+		return nil, invalid("The audit details are not valid JSON.")
+	}
+	if len(encoded) > MaxDetailsBytes {
+		return nil, invalid("The audit details are too large.")
+	}
+	return encoded, nil
+}
+
 const insertSQL = `
 INSERT INTO audit_events (
-    brand_id, tenant_id, id, actor_type, actor_id, action, reason, outcome, correlation_id, occurred_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+    brand_id, tenant_id, id, actor_type, actor_id, action, reason, outcome, correlation_id, occurred_at, details
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
 
 // Write appends entry in tx under scope s and returns the stored event.
 func Write(ctx context.Context, tx pgx.Tx, s scope.Scope, entry Entry) (Event, error) {
+	if err := s.Validate(); err != nil {
+		return Event{}, err
+	}
+	return write(ctx, tx, s.Brand, s.Tenant, entry)
+}
+
+// WriteBrand appends a brand event, one that belongs to brand and to no
+// tenant, in tx.
+func WriteBrand(ctx context.Context, tx pgx.Tx, brand idgen.UUID, entry Entry) (Event, error) {
+	if brand.IsNil() {
+		return Event{}, scope.ErrMissing
+	}
+	return write(ctx, tx, brand, idgen.Nil, entry)
+}
+
+func write(ctx context.Context, tx pgx.Tx, brand, tenant idgen.UUID, entry Entry) (Event, error) {
 	if tx == nil {
 		return Event{}, fmt.Errorf("audit write requires a transaction")
 	}
 	if err := entry.Validate(); err != nil {
+		return Event{}, err
+	}
+	details, err := encodeDetails(entry.Details)
+	if err != nil {
 		return Event{}, err
 	}
 	id, err := idgen.NewV7()
@@ -119,24 +162,27 @@ func Write(ctx context.Context, tx pgx.Tx, s scope.Scope, entry Entry) (Event, e
 	// and the cursor identical to what a later query reads back.
 	occurredAt = occurredAt.UTC().Truncate(time.Microsecond)
 
-	args, err := s.Bind(id, string(entry.Actor.Type), nullable(entry.Actor.ID), entry.Action,
-		nullable(entry.Reason), string(entry.Outcome), entry.CorrelationID, occurredAt)
-	if err != nil {
-		return Event{}, err
+	var tenantArg any
+	tenantID := ""
+	if !tenant.IsNil() {
+		tenantArg = tenant
+		tenantID = idgen.Format(idgen.Tenant, tenant)
 	}
-	if _, err := tx.Exec(ctx, insertSQL, args...); err != nil {
+	if _, err := tx.Exec(ctx, insertSQL, brand, tenantArg, id, string(entry.Actor.Type), nullable(entry.Actor.ID),
+		entry.Action, nullable(entry.Reason), string(entry.Outcome), entry.CorrelationID, occurredAt, details); err != nil {
 		return Event{}, fmt.Errorf("insert audit event: %w", err)
 	}
 	return Event{
 		ID:            idgen.Format(idgen.Audit, id),
-		BrandID:       s.BrandID(),
-		TenantID:      s.TenantID(),
+		BrandID:       idgen.Format(idgen.Brand, brand),
+		TenantID:      tenantID,
 		Actor:         entry.Actor,
 		Action:        entry.Action,
 		Reason:        entry.Reason,
 		Outcome:       entry.Outcome,
 		CorrelationID: entry.CorrelationID,
 		OccurredAt:    occurredAt,
+		Details:       entry.Details,
 	}, nil
 }
 
@@ -177,6 +223,23 @@ type Querier interface {
 
 // Query returns audit events for scope s, newest first.
 func Query(ctx context.Context, db Querier, s scope.Scope, f Filter) (Page, error) {
+	args, err := s.Bind()
+	if err != nil {
+		return Page{}, err
+	}
+	return query(ctx, db, args, "brand_id = $1 AND tenant_id = $2", s.BrandID(), s.TenantID(), f)
+}
+
+// QueryBrand returns the brand events of brand, newest first. Tenant events
+// are never included.
+func QueryBrand(ctx context.Context, db Querier, brand idgen.UUID, f Filter) (Page, error) {
+	if brand.IsNil() {
+		return Page{}, scope.ErrMissing
+	}
+	return query(ctx, db, []any{brand}, "brand_id = $1 AND tenant_id IS NULL", idgen.Format(idgen.Brand, brand), "", f)
+}
+
+func query(ctx context.Context, db Querier, args []any, where, brandID, tenantID string, f Filter) (Page, error) {
 	limit := f.Limit
 	switch {
 	case limit == 0:
@@ -194,14 +257,11 @@ func Query(ctx context.Context, db Querier, s scope.Scope, f Filter) (Page, erro
 		return Page{}, invalid("occurred_after must be earlier than occurred_before.")
 	}
 
-	args, err := s.Bind()
-	if err != nil {
-		return Page{}, err
-	}
 	var sql strings.Builder
-	sql.WriteString(`SELECT id, actor_type, actor_id, action, reason, outcome, correlation_id, occurred_at
+	sql.WriteString(`SELECT id, actor_type, actor_id, action, reason, outcome, correlation_id, occurred_at, details
 FROM audit_events
-WHERE brand_id = $1 AND tenant_id = $2`)
+WHERE `)
+	sql.WriteString(where)
 	add := func(clause string, values ...any) {
 		placeholders := make([]any, len(values))
 		for i, v := range values {
@@ -247,9 +307,10 @@ WHERE brand_id = $1 AND tenant_id = $2`)
 			reason      *string
 			outcome     string
 			eventAction string
+			details     []byte
 			ev          Event
 		)
-		if err := rows.Scan(&id, &actorType, &actorID, &eventAction, &reason, &outcome, &ev.CorrelationID, &ev.OccurredAt); err != nil {
+		if err := rows.Scan(&id, &actorType, &actorID, &eventAction, &reason, &outcome, &ev.CorrelationID, &ev.OccurredAt, &details); err != nil {
 			return Page{}, zserrors.Wrap(zserrors.CodeDatabaseUnavailable, "", err)
 		}
 		if len(page.Events) == limit {
@@ -257,13 +318,18 @@ WHERE brand_id = $1 AND tenant_id = $2`)
 			break
 		}
 		ev.ID = idgen.Format(idgen.Audit, id)
-		ev.BrandID = s.BrandID()
-		ev.TenantID = s.TenantID()
+		ev.BrandID = brandID
+		ev.TenantID = tenantID
 		ev.Actor = events.Actor{Type: events.ActorType(actorType), ID: deref(actorID)}
 		ev.Action = eventAction
 		ev.Reason = deref(reason)
 		ev.Outcome = Outcome(outcome)
 		ev.OccurredAt = ev.OccurredAt.UTC()
+		if len(details) > 0 {
+			if err := json.Unmarshal(details, &ev.Details); err != nil {
+				return Page{}, zserrors.Wrap(zserrors.CodeInternal, "", err)
+			}
+		}
 		page.Events = append(page.Events, ev)
 		lastID = id
 	}

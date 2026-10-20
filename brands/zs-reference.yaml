@@ -1,0 +1,45 @@
+# The reference brand. It matches the zs-reference realm and Kill Bill tenant
+# of the compose stack in deploy/compose. Secrets are references, never
+# values, and every reference of this brand starts with BRAND_ZS_REFERENCE__.
+# BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET holds the value of
+# ZS_STAFF_CLIENT_SECRET. BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET holds
+# the value of KILLBILL_TENANT_API_SECRET in deploy/compose/.env. ssl_required
+# is none for the loopback stack only: the command line warns about it and
+# the HTTP route refuses it. See docs/modules/brands.md.
+schema_version: 1
+slug: zs-reference
+name: ZSoftly reference
+identity:
+  realm: zs-reference
+  display_name: ZSoftly reference
+  login_theme: keycloak.v2
+  email_theme: keycloak
+  locales: [en, fr]
+  default_locale: en
+  ssl_required: none
+  token_lifetimes:
+    access_token_seconds: 300
+    sso_session_idle_seconds: 1800
+    sso_session_max_seconds: 36000
+  mfa: optional
+  required_actions: []
+  customer_client:
+    client_id: zs-customer
+    name: ZSoftly reference customer client
+    redirect_uris: ["http://127.0.0.1/*", "http://localhost/*"]
+    web_origins: ["+"]
+  staff_client:
+    client_id: zs-staff
+    name: ZSoftly reference staff client
+    secret_ref: env://BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET
+    redirect_uris: ["http://127.0.0.1/*", "http://localhost/*"]
+    web_origins: ["+"]
+    service_accounts: true
+billing:
+  killbill_tenant_key: zs-reference
+  killbill_api_secret_ref: env://BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET
+  catalogue: zs-reference/catalogue.xml
+  currencies: [CAD, USD]
+  seller:
+    name: ZSoftly Technologies Inc.
+    country: CA

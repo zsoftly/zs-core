@@ -1,0 +1,581 @@
+// Package brand loads, validates and applies brand manifests.
+//
+// A brand is one product on a Core deployment: one Keycloak realm, one Kill
+// Bill tenant and one manifest, brands/<slug>.yaml, validated against
+// api/schemas/brand-manifest.json. Apply converges both engines towards the
+// manifest and records the brand in Core. It is explicit and idempotent: it
+// computes the desired state, reads the current state, produces a diff,
+// applies that diff, audits every change and returns the diff. Secrets are
+// references that are resolved at apply time and never stored, logged or
+// put in a diff.
+package brand
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
+	"gopkg.in/yaml.v3"
+
+	"github.com/zsoftly/zs-core/api/schemas"
+	"github.com/zsoftly/zs-core/internal/secrets"
+	zserrors "github.com/zsoftly/zs-core/pkg/errors"
+)
+
+// MaxManifestBytes caps the size of a manifest file or request body.
+const MaxManifestBytes = 1 << 20
+
+// MFA policies.
+const (
+	MFAOptional         = "optional"
+	MFARequired         = "required"
+	MFARequiredForStaff = "required_for_staff"
+)
+
+// Manifest is a brand manifest. Field names follow the YAML keys.
+type Manifest struct {
+	SchemaVersion int            `json:"schema_version"`
+	Slug          string         `json:"slug"`
+	Name          string         `json:"name"`
+	Identity      Identity       `json:"identity"`
+	Billing       Billing        `json:"billing"`
+	Notifications *Notifications `json:"notifications,omitempty"`
+	Permissions   []string       `json:"permissions,omitempty"`
+}
+
+// Identity is the Keycloak side of a brand.
+type Identity struct {
+	Realm             string             `json:"realm"`
+	DisplayName       string             `json:"display_name"`
+	LoginTheme        string             `json:"login_theme,omitempty"`
+	EmailTheme        string             `json:"email_theme,omitempty"`
+	Locales           []string           `json:"locales"`
+	DefaultLocale     string             `json:"default_locale"`
+	SSLRequired       string             `json:"ssl_required,omitempty"`
+	TokenLifetimes    *TokenLifetimes    `json:"token_lifetimes,omitempty"`
+	MFA               string             `json:"mfa"`
+	MFAACRValues      []string           `json:"mfa_acr_values,omitempty"`
+	RequiredActions   []string           `json:"required_actions,omitempty"`
+	CustomerClient    CustomerClient     `json:"customer_client"`
+	StaffClient       StaffClient        `json:"staff_client"`
+	ServiceClients    []ServiceClient    `json:"service_clients,omitempty"`
+	IdentityProviders []IdentityProvider `json:"identity_providers,omitempty"`
+}
+
+// TokenLifetimes are realm token and session lifetimes in seconds.
+type TokenLifetimes struct {
+	AccessTokenSeconds    *int `json:"access_token_seconds,omitempty"`
+	SSOSessionIdleSeconds *int `json:"sso_session_idle_seconds,omitempty"`
+	SSOSessionMaxSeconds  *int `json:"sso_session_max_seconds,omitempty"`
+}
+
+// CustomerClient is the public OIDC client customers sign in with.
+type CustomerClient struct {
+	ClientID           string   `json:"client_id"`
+	Name               string   `json:"name,omitempty"`
+	RedirectURIs       []string `json:"redirect_uris"`
+	WebOrigins         []string `json:"web_origins,omitempty"`
+	DirectAccessGrants bool     `json:"direct_access_grants,omitempty"`
+}
+
+// StaffClient is the confidential client staff sign in with.
+type StaffClient struct {
+	ClientID           string   `json:"client_id"`
+	Name               string   `json:"name,omitempty"`
+	SecretRef          string   `json:"secret_ref"`
+	RedirectURIs       []string `json:"redirect_uris"`
+	WebOrigins         []string `json:"web_origins,omitempty"`
+	DirectAccessGrants bool     `json:"direct_access_grants,omitempty"`
+	ServiceAccounts    bool     `json:"service_accounts,omitempty"`
+}
+
+// ServiceClient is a confidential client with a service account.
+type ServiceClient struct {
+	ClientID  string `json:"client_id"`
+	Name      string `json:"name,omitempty"`
+	SecretRef string `json:"secret_ref"`
+}
+
+// IdentityProvider is a brokered provider. Which fields apply depends on
+// Type: google, microsoft, github, oidc or saml.
+type IdentityProvider struct {
+	Alias              string `json:"alias"`
+	Type               string `json:"type"`
+	DisplayName        string `json:"display_name,omitempty"`
+	Enabled            *bool  `json:"enabled,omitempty"`
+	ClientID           string `json:"client_id,omitempty"`
+	ClientSecretRef    string `json:"client_secret_ref,omitempty"`
+	DefaultScopes      string `json:"default_scopes,omitempty"`
+	Issuer             string `json:"issuer,omitempty"`
+	AuthorizationURL   string `json:"authorization_url,omitempty"`
+	TokenURL           string `json:"token_url,omitempty"`
+	JWKSURL            string `json:"jwks_url,omitempty"`
+	IDPEntityID        string `json:"idp_entity_id,omitempty"`
+	SSOURL             string `json:"sso_url,omitempty"`
+	SPEntityID         string `json:"sp_entity_id,omitempty"`
+	NameIDFormat       string `json:"name_id_format,omitempty"`
+	SigningCertificate string `json:"signing_certificate,omitempty"`
+}
+
+// IsEnabled defaults to true.
+func (p IdentityProvider) IsEnabled() bool { return p.Enabled == nil || *p.Enabled }
+
+// Billing is the Kill Bill side of a brand.
+type Billing struct {
+	KillBillTenantKey    string         `json:"killbill_tenant_key"`
+	KillBillAPISecretRef string         `json:"killbill_api_secret_ref"`
+	Catalogue            string         `json:"catalogue,omitempty"`
+	Overdue              string         `json:"overdue,omitempty"`
+	Currencies           []string       `json:"currencies"`
+	Seller               Seller         `json:"seller"`
+	PaymentPlugin        *PaymentPlugin `json:"payment_plugin,omitempty"`
+	InvoicePlugin        *InvoicePlugin `json:"invoice_plugin,omitempty"`
+	Templates            string         `json:"templates,omitempty"`
+}
+
+// Seller is the legal seller of a brand.
+type Seller struct {
+	Name    string `json:"name"`
+	Country string `json:"country"`
+	Address string `json:"address,omitempty"`
+}
+
+// PaymentPlugin names the brand's payment plugin and its configuration.
+type PaymentPlugin struct {
+	Name      string `json:"name"`
+	Version   string `json:"version,omitempty"`
+	ConfigKey string `json:"config_key,omitempty"`
+	ConfigRef string `json:"config_ref"`
+}
+
+// Key is the plugin service name its per-tenant configuration is stored
+// under.
+func (p PaymentPlugin) Key() string {
+	if p.ConfigKey != "" {
+		return p.ConfigKey
+	}
+	return "killbill-" + p.Name
+}
+
+// InvoicePlugin names an invoice plugin, for tax.
+type InvoicePlugin struct {
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+}
+
+// Notifications declares the sender identity and webhook endpoints.
+type Notifications struct {
+	Sender   *Sender   `json:"sender,omitempty"`
+	ReplyTo  string    `json:"reply_to,omitempty"`
+	Webhooks []Webhook `json:"webhooks,omitempty"`
+}
+
+// Sender is the From identity of brand email.
+type Sender struct {
+	Email string `json:"email"`
+	Name  string `json:"name,omitempty"`
+}
+
+// Webhook is an outbound webhook endpoint.
+type Webhook struct {
+	URL       string   `json:"url"`
+	SecretRef string   `json:"secret_ref"`
+	Events    []string `json:"events,omitempty"`
+}
+
+var (
+	schemaOnce sync.Once
+	schema     *jsonschema.Schema
+	schemaErr  error
+)
+
+// refuseLoader stops the schema compiler from fetching anything: the brand
+// manifest schema is self-contained and the 2020-12 meta-schema is built in.
+type refuseLoader struct{}
+
+func (refuseLoader) Load(url string) (any, error) {
+	return nil, fmt.Errorf("schema loading disabled: %s", url)
+}
+
+func compiledSchema() (*jsonschema.Schema, error) {
+	schemaOnce.Do(func() {
+		doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(schemas.BrandManifest))
+		if err != nil {
+			schemaErr = fmt.Errorf("brand manifest schema: %w", err)
+			return
+		}
+		c := jsonschema.NewCompiler()
+		c.DefaultDraft(jsonschema.Draft2020)
+		c.UseLoader(refuseLoader{})
+		if err := c.AddResource(schemas.BrandManifestURL, doc); err != nil {
+			schemaErr = fmt.Errorf("brand manifest schema: %w", err)
+			return
+		}
+		schema, schemaErr = c.Compile(schemas.BrandManifestURL)
+	})
+	return schema, schemaErr
+}
+
+// invalid returns brand_manifest_invalid with the problems in the message.
+// Manifests hold no secret values, so the problems are safe to show.
+func invalid(problems []string) error {
+	sort.Strings(problems)
+	if len(problems) > 20 {
+		problems = append(problems[:20], fmt.Sprintf("and %d more", len(problems)-20))
+	}
+	return zserrors.New(zserrors.CodeBrandManifestInvalid, "The brand manifest is invalid: "+strings.Join(problems, "; ")+".")
+}
+
+// Load reads and validates the manifest at path.
+func Load(path string) (*Manifest, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open brand manifest: %w", err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, MaxManifestBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read brand manifest: %w", err)
+	}
+	return Parse(data)
+}
+
+// Parse decodes a YAML or JSON manifest, validates it against the schema
+// and the rules the schema cannot express, and returns it. Unknown keys,
+// duplicate keys and anything that is not a single document are rejected.
+func Parse(data []byte) (*Manifest, error) {
+	if len(data) > MaxManifestBytes {
+		return nil, invalid([]string{"the manifest is larger than 1 MiB"})
+	}
+	var doc any
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&doc); err != nil {
+		return nil, invalid([]string{"not valid YAML or JSON: " + yamlMessage(err)})
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, invalid([]string{"the file must hold exactly one document"})
+	}
+	// Round-trip through JSON so the schema sees JSON types only.
+	encoded, err := json.Marshal(normalizeYAML(doc))
+	if err != nil {
+		return nil, invalid([]string{"the manifest holds values that are not JSON: " + err.Error()})
+	}
+	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(encoded))
+	if err != nil {
+		return nil, invalid([]string{"not valid JSON"})
+	}
+	sch, err := compiledSchema()
+	if err != nil {
+		return nil, err
+	}
+	if err := sch.Validate(instance); err != nil {
+		var ve *jsonschema.ValidationError
+		if errors.As(err, &ve) {
+			return nil, invalid(schemaProblems(ve))
+		}
+		return nil, invalid([]string{err.Error()})
+	}
+	var m Manifest
+	jd := json.NewDecoder(bytes.NewReader(encoded))
+	jd.DisallowUnknownFields()
+	if err := jd.Decode(&m); err != nil {
+		return nil, invalid([]string{err.Error()})
+	}
+	if err := m.Validate(); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func yamlMessage(err error) string {
+	msg := strings.TrimPrefix(err.Error(), "yaml: ")
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	return msg
+}
+
+// normalizeYAML turns the map[string]any and map[any]any values yaml.v3 can
+// produce into JSON-encodable maps.
+func normalizeYAML(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = normalizeYAML(val)
+		}
+		return out
+	case map[any]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[fmt.Sprint(k)] = normalizeYAML(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = normalizeYAML(val)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func schemaProblems(ve *jsonschema.ValidationError) []string {
+	var problems []string
+	var walk func(u jsonschema.OutputUnit)
+	walk = func(u jsonschema.OutputUnit) {
+		if u.Error != nil {
+			loc := u.InstanceLocation
+			if loc == "" {
+				loc = "/"
+			}
+			problems = append(problems, loc+": "+u.Error.String())
+		}
+		for _, c := range u.Errors {
+			walk(c)
+		}
+	}
+	walk(*ve.BasicOutput())
+	if len(problems) == 0 {
+		problems = append(problems, "does not match the schema")
+	}
+	return dedupe(problems)
+}
+
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	out := in[:0]
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// Validate checks the rules the JSON Schema cannot express. Parse calls it.
+func (m *Manifest) Validate() error {
+	var problems []string
+	fail := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
+
+	if m.SchemaVersion != 1 {
+		fail("/schema_version: must be 1")
+	}
+	if !secrets.ValidSlug(m.Slug) {
+		fail("/slug: must be 2 to 40 lowercase letters and digits in words joined by single hyphens")
+	}
+	id := m.Identity
+	if !containsString(id.Locales, id.DefaultLocale) {
+		fail("/identity/default_locale: must be one of /identity/locales")
+	}
+	switch id.MFA {
+	case MFAOptional, MFARequired, MFARequiredForStaff:
+	default:
+		fail("/identity/mfa: must be optional, required or required_for_staff")
+	}
+	// The password grant never runs a browser flow, so it would issue tokens
+	// without the second factor the policy requires.
+	if id.MFA == MFARequired && id.CustomerClient.DirectAccessGrants {
+		fail("/identity/customer_client/direct_access_grants: must be false when /identity/mfa is required, because the password grant skips the second factor")
+	}
+	if (id.MFA == MFARequired || id.MFA == MFARequiredForStaff) && id.StaffClient.DirectAccessGrants {
+		fail("/identity/staff_client/direct_access_grants: must be false when /identity/mfa is %s, because the password grant skips the second factor", id.MFA)
+	}
+	clients := map[string]string{}
+	addClient := func(path, clientID string) {
+		if prev, ok := clients[clientID]; ok {
+			fail("%s: client_id %q is also used by %s", path, clientID, prev)
+			return
+		}
+		clients[clientID] = path
+	}
+	addClient("/identity/customer_client", id.CustomerClient.ClientID)
+	addClient("/identity/staff_client", id.StaffClient.ClientID)
+	for i, sc := range id.ServiceClients {
+		addClient(fmt.Sprintf("/identity/service_clients/%d", i), sc.ClientID)
+	}
+	aliases := map[string]bool{}
+	for i, p := range id.IdentityProviders {
+		if aliases[p.Alias] {
+			fail("/identity/identity_providers/%d: alias %q is used twice", i, p.Alias)
+		}
+		aliases[p.Alias] = true
+	}
+	for path, file := range map[string]string{
+		"/billing/catalogue": m.Billing.Catalogue,
+		"/billing/overdue":   m.Billing.Overdue,
+		"/billing/templates": m.Billing.Templates,
+	} {
+		if file != "" && !filepath.IsLocal(filepath.FromSlash(file)) {
+			fail("%s: must be a relative path inside the manifest directory", path)
+		}
+	}
+	if id.Realm == "master" || !realmName.MatchString(id.Realm) {
+		fail("/identity/realm: must match %s and must not be master", realmName)
+	}
+	for i, v := range id.MFAACRValues {
+		if strings.TrimSpace(v) == "" || len(v) > 64 || v == "0" || v == "1" {
+			fail("/identity/mfa_acr_values/%d: must be a non-empty value of at most 64 characters, other than 0 and 1, that the realm issues only after a second factor", i)
+		}
+	}
+	type clientURIs struct {
+		path               string
+		redirects, origins []string
+	}
+	for _, c := range []clientURIs{
+		{"/identity/customer_client", id.CustomerClient.RedirectURIs, id.CustomerClient.WebOrigins},
+		{"/identity/staff_client", id.StaffClient.RedirectURIs, id.StaffClient.WebOrigins},
+	} {
+		for i, u := range c.redirects {
+			if err := checkRedirectURI(u); err != nil {
+				fail("%s/redirect_uris/%d: %v", c.path, i, err)
+			}
+		}
+		for i, o := range c.origins {
+			if err := checkWebOrigin(o); err != nil {
+				fail("%s/web_origins/%d: %v", c.path, i, err)
+			}
+		}
+	}
+	if len(problems) > 0 {
+		return invalid(problems)
+	}
+	return nil
+}
+
+// realmName is the form of a brand realm name.
+var realmName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}$`)
+
+// SecretRefChecker decides whether a brand may use a secret reference.
+// secrets.Default implements it.
+type SecretRefChecker interface {
+	Check(slug, ref string) error
+}
+
+// CheckSecretRefs returns secret_ref_invalid when any secret reference of the
+// manifest is outside the brand's namespace: env:// references must start
+// with BRAND_<SLUG>__ and file:// references must resolve inside
+// ZS_SECRETS_DIR/<slug>/. Apply runs it before it resolves anything.
+func (m *Manifest) CheckSecretRefs(c SecretRefChecker) error {
+	var problems []string
+	for _, ref := range m.secretRefs() {
+		if err := c.Check(m.Slug, ref.ref); err != nil {
+			problems = append(problems, ref.path+": "+refProblem(err))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return zserrors.New(zserrors.CodeSecretRefInvalid, "Secret references outside the brand's namespace: "+strings.Join(problems, "; ")+".")
+}
+
+// refProblem returns the rule a reference breaks. The error of a checker
+// names the rule and the reference, never a value.
+func refProblem(err error) string {
+	return strings.TrimPrefix(err.Error(), secrets.ErrNotAllowed.Error()+": ")
+}
+
+type secretRefAt struct{ path, ref string }
+
+// secretRefs lists every secret reference in the manifest with its path.
+func (m *Manifest) secretRefs() []secretRefAt {
+	refs := []secretRefAt{
+		{"/identity/staff_client/secret_ref", m.Identity.StaffClient.SecretRef},
+		{"/billing/killbill_api_secret_ref", m.Billing.KillBillAPISecretRef},
+	}
+	for i, sc := range m.Identity.ServiceClients {
+		refs = append(refs, secretRefAt{fmt.Sprintf("/identity/service_clients/%d/secret_ref", i), sc.SecretRef})
+	}
+	for i, p := range m.Identity.IdentityProviders {
+		if p.ClientSecretRef != "" {
+			refs = append(refs, secretRefAt{fmt.Sprintf("/identity/identity_providers/%d/client_secret_ref", i), p.ClientSecretRef})
+		}
+	}
+	if m.Billing.PaymentPlugin != nil {
+		refs = append(refs, secretRefAt{"/billing/payment_plugin/config_ref", m.Billing.PaymentPlugin.ConfigRef})
+	}
+	if m.Notifications != nil {
+		for i, w := range m.Notifications.Webhooks {
+			refs = append(refs, secretRefAt{fmt.Sprintf("/notifications/webhooks/%d/secret_ref", i), w.SecretRef})
+		}
+	}
+	return refs
+}
+
+// Digest returns "sha256:<hex>" of the manifest's canonical JSON encoding.
+// Two manifests with the same content have the same digest whatever their
+// key order or formatting.
+func (m *Manifest) Digest() string {
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		// A Manifest holds only strings, numbers, booleans and slices.
+		panic(err)
+	}
+	sum := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// ClientIDs returns every client the brand declares.
+func (m *Manifest) ClientIDs() []string {
+	ids := []string{m.Identity.CustomerClient.ClientID, m.Identity.StaffClient.ClientID}
+	for _, sc := range m.Identity.ServiceClients {
+		ids = append(ids, sc.ClientID)
+	}
+	return ids
+}
+
+func containsString(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+// LoadDir loads every *.yaml and *.yml manifest in dir. The file name must be
+// <slug>.yaml. It fails on the first invalid manifest, naming the file.
+func LoadDir(dir string) ([]*Manifest, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read brands directory: %w", err)
+	}
+	var out []*Manifest
+	seen := map[string]string{}
+	for _, e := range entries {
+		name := e.Name()
+		ext := filepath.Ext(name)
+		if e.IsDir() || (ext != ".yaml" && ext != ".yml") {
+			continue
+		}
+		m, err := Load(filepath.Join(dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		if strings.TrimSuffix(name, ext) != m.Slug {
+			return nil, fmt.Errorf("%s: the file name must be %s%s", name, m.Slug, ext)
+		}
+		if prev, ok := seen[m.Slug]; ok {
+			return nil, fmt.Errorf("%s: slug %s is also declared in %s", name, m.Slug, prev)
+		}
+		seen[m.Slug] = name
+		out = append(out, m)
+	}
+	return out, nil
+}

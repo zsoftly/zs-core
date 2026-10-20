@@ -9,11 +9,16 @@ import (
 	"github.com/zsoftly/zs-core/internal/httpapi/gen"
 	"github.com/zsoftly/zs-core/pkg/audit"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
+	"github.com/zsoftly/zs-core/pkg/identity"
+	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/scope"
 )
 
+// listAuditEvents is a staff operator route until Phase 3b adds the tenant
+// member path. With tenant_id it lists that tenant's events inside the
+// caller's brand; without it, the brand's own events.
 func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
-	sc, err := scope.FromContext(r.Context())
+	p, err := s.requireStaff(r.Context(), identity.StaffOperator)
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -43,7 +48,17 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 		filter.OccurredBefore = *params.OccurredBefore
 	}
 
-	page, err := audit.Query(r.Context(), s.db, sc, filter)
+	var page audit.Page
+	if params.TenantId != nil {
+		tenant, perr := idgen.ParseAs(idgen.Tenant, *params.TenantId)
+		if perr != nil {
+			s.writeError(w, r, scope.ErrInvalid)
+			return
+		}
+		page, err = audit.Query(r.Context(), s.db, scope.Scope{Brand: p.Brand.ID, Tenant: tenant}, filter)
+	} else {
+		page, err = audit.QueryBrand(r.Context(), s.db, p.Brand.ID, filter)
+	}
 	if err != nil {
 		s.writeError(w, r, err)
 		return
@@ -57,7 +72,6 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 		item := gen.AuditEvent{
 			Id:            e.ID,
 			BrandId:       e.BrandID,
-			TenantId:      e.TenantID,
 			Actor:         gen.Actor{Type: gen.ActorType(e.Actor.Type)},
 			Action:        e.Action,
 			Outcome:       gen.AuditOutcome(e.Outcome),
@@ -67,6 +81,14 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 		if e.Actor.ID != "" {
 			id := e.Actor.ID
 			item.Actor.Id = &id
+		}
+		if e.TenantID != "" {
+			tenant := e.TenantID
+			item.TenantId = &tenant
+		}
+		if e.Details != nil {
+			details := e.Details
+			item.Details = &details
 		}
 		if e.Reason != "" {
 			reason := e.Reason
@@ -100,6 +122,7 @@ func parseListAuditEventsParams(q url.Values) (gen.ListAuditEventsParams, error)
 		}
 		return nil
 	}
+	p.TenantId = optional("tenant_id")
 	p.Cursor = optional("cursor")
 	p.ActorId = optional("actor_id")
 	p.Action = optional("action")

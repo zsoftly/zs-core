@@ -6,14 +6,16 @@ A brand is one product on a Core deployment: one Keycloak realm, one Kill Bill t
 
 ## Brands
 
-Table `brands`: `id` (`brd_`), `slug` (unique, lowercase, 2 to 40 chars), `name`, `status`, `keycloak_realm`, `killbill_tenant_id`, `killbill_api_key`, `killbill_api_secret_ref` (secret store reference, never the value), `manifest_digest`, `applied_at`, timestamps.
+Table `brands`: `id` (`brd_`), `slug` (unique, 2 to 40 chars, lowercase letters and digits in words joined by single hyphens), `name`, `status`, `keycloak_realm`, `killbill_tenant_id`, `killbill_api_key`, `killbill_api_secret_ref` (secret store reference, never the value), `manifest_digest`, `applied_at`, timestamps.
 
 The manifest (`brands/<slug>.yaml`, schema `api/schemas/brand-manifest.json`) declares:
 
-- `identity`: realm display name, login theme, email theme, locales (`en`, `fr`), customer client (OIDC public client with PKCE), staff client, service clients, brokered providers (Google, Microsoft, GitHub, enterprise OIDC or SAML) with secret references, authentication policy (`mfa: optional | required | required_for_staff`, TOTP and WebAuthn allowed), token lifetimes, required actions (verify email, update profile).
+- `identity`: realm display name, login theme, email theme, locales (`en`, `fr`), customer client (OIDC public client with PKCE), staff client, service clients, brokered providers (Google, Microsoft, GitHub, enterprise OIDC or SAML) with secret references, authentication policy (`mfa: optional | required | required_for_staff`, TOTP and WebAuthn allowed, see below), token lifetimes, required actions (verify email, update profile).
 - `billing`: Kill Bill tenant key, catalogue file path, currencies, legal seller name and address, payment plugin (`stripe`, `adyen`, `paypal-express` once a Java plugin exists, or a custom plugin name) with a configuration reference, invoice plugin (optional, for tax), email template set, overdue policy file.
 - `notifications`: sender identity, reply-to, webhook endpoints with secret references.
 - `permissions`: the `resource:action` strings the product uses beyond the built-ins.
+
+Secret references in v1 are only `env://NAME` and `file:///abs/path`. They are namespaced per brand. An `env://` reference of brand `<slug>` starts with `BRAND_<SLUG>__`, such as `BRAND_ZS_REFERENCE__` for `zs-reference` and `BRAND_ZS__` for `zs`. The double underscore ends the prefix and cannot occur inside a slug, so the namespaces of two brands never overlap. A `file://` reference resolves inside `ZS_SECRETS_DIR/<slug>/`. Any other reference is `422 secret_ref_invalid`. See [brands.md](brands.md#secrets).
 
 `zs-core brand apply <file>` converges Keycloak (realm, clients, brokers, theme, locales, flows, required actions) through the Admin API, converges Kill Bill (tenant, plugin install through KPM, per-tenant plugin configuration, catalogue upload, overdue upload, templates) through its API, stores the result, and audits every change with a diff. Apply is idempotent and refuses unknown manifest keys.
 
@@ -21,7 +23,9 @@ Rules:
 
 - A token acts inside exactly one brand, chosen by its issuer (the realm) and audience. Unknown realm or audience: `401 token_audience_unknown`.
 - Nothing crosses brands: not tokens, not API keys, not staff grants, not webhooks.
-- Changing a brand's payment plugin is an apply with a required `reason` and recent staff MFA; it never migrates stored payment methods automatically.
+- `mfa: required` holds for every login path. The realm's browser flow requires OTP, and every identity provider runs a post-broker-login flow that requires OTP. Neither the customer client nor the staff client may allow the password grant. `required_for_staff` binds the OTP flow to the staff client and refuses the password grant on it.
+- Changing a brand's payment plugin is an apply with a required `reason`. Over HTTP it also needs recent staff MFA. It never migrates stored payment methods automatically.
+- Over HTTP, an apply that changes MFA settings, a client, an identity provider, `ssl_required` or the payment plugin needs recent staff MFA (`403 recent_mfa_required`) and a `reason` (`400 reason_required`). The command line is exempt because it runs as a service actor named by `--operator`.
 
 ## Identities
 
@@ -30,8 +34,9 @@ Table `identities`: `id` (`idn_`), `brand_id`, `issuer`, `subject`, `keycloak_us
 Rules:
 
 - Created on first authenticated contact with a verified email claim. Without `email_verified: true` the caller is authenticated but cannot create a tenant or accept an invitation. The API returns `403 email_not_verified`.
-- Email is refreshed from the token; it is never used to find or merge identities.
-- Verification: RS256 against the realm JWKS, `iss` equals the realm issuer, `aud` contains a brand audience, `typ` is `Bearer`, `exp` and `nbf` with 60 seconds leeway, `azp` equals the configured client when the manifest sets one. MFA is read from `amr` and `acr`; `RequireRecentMFA(15 minutes)` guards API key creation, owner transfer and member removal.
+- Email is refreshed from the token. It is never used to find or merge identities.
+- Core reads the identity first. It writes the row only when the email, the verified flag or the display name changed, or `last_seen_at` is 5 minutes old or older.
+- Verification: RS256 against the realm JWKS, `iss` equals the realm issuer, `aud` contains a brand audience, `typ` is `Bearer`, `exp` and `nbf` with 60 seconds leeway. `azp` is always required, must name one of the brand's clients and must appear in `aud`. The client decides the principal kind. MFA is read from `amr` and `acr`. `RequireRecentMFA(15 minutes)` guards API key creation, owner transfer, member removal and sensitive brand applies over HTTP. It treats `auth_time` as the time of the second factor. See [brands.md](brands.md#token-verification) for the limit this implies.
 - A token stays valid until it expires. Core re-checks membership and tenant status on every request, so a removed member loses access at once.
 
 ## Tenants
@@ -68,7 +73,7 @@ Rules: creation needs `apikey:create` and recent MFA; requested permissions must
 
 Table `staff_grants`: `id` (`grt_`), `brand_id`, `issuer`, `subject`, `scope` (`operator`, `activation`, `billing`, `support`), `status`, `granted_by`, `reason`.
 
-Staff tokens are verified against the brand's staff client. Authority comes only from an active grant with the needed scope in the same brand; missing returns `404`. No HTTP route creates grants in v1; `zs-core grant add` does, audited. Migrations create no grants. Keycloak realm roles never grant staff authority.
+Staff tokens are verified against the brand's staff client. Authority comes only from an active grant with the needed scope in the same brand. A missing grant returns `404`. No HTTP route creates or revokes grants in v1. `zs-core grant add` creates one and `zs-core grant revoke --brand --issuer --subject --scope --reason --operator` sets it to `revoked`. Both are audited, as `staff.grant.added` and `staff.grant.revoked`. A revoked grant stops working at once, because verification requires an `active` grant. Migrations create no grants. Keycloak realm roles never grant staff authority.
 
 ## Scope resolution
 
@@ -97,8 +102,9 @@ The Phase 1 trusted-header mode is removed here.
 | `GET /v1/tenants/{id}/activation`; `POST /v1/staff/tenants/{id}/activation` | member; staff `activation` | `tenant:read`; n/a |
 | `GET, POST /v1/tenants/{id}/api-keys`; `DELETE .../api-keys/{key}` | member, recent MFA on create | `apikey:*` |
 | `GET /v1/brands/{id}`; `POST /v1/brands/{id}/apply` | staff `operator` | n/a |
+| `GET /v1/audit/events` | staff `operator`, optional `tenant_id`; `404` without the grant | n/a |
 
-Built-in permissions: `tenant:read`, `tenant:update`, `tenant:transfer`, `member:read`, `member:invite`, `member:update`, `member:remove`, `team:read`, `team:manage`, `apikey:create`, `apikey:read`, `apikey:revoke`, `billing:read`, `billing:manage`, `audit:read`.
+Built-in permissions: `tenant:read`, `tenant:update`, `tenant:transfer`, `member:read`, `member:invite`, `member:update`, `member:remove`, `team:read`, `team:manage`, `apikey:create`, `apikey:read`, `apikey:revoke`, `billing:read`, `billing:manage`, `audit:read`. `audit:read` is the Phase 3b permission for tenant members.
 
 ## Tests that gate Phase 3
 

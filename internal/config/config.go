@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,11 +33,14 @@ const (
 	EnvHTTPWriteTimeout        = "ZS_HTTP_WRITE_TIMEOUT"
 	EnvHTTPIdleTimeout         = "ZS_HTTP_IDLE_TIMEOUT"
 	EnvShutdownTimeout         = "ZS_SHUTDOWN_TIMEOUT"
-	EnvDevTrustedScopeHeaders  = "ZS_DEV_TRUSTED_SCOPE_HEADERS"
 	EnvKeycloakURL             = "ZS_KEYCLOAK_URL"
 	EnvKeycloakRealm           = "ZS_KEYCLOAK_REALM"
 	EnvKeycloakAdminUser       = "ZS_KEYCLOAK_ADMIN_USER"
 	EnvKeycloakAdminPassword   = "ZS_KEYCLOAK_ADMIN_PASSWORD"
+	EnvKeycloakAdminClientID   = "ZS_KEYCLOAK_ADMIN_CLIENT_ID"
+	EnvKeycloakAdminSecret     = "ZS_KEYCLOAK_ADMIN_CLIENT_SECRET"
+	EnvBrandsDir               = "ZS_BRANDS_DIR"
+	EnvSecretsDir              = "ZS_SECRETS_DIR"
 	EnvKillBillURL             = "ZS_KILLBILL_URL"
 	EnvKillBillAdminUser       = "ZS_KILLBILL_ADMIN_USER"
 	EnvKillBillAdminPassword   = "ZS_KILLBILL_ADMIN_PASSWORD"
@@ -63,10 +67,11 @@ var known = map[string]bool{
 	EnvDatabaseURL: true, EnvDatabaseMaxConns: true, EnvListenAddr: true, EnvLogLevel: true,
 	EnvLogFormat: true, EnvMigrateOnStart: true, EnvHTTPReadHeaderTimeout: true,
 	EnvHTTPReadTimeout: true, EnvHTTPWriteTimeout: true, EnvHTTPIdleTimeout: true,
-	EnvShutdownTimeout: true, EnvDevTrustedScopeHeaders: true,
-	EnvKeycloakURL: true, EnvKeycloakRealm: true, EnvKeycloakAdminUser: true,
+	EnvShutdownTimeout: true,
+	EnvKeycloakURL:     true, EnvKeycloakRealm: true, EnvKeycloakAdminUser: true,
 	EnvKeycloakAdminPassword: true, EnvKillBillURL: true, EnvKillBillAdminUser: true,
 	EnvKillBillAdminPassword: true, EnvKAUIURL: true,
+	EnvKeycloakAdminClientID: true, EnvKeycloakAdminSecret: true, EnvBrandsDir: true, EnvSecretsDir: true,
 }
 
 // Config is the validated service configuration.
@@ -82,11 +87,6 @@ type Config struct {
 	HTTPWriteTimeout      time.Duration
 	HTTPIdleTimeout       time.Duration
 	ShutdownTimeout       time.Duration
-	// DevTrustedScopeHeaders makes the API read the brand and tenant from
-	// the X-ZS-Brand and X-ZS-Tenant headers without authentication. It is a
-	// development aid for Phase 1 and is refused unless ListenAddr is a
-	// loopback address.
-	DevTrustedScopeHeaders bool
 
 	// The component settings below are read by `zs-core doctor`. All of them
 	// are optional for `serve` and `migrate`. An admin user and its password
@@ -95,10 +95,24 @@ type Config struct {
 	KeycloakRealm         string
 	KeycloakAdminUser     string
 	KeycloakAdminPassword string
-	KillBillURL           string
-	KillBillAdminUser     string
-	KillBillAdminPassword string
-	KAUIURL               string
+	// KeycloakAdminClientID and KeycloakAdminClientSecret select the client
+	// credentials grant for the Admin API instead of the admin password.
+	KeycloakAdminClientID     string
+	KeycloakAdminClientSecret string
+	KillBillURL               string
+	KillBillAdminUser         string
+	KillBillAdminPassword     string
+	KAUIURL                   string
+
+	// BrandsDir holds brand manifests, brands/<slug>.yaml. serve loads and
+	// validates them at start and resolves the file references of HTTP
+	// applies against it. Apply stays an explicit command.
+	BrandsDir string
+
+	// SecretsDir holds file secrets of brand manifests, one directory per
+	// brand slug. A file:// reference of brand <slug> must resolve inside
+	// SecretsDir/<slug>/. When empty, file:// references are refused.
+	SecretsDir string
 }
 
 // Load reads the configuration from environ, a list of KEY=value strings as
@@ -197,7 +211,6 @@ func Load(environ []string) (Config, error) {
 		}
 	}
 	parseBool(EnvMigrateOnStart, &cfg.MigrateOnStart)
-	parseBool(EnvDevTrustedScopeHeaders, &cfg.DevTrustedScopeHeaders)
 
 	parseDuration := func(name string, target *time.Duration) {
 		v, ok := env[name]
@@ -239,12 +252,27 @@ func Load(environ []string) (Config, error) {
 	if (cfg.KeycloakAdminUser == "") != (cfg.KeycloakAdminPassword == "") {
 		fail("%s and %s must be set together", EnvKeycloakAdminUser, EnvKeycloakAdminPassword)
 	}
+	cfg.KeycloakAdminClientID = env[EnvKeycloakAdminClientID]
+	cfg.KeycloakAdminClientSecret = env[EnvKeycloakAdminSecret]
+	if (cfg.KeycloakAdminClientID == "") != (cfg.KeycloakAdminClientSecret == "") {
+		fail("%s and %s must be set together", EnvKeycloakAdminClientID, EnvKeycloakAdminSecret)
+	}
+	if v := env[EnvBrandsDir]; v != "" {
+		if strings.ContainsRune(v, 0) {
+			fail("%s must be a directory path", EnvBrandsDir)
+		} else {
+			cfg.BrandsDir = v
+		}
+	}
+	if v := env[EnvSecretsDir]; v != "" {
+		if strings.ContainsRune(v, 0) || !filepath.IsAbs(v) {
+			fail("%s must be an absolute directory path", EnvSecretsDir)
+		} else {
+			cfg.SecretsDir = filepath.Clean(v)
+		}
+	}
 	if (cfg.KillBillAdminUser == "") != (cfg.KillBillAdminPassword == "") {
 		fail("%s and %s must be set together", EnvKillBillAdminUser, EnvKillBillAdminPassword)
-	}
-
-	if cfg.DevTrustedScopeHeaders && !IsLoopback(cfg.ListenAddr) {
-		fail("%s=true requires %s to be a loopback address such as 127.0.0.1:8080", EnvDevTrustedScopeHeaders, EnvListenAddr)
 	}
 
 	if len(problems) > 0 {

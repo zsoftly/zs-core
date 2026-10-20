@@ -77,7 +77,9 @@ Every ZSoftly product needs the same things: a company with members and roles, a
                       |
      +-----------+----+------+-----------+
      |           |           |           |
-  Compute     Storage    Networking     DNS
+  Compute     Storage    Networking     DNS        IaaS
+  App Hosting Kubernetes Databases   CI Runners   PaaS
+     |           |           |           |
   Own brand   Own brand   Own brand   Own brand
   Own billing Own billing Own billing Own billing
   Own users   Own users   Own users   Own users

@@ -175,3 +175,21 @@ func TestComponentURLsRejectUserInfo(t *testing.T) {
 		}
 	}
 }
+
+func TestBillingSettings(t *testing.T) {
+	cfg, err := Load([]string{dbURL})
+	if err != nil || cfg.CreditSweepInterval != DefaultCreditSweepInterval || cfg.KillBillWebhookSecret != "" || cfg.KillBillCallbackURL != "" {
+		t.Fatalf("defaults = %+v %v", cfg, err)
+	}
+	secret := strings.Repeat("w", 32)
+	cfg, err = Load([]string{dbURL, "ZS_KILLBILL_WEBHOOK_SECRET=" + secret, "ZS_KILLBILL_CALLBACK_URL=http://core:8080/", "ZS_CREDIT_SWEEP_INTERVAL=5m"})
+	if err != nil || cfg.KillBillWebhookSecret != secret || cfg.KillBillCallbackURL != "http://core:8080" || cfg.CreditSweepInterval != 5*time.Minute {
+		t.Fatalf("set = %+v %v", cfg, err)
+	}
+	_, err = Load([]string{dbURL, "ZS_KILLBILL_WEBHOOK_SECRET=short-secret-value", "ZS_KILLBILL_CALLBACK_URL=core:8080", "ZS_CREDIT_SWEEP_INTERVAL=0s"})
+	if err == nil || !strings.Contains(err.Error(), "ZS_KILLBILL_WEBHOOK_SECRET must be at least 32") ||
+		!strings.Contains(err.Error(), "ZS_KILLBILL_CALLBACK_URL") || !strings.Contains(err.Error(), "ZS_CREDIT_SWEEP_INTERVAL") ||
+		strings.Contains(err.Error(), "short-secret-value") {
+		t.Fatalf("invalid = %v", err)
+	}
+}

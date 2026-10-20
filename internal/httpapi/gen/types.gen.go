@@ -121,6 +121,30 @@ func (e AuditOutcome) Valid() bool {
 	}
 }
 
+// Defines values for BillingSummaryHoldReasons.
+const (
+	BillingSummaryHoldReasonsAccountBlocked             BillingSummaryHoldReasons = "account_blocked"
+	BillingSummaryHoldReasonsOverdueBlocksChanges       BillingSummaryHoldReasons = "overdue_blocks_changes"
+	BillingSummaryHoldReasonsOverdueDisablesEntitlement BillingSummaryHoldReasons = "overdue_disables_entitlement"
+	BillingSummaryHoldReasonsTenantSuspended            BillingSummaryHoldReasons = "tenant_suspended"
+)
+
+// Valid indicates whether the value is a known member of the BillingSummaryHoldReasons enum.
+func (e BillingSummaryHoldReasons) Valid() bool {
+	switch e {
+	case BillingSummaryHoldReasonsAccountBlocked:
+		return true
+	case BillingSummaryHoldReasonsOverdueBlocksChanges:
+		return true
+	case BillingSummaryHoldReasonsOverdueDisablesEntitlement:
+		return true
+	case BillingSummaryHoldReasonsTenantSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for BrandStatus.
 const (
 	BrandStatusActive   BrandStatus = "active"
@@ -159,18 +183,20 @@ func (e BrandChangeAction) Valid() bool {
 
 // Defines values for BrandChangeTarget.
 const (
-	BrandChangeTargetCoreBrand                  BrandChangeTarget = "core.brand"
-	BrandChangeTargetKeycloakAuthenticationFlow BrandChangeTarget = "keycloak.authentication_flow"
-	BrandChangeTargetKeycloakClient             BrandChangeTarget = "keycloak.client"
-	BrandChangeTargetKeycloakClientScope        BrandChangeTarget = "keycloak.client_scope"
-	BrandChangeTargetKeycloakIdentityProvider   BrandChangeTarget = "keycloak.identity_provider"
-	BrandChangeTargetKeycloakMfaPolicy          BrandChangeTarget = "keycloak.mfa_policy"
-	BrandChangeTargetKeycloakRealm              BrandChangeTarget = "keycloak.realm"
-	BrandChangeTargetKeycloakRequiredAction     BrandChangeTarget = "keycloak.required_action"
-	BrandChangeTargetKillbillCatalogue          BrandChangeTarget = "killbill.catalogue"
-	BrandChangeTargetKillbillOverdue            BrandChangeTarget = "killbill.overdue"
-	BrandChangeTargetKillbillPluginConfig       BrandChangeTarget = "killbill.plugin_config"
-	BrandChangeTargetKillbillTenant             BrandChangeTarget = "killbill.tenant"
+	BrandChangeTargetCoreBrand                    BrandChangeTarget = "core.brand"
+	BrandChangeTargetKeycloakAuthenticationFlow   BrandChangeTarget = "keycloak.authentication_flow"
+	BrandChangeTargetKeycloakClient               BrandChangeTarget = "keycloak.client"
+	BrandChangeTargetKeycloakClientScope          BrandChangeTarget = "keycloak.client_scope"
+	BrandChangeTargetKeycloakIdentityProvider     BrandChangeTarget = "keycloak.identity_provider"
+	BrandChangeTargetKeycloakMfaPolicy            BrandChangeTarget = "keycloak.mfa_policy"
+	BrandChangeTargetKeycloakRealm                BrandChangeTarget = "keycloak.realm"
+	BrandChangeTargetKeycloakRequiredAction       BrandChangeTarget = "keycloak.required_action"
+	BrandChangeTargetKillbillCatalogue            BrandChangeTarget = "killbill.catalogue"
+	BrandChangeTargetKillbillNotificationCallback BrandChangeTarget = "killbill.notification_callback"
+	BrandChangeTargetKillbillOverdue              BrandChangeTarget = "killbill.overdue"
+	BrandChangeTargetKillbillPlugin               BrandChangeTarget = "killbill.plugin"
+	BrandChangeTargetKillbillPluginConfig         BrandChangeTarget = "killbill.plugin_config"
+	BrandChangeTargetKillbillTenant               BrandChangeTarget = "killbill.tenant"
 )
 
 // Valid indicates whether the value is a known member of the BrandChangeTarget enum.
@@ -194,11 +220,66 @@ func (e BrandChangeTarget) Valid() bool {
 		return true
 	case BrandChangeTargetKillbillCatalogue:
 		return true
+	case BrandChangeTargetKillbillNotificationCallback:
+		return true
 	case BrandChangeTargetKillbillOverdue:
+		return true
+	case BrandChangeTargetKillbillPlugin:
 		return true
 	case BrandChangeTargetKillbillPluginConfig:
 		return true
 	case BrandChangeTargetKillbillTenant:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CreditSource.
+const (
+	CreditSourceCreditCode CreditSource = "credit_code"
+	CreditSourceStaff      CreditSource = "staff"
+)
+
+// Valid indicates whether the value is a known member of the CreditSource enum.
+func (e CreditSource) Valid() bool {
+	switch e {
+	case CreditSourceCreditCode:
+		return true
+	case CreditSourceStaff:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for EntitlementReason.
+const (
+	EntitlementReasonBillingUnavailable   EntitlementReason = "billing_unavailable"
+	EntitlementReasonFeatureInvalid       EntitlementReason = "feature_invalid"
+	EntitlementReasonFeatureNotInPlan     EntitlementReason = "feature_not_in_plan"
+	EntitlementReasonIncludedInPlan       EntitlementReason = "included_in_plan"
+	EntitlementReasonNoActiveSubscription EntitlementReason = "no_active_subscription"
+	EntitlementReasonTenantNotFound       EntitlementReason = "tenant_not_found"
+	EntitlementReasonWalletOnHold         EntitlementReason = "wallet_on_hold"
+)
+
+// Valid indicates whether the value is a known member of the EntitlementReason enum.
+func (e EntitlementReason) Valid() bool {
+	switch e {
+	case EntitlementReasonBillingUnavailable:
+		return true
+	case EntitlementReasonFeatureInvalid:
+		return true
+	case EntitlementReasonFeatureNotInPlan:
+		return true
+	case EntitlementReasonIncludedInPlan:
+		return true
+	case EntitlementReasonNoActiveSubscription:
+		return true
+	case EntitlementReasonTenantNotFound:
+		return true
+	case EntitlementReasonWalletOnHold:
 		return true
 	default:
 		return false
@@ -367,6 +448,24 @@ func (e Role) Valid() bool {
 	}
 }
 
+// Defines values for SubscriptionChangePolicy.
+const (
+	SubscriptionChangePolicyEndOfTerm SubscriptionChangePolicy = "end_of_term"
+	SubscriptionChangePolicyImmediate SubscriptionChangePolicy = "immediate"
+)
+
+// Valid indicates whether the value is a known member of the SubscriptionChangePolicy enum.
+func (e SubscriptionChangePolicy) Valid() bool {
+	switch e {
+	case SubscriptionChangePolicyEndOfTerm:
+		return true
+	case SubscriptionChangePolicyImmediate:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for TenantActivation.
 const (
 	TenantActivationApproved TenantActivation = "approved"
@@ -421,6 +520,24 @@ func (e TenantStatus) Valid() bool {
 	case TenantStatusClosed:
 		return true
 	case TenantStatusSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for CancelSubscriptionParamsPolicy.
+const (
+	CancelSubscriptionParamsPolicyEndOfTerm CancelSubscriptionParamsPolicy = "end_of_term"
+	CancelSubscriptionParamsPolicyImmediate CancelSubscriptionParamsPolicy = "immediate"
+)
+
+// Valid indicates whether the value is a known member of the CancelSubscriptionParamsPolicy enum.
+func (e CancelSubscriptionParamsPolicy) Valid() bool {
+	switch e {
+	case CancelSubscriptionParamsPolicyEndOfTerm:
+		return true
+	case CancelSubscriptionParamsPolicyImmediate:
 		return true
 	default:
 		return false
@@ -564,6 +681,43 @@ type AuditOutcome string
 // BillingCountry An ISO 3166-1 alpha-2 country code in upper case.
 type BillingCountry = string
 
+// BillingCredential defines model for BillingCredential.
+type BillingCredential struct {
+	// AccountExternalKey A tenant ID.
+	AccountExternalKey TenantId `json:"account_external_key"`
+
+	// AccountId The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	AccountId KillBillId `json:"account_id"`
+	ExpiresAt time.Time  `json:"expires_at"`
+
+	// ProxyPath The proxy route of the tenant.
+	ProxyPath string `json:"proxy_path"`
+
+	// Token `zsbc_...`. Valid for 15 minutes.
+	Token string `json:"token"`
+}
+
+// BillingSummary defines model for BillingSummary.
+type BillingSummary struct {
+	// BalanceMinor What the account owes in minor units, negative when it holds credit.
+	BalanceMinor int64 `json:"balance_minor"`
+
+	// CreditMinor The account credit in minor units.
+	CreditMinor int64 `json:"credit_minor"`
+
+	// Currency An ISO 4217 currency code.
+	Currency    Currency                    `json:"currency"`
+	HoldReasons []BillingSummaryHoldReasons `json:"hold_reasons"`
+	OnHold      bool                        `json:"on_hold"`
+	Overdue     OverdueState                `json:"overdue"`
+
+	// PaymentPlugin The Kill Bill payment plugin of the brand, or __EXTERNAL_PAYMENT__.
+	PaymentPlugin string `json:"payment_plugin"`
+}
+
+// BillingSummaryHoldReasons defines model for BillingSummary.HoldReasons.
+type BillingSummaryHoldReasons string
+
 // Brand defines model for Brand.
 type Brand struct {
 	AppliedAt *time.Time `json:"applied_at"`
@@ -629,6 +783,109 @@ type BrandId = string
 // BrandManifest A brand manifest. The full schema is `api/schemas/brand-manifest.json`; the server validates against it and rejects unknown keys.
 type BrandManifest map[string]interface{}
 
+// Catalogue defines model for Catalogue.
+type Catalogue struct {
+	Currencies    []Currency         `json:"currencies"`
+	EffectiveDate string             `json:"effective_date"`
+	Name          string             `json:"name"`
+	Products      []CatalogueProduct `json:"products"`
+	Units         []string           `json:"units"`
+}
+
+// CataloguePhase defines model for CataloguePhase.
+type CataloguePhase struct {
+	// Duration Null for an unlimited phase.
+	Duration        *PhaseDuration `json:"duration"`
+	FixedPrices     []Money        `json:"fixed_prices"`
+	RecurringPrices []Money        `json:"recurring_prices"`
+
+	// Type TRIAL, DISCOUNT, FIXEDTERM or EVERGREEN.
+	Type  string       `json:"type"`
+	Usage []UsagePrice `json:"usage"`
+}
+
+// CataloguePlan defines model for CataloguePlan.
+type CataloguePlan struct {
+	BillingPeriod string           `json:"billing_period"`
+	Name          string           `json:"name"`
+	Phases        []CataloguePhase `json:"phases"`
+	PrettyName    *string          `json:"pretty_name,omitempty"`
+}
+
+// CatalogueProduct defines model for CatalogueProduct.
+type CatalogueProduct struct {
+	// Category BASE, ADD_ON or STANDALONE.
+	Category string `json:"category"`
+
+	// Features What an active subscription to a plan of the product entitles to, the product name and the usage units of its plans.
+	Features   []string        `json:"features"`
+	Name       string          `json:"name"`
+	Plans      []CataloguePlan `json:"plans"`
+	PrettyName *string         `json:"pretty_name,omitempty"`
+}
+
+// Credit defines model for Credit.
+type Credit struct {
+	AmountMinor  int64     `json:"amount_minor"`
+	CreatedAt    time.Time `json:"created_at"`
+	CreditCodeId *string   `json:"credit_code_id,omitempty"`
+
+	// Currency An ISO 4217 currency code.
+	Currency  Currency   `json:"currency"`
+	ExpiredAt *time.Time `json:"expired_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	Id        string     `json:"id"`
+
+	// KillbillCreditId The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	KillbillCreditId KillBillId   `json:"killbill_credit_id"`
+	ReversedMinor    int64        `json:"reversed_minor"`
+	Source           CreditSource `json:"source"`
+}
+
+// CreditSource defines model for Credit.Source.
+type CreditSource string
+
+// CreditGrant defines model for CreditGrant.
+type CreditGrant struct {
+	AmountMinor int64 `json:"amount_minor"`
+
+	// Currency An ISO 4217 currency code.
+	Currency Currency `json:"currency"`
+
+	// ExpiresAt When the sweeper reverses the unused part. Within 10 years.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// IdempotencyKey Client-chosen key that makes a command safe to retry. Scoped to the
+	// brand, the tenant and the actor. A retry with the same payload returns
+	// the original result; a different payload returns `409
+	// idempotency_key_conflict`.
+	IdempotencyKey IdempotencyKey `json:"idempotency_key"`
+	Reason         string         `json:"reason"`
+}
+
+// CreditRedeem defines model for CreditRedeem.
+type CreditRedeem struct {
+	Code string `json:"code"`
+}
+
+// Currency An ISO 4217 currency code.
+type Currency = string
+
+// Entitlement defines model for Entitlement.
+type Entitlement struct {
+	Allowed bool   `json:"allowed"`
+	Limit   *int64 `json:"limit"`
+
+	// Plan The plan that grants the feature, when allowed.
+	Plan      *string           `json:"plan,omitempty"`
+	Reason    EntitlementReason `json:"reason"`
+	Remaining *int64            `json:"remaining"`
+	Used      *int64            `json:"used"`
+}
+
+// EntitlementReason defines model for Entitlement.Reason.
+type EntitlementReason string
+
 // Error defines model for Error.
 type Error struct {
 	// Code Stable machine-readable code in snake_case. Clients branch on this value.
@@ -655,6 +912,14 @@ type HealthStatus struct {
 
 // HealthStatusStatus defines model for HealthStatus.Status.
 type HealthStatusStatus string
+
+// HostedForm defines model for HostedForm.
+type HostedForm struct {
+	// Fields What the plugin returned, such as a provider session ID.
+	Fields map[string]interface{} `json:"fields"`
+	Method *string                `json:"method,omitempty"`
+	Url    *string                `json:"url,omitempty"`
+}
 
 // IdempotencyKey Client-chosen key that makes a command safe to retry. Scoped to the
 // brand, the tenant and the actor. A retry with the same payload returns
@@ -753,6 +1018,67 @@ type InvitationPage struct {
 	NextCursor *NextCursor `json:"next_cursor"`
 }
 
+// Invoice defines model for Invoice.
+type Invoice struct {
+	AmountMinor    int64 `json:"amount_minor"`
+	BalanceMinor   int64 `json:"balance_minor"`
+	CreditAdjMinor int64 `json:"credit_adj_minor"`
+
+	// Currency An ISO 4217 currency code.
+	Currency Currency `json:"currency"`
+	Date     string   `json:"date"`
+
+	// Id The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Id KillBillId `json:"id"`
+
+	// Items The lines, on a single invoice only.
+	Items          *[]InvoiceItem `json:"items,omitempty"`
+	Number         string         `json:"number"`
+	RefundAdjMinor int64          `json:"refund_adj_minor"`
+
+	// Status DRAFT, COMMITTED or VOID.
+	Status     string `json:"status"`
+	TargetDate string `json:"target_date"`
+}
+
+// InvoiceItem defines model for InvoiceItem.
+type InvoiceItem struct {
+	AmountMinor int64 `json:"amount_minor"`
+
+	// Currency An ISO 4217 currency code.
+	Currency       Currency `json:"currency"`
+	Description    *string  `json:"description,omitempty"`
+	EndDate        *string  `json:"end_date,omitempty"`
+	Id             string   `json:"id"`
+	Phase          *string  `json:"phase,omitempty"`
+	Plan           *string  `json:"plan,omitempty"`
+	Product        *string  `json:"product,omitempty"`
+	StartDate      *string  `json:"start_date,omitempty"`
+	SubscriptionId *string  `json:"subscription_id,omitempty"`
+	Type           string   `json:"type"`
+	Usage          *string  `json:"usage,omitempty"`
+}
+
+// InvoicePage defines model for InvoicePage.
+type InvoicePage struct {
+	Data []Invoice `json:"data"`
+
+	// NextCursor The cursor for the next page, or null on the last page.
+	NextCursor *NextCursor `json:"next_cursor"`
+}
+
+// KillBillId The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+type KillBillId = string
+
+// KillBillNotification defines model for KillBillNotification.
+type KillBillNotification struct {
+	AccountId  *string `json:"accountId,omitempty"`
+	EventType  string  `json:"eventType"`
+	MetaData   *string `json:"metaData,omitempty"`
+	ObjectId   *string `json:"objectId,omitempty"`
+	ObjectType *string `json:"objectType,omitempty"`
+}
+
 // Me defines model for Me.
 type Me struct {
 	Identity    Identity     `json:"identity"`
@@ -826,8 +1152,25 @@ type MembershipStatus string
 // MembershipId A membership ID.
 type MembershipId = string
 
+// Money defines model for Money.
+type Money struct {
+	// AmountMinor The amount in minor units of the currency, such as cents.
+	AmountMinor int64 `json:"amount_minor"`
+
+	// Currency An ISO 4217 currency code.
+	Currency Currency `json:"currency"`
+}
+
 // NextCursor The cursor for the next page, or null on the last page.
 type NextCursor = string
+
+// OverdueState defines model for OverdueState.
+type OverdueState struct {
+	BlocksChanges       bool   `json:"blocks_changes"`
+	Clear               bool   `json:"clear"`
+	DisablesEntitlement bool   `json:"disables_entitlement"`
+	State               string `json:"state"`
+}
 
 // OwnershipTransfer defines model for OwnershipTransfer.
 type OwnershipTransfer struct {
@@ -841,13 +1184,166 @@ type OwnershipTransferResult struct {
 	To   Member `json:"to"`
 }
 
+// Payment defines model for Payment.
+type Payment struct {
+	AuthMinor     int64 `json:"auth_minor"`
+	CapturedMinor int64 `json:"captured_minor"`
+	CreditedMinor int64 `json:"credited_minor"`
+
+	// Currency An ISO 4217 currency code.
+	Currency Currency `json:"currency"`
+
+	// Id The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Id              KillBillId           `json:"id"`
+	Number          string               `json:"number"`
+	PaymentMethodId string               `json:"payment_method_id"`
+	PurchasedMinor  int64                `json:"purchased_minor"`
+	RefundedMinor   int64                `json:"refunded_minor"`
+	Transactions    []PaymentTransaction `json:"transactions"`
+}
+
+// PaymentMethod defines model for PaymentMethod.
+type PaymentMethod struct {
+	// Id The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Id         KillBillId `json:"id"`
+	IsDefault  bool       `json:"is_default"`
+	PluginName string     `json:"plugin_name"`
+}
+
+// PaymentMethodAdded defines model for PaymentMethodAdded.
+type PaymentMethodAdded struct {
+	Form          *HostedForm    `json:"form,omitempty"`
+	PaymentMethod *PaymentMethod `json:"payment_method"`
+}
+
+// PaymentMethodCreate defines model for PaymentMethodCreate.
+type PaymentMethodCreate struct {
+	// ExternalPaymentMethodId The token the provider's own client library made, such as a Stripe payment method ID. Never card data.
+	ExternalPaymentMethodId *string `json:"external_payment_method_id,omitempty"`
+
+	// HostedPage Ask the plugin for its hosted payment page.
+	HostedPage *bool `json:"hosted_page,omitempty"`
+
+	// HostedPageFields Fields the plugin's hosted page takes, such as return URLs.
+	HostedPageFields *[]PluginProperty `json:"hosted_page_fields,omitempty"`
+
+	// IdempotencyKey Client-chosen key that makes a command safe to retry. Scoped to the
+	// brand, the tenant and the actor. A retry with the same payload returns
+	// the original result; a different payload returns `409
+	// idempotency_key_conflict`.
+	IdempotencyKey IdempotencyKey `json:"idempotency_key"`
+
+	// PluginProperties Properties passed to the plugin. Never logged.
+	PluginProperties *[]PluginProperty `json:"plugin_properties,omitempty"`
+	SetDefault       *bool             `json:"set_default,omitempty"`
+}
+
+// PaymentMethodList defines model for PaymentMethodList.
+type PaymentMethodList struct {
+	Data []PaymentMethod `json:"data"`
+}
+
+// PaymentPage defines model for PaymentPage.
+type PaymentPage struct {
+	Data []Payment `json:"data"`
+
+	// NextCursor The cursor for the next page, or null on the last page.
+	NextCursor *NextCursor `json:"next_cursor"`
+}
+
+// PaymentTransaction defines model for PaymentTransaction.
+type PaymentTransaction struct {
+	AmountMinor int64 `json:"amount_minor"`
+
+	// Currency An ISO 4217 currency code.
+	Currency      Currency `json:"currency"`
+	EffectiveDate string   `json:"effective_date"`
+	Id            string   `json:"id"`
+	Status        string   `json:"status"`
+	Type          string   `json:"type"`
+}
+
 // Permission A `resource:action` permission, built in or registered by the brand.
 type Permission = string
+
+// PhaseDuration defines model for PhaseDuration.
+type PhaseDuration struct {
+	Number int    `json:"number"`
+	Unit   string `json:"unit"`
+}
+
+// PluginProperty defines model for PluginProperty.
+type PluginProperty struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// RefundRequest defines model for RefundRequest.
+type RefundRequest struct {
+	AmountMinor int64 `json:"amount_minor"`
+
+	// IdempotencyKey Client-chosen key that makes a command safe to retry. Scoped to the
+	// brand, the tenant and the actor. A retry with the same payload returns
+	// the original result; a different payload returns `409
+	// idempotency_key_conflict`.
+	IdempotencyKey IdempotencyKey `json:"idempotency_key"`
+	Reason         string         `json:"reason"`
+}
 
 // Role `owner` holds every permission. `admin` holds every permission except
 // `billing:*` and `tenant:transfer`. `billing_admin` holds `billing:*`.
 // `member` holds what its teams grant.
 type Role string
+
+// Subscription defines model for Subscription.
+type Subscription struct {
+	BillingEndDate     *string `json:"billing_end_date,omitempty"`
+	BillingPeriod      string  `json:"billing_period"`
+	BundleId           string  `json:"bundle_id"`
+	CancelledDate      *string `json:"cancelled_date,omitempty"`
+	Category           string  `json:"category"`
+	ChargedThroughDate *string `json:"charged_through_date,omitempty"`
+
+	// Id The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Id        KillBillId `json:"id"`
+	Phase     string     `json:"phase"`
+	Plan      string     `json:"plan"`
+	Product   string     `json:"product"`
+	StartDate *string    `json:"start_date,omitempty"`
+
+	// State PENDING, ACTIVE, BLOCKED, CANCELLED or EXPIRED.
+	State string `json:"state"`
+}
+
+// SubscriptionChange defines model for SubscriptionChange.
+type SubscriptionChange struct {
+	Plan   string                   `json:"plan"`
+	Policy SubscriptionChangePolicy `json:"policy"`
+
+	// Reason Recorded in Kill Bill's audit log.
+	Reason *string `json:"reason,omitempty"`
+}
+
+// SubscriptionChangePolicy defines model for SubscriptionChange.Policy.
+type SubscriptionChangePolicy string
+
+// SubscriptionCreate defines model for SubscriptionCreate.
+type SubscriptionCreate struct {
+	// IdempotencyKey Client-chosen key that makes a command safe to retry. Scoped to the
+	// brand, the tenant and the actor. A retry with the same payload returns
+	// the original result; a different payload returns `409
+	// idempotency_key_conflict`.
+	IdempotencyKey IdempotencyKey `json:"idempotency_key"`
+	Plan           string         `json:"plan"`
+
+	// Reason Recorded in Kill Bill's audit log.
+	Reason *string `json:"reason,omitempty"`
+}
+
+// SubscriptionList defines model for SubscriptionList.
+type SubscriptionList struct {
+	Data []Subscription `json:"data"`
+}
 
 // Team defines model for Team.
 type Team struct {
@@ -950,6 +1446,13 @@ type TenantUpdate struct {
 	Name           *string `json:"name,omitempty"`
 }
 
+// UsagePrice defines model for UsagePrice.
+type UsagePrice struct {
+	BlockSize string  `json:"block_size"`
+	Prices    []Money `json:"prices"`
+	Unit      string  `json:"unit"`
+}
+
 // ApiKeyIdPath An API key ID.
 type ApiKeyIdPath = ApiKeyId
 
@@ -962,11 +1465,26 @@ type Cursor = string
 // InvitationIdPath An invitation ID.
 type InvitationIdPath = InvitationId
 
+// InvoiceIdPath The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+type InvoiceIdPath = KillBillId
+
 // Limit defines model for Limit.
 type Limit = int
 
 // MembershipIdPath A membership ID.
 type MembershipIdPath = MembershipId
+
+// PaymentIdPath The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+type PaymentIdPath = KillBillId
+
+// PaymentMethodIdPath The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+type PaymentMethodIdPath = KillBillId
+
+// ProxyPath defines model for ProxyPath.
+type ProxyPath = string
+
+// SubscriptionIdPath The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+type SubscriptionIdPath = KillBillId
 
 // TeamIdPath A team ID.
 type TeamIdPath = TeamId
@@ -1061,8 +1579,20 @@ type ListTenantAuditEventsParams struct {
 	OccurredBefore *time.Time `form:"occurred_before,omitempty" json:"occurred_before,omitempty"`
 }
 
+// ProxyBillingPostJSONBody defines parameters for ProxyBillingPost.
+type ProxyBillingPostJSONBody = map[string]interface{}
+
 // ListInvitationsParams defines parameters for ListInvitations.
 type ListInvitationsParams struct {
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// ListInvoicesParams defines parameters for ListInvoices.
+type ListInvoicesParams struct {
 	// Limit The page size. Defaults to 50.
 	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
 
@@ -1079,6 +1609,26 @@ type ListMembersParams struct {
 	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
 }
 
+// ListPaymentsParams defines parameters for ListPayments.
+type ListPaymentsParams struct {
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// CancelSubscriptionParams defines parameters for CancelSubscription.
+type CancelSubscriptionParams struct {
+	Policy *CancelSubscriptionParamsPolicy `form:"policy,omitempty" json:"policy,omitempty"`
+
+	// Reason Why, recorded in Kill Bill's audit log.
+	Reason *string `form:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// CancelSubscriptionParamsPolicy defines parameters for CancelSubscription.
+type CancelSubscriptionParamsPolicy string
+
 // ListTeamsParams defines parameters for ListTeams.
 type ListTeamsParams struct {
 	// Limit The page size. Defaults to 50.
@@ -1087,6 +1637,9 @@ type ListTeamsParams struct {
 	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
 	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
 }
+
+// ReceiveKillBillNotificationJSONRequestBody defines body for ReceiveKillBillNotification for application/json ContentType.
+type ReceiveKillBillNotificationJSONRequestBody = KillBillNotification
 
 // ApplyBrandJSONRequestBody defines body for ApplyBrand for application/json ContentType.
 type ApplyBrandJSONRequestBody = BrandManifest
@@ -1097,6 +1650,9 @@ type AcceptInvitationJSONRequestBody = InvitationAccept
 // DecideTenantActivationJSONRequestBody defines body for DecideTenantActivation for application/json ContentType.
 type DecideTenantActivationJSONRequestBody = ActivationDecisionRequest
 
+// GrantCreditJSONRequestBody defines body for GrantCredit for application/json ContentType.
+type GrantCreditJSONRequestBody = CreditGrant
+
 // CreateTenantJSONRequestBody defines body for CreateTenant for application/json ContentType.
 type CreateTenantJSONRequestBody = TenantCreate
 
@@ -1106,6 +1662,12 @@ type UpdateTenantJSONRequestBody = TenantUpdate
 // CreateApiKeyJSONRequestBody defines body for CreateApiKey for application/json ContentType.
 type CreateApiKeyJSONRequestBody = ApiKeyCreate
 
+// ProxyBillingPostJSONRequestBody defines body for ProxyBillingPost for application/json ContentType.
+type ProxyBillingPostJSONRequestBody = ProxyBillingPostJSONBody
+
+// RedeemCreditCodeJSONRequestBody defines body for RedeemCreditCode for application/json ContentType.
+type RedeemCreditCodeJSONRequestBody = CreditRedeem
+
 // CreateInvitationJSONRequestBody defines body for CreateInvitation for application/json ContentType.
 type CreateInvitationJSONRequestBody = InvitationCreate
 
@@ -1114,6 +1676,18 @@ type UpdateMemberJSONRequestBody = MemberUpdate
 
 // TransferOwnershipJSONRequestBody defines body for TransferOwnership for application/json ContentType.
 type TransferOwnershipJSONRequestBody = OwnershipTransfer
+
+// AddPaymentMethodJSONRequestBody defines body for AddPaymentMethod for application/json ContentType.
+type AddPaymentMethodJSONRequestBody = PaymentMethodCreate
+
+// RefundPaymentJSONRequestBody defines body for RefundPayment for application/json ContentType.
+type RefundPaymentJSONRequestBody = RefundRequest
+
+// CreateSubscriptionJSONRequestBody defines body for CreateSubscription for application/json ContentType.
+type CreateSubscriptionJSONRequestBody = SubscriptionCreate
+
+// ChangeSubscriptionPlanJSONRequestBody defines body for ChangeSubscriptionPlan for application/json ContentType.
+type ChangeSubscriptionPlanJSONRequestBody = SubscriptionChange
 
 // CreateTeamJSONRequestBody defines body for CreateTeam for application/json ContentType.
 type CreateTeamJSONRequestBody = TeamCreate

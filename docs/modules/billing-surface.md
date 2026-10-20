@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-Kill Bill is the billing engine and Core adds no ledger. Each brand is a Kill Bill tenant with its own catalogue, overdue policy, payment plugin, invoice plugin and templates, all declared in the brand manifest and applied by Core. Each Core tenant is a Kill Bill account keyed by the Core tenant ID. Core's `/v1` billing routes wrap the Kill Bill API and scope every call to one brand and one tenant. They cover subscriptions, usage, credits, promo codes, invoices, payments, payment methods and entitlement checks. Products that need more call Kill Bill directly with brand-scoped credentials from Core. This is the Phase 4 contract.
+Kill Bill is the billing engine and Core adds no ledger. Each brand is a Kill Bill tenant with its own catalogue, overdue policy, payment plugin, invoice plugin and templates, all declared in the brand manifest and applied by Core. Each Core tenant is a Kill Bill account keyed by the Core tenant ID. Core's `/v1` billing routes wrap the Kill Bill API and scope every call to one brand and one tenant. They cover subscriptions, usage, credits, promo codes, invoices, payments, payment methods and entitlement checks. Products that need more use a Core token as their credential. They exchange it on a proxy that calls Kill Bill with the brand's credentials. This is the Phase 4 contract.
 
 ## Mapping
 
@@ -13,7 +13,7 @@ Kill Bill is the billing engine and Core adds no ledger. Each brand is a Kill Bi
 | Catalogue | Catalogue XML per tenant, versioned by `effectiveDate` | Products, plans, phases (trial, discount, evergreen), prices per currency, usage units, change plan policies |
 | Entitlement and plan | Subscription (base, add-on, standalone) | `CheckEntitlement(tenant, feature)` reads active subscriptions and catalogue product features |
 | Usage | Usage records on a consumable subscription unit | Core validates and forwards; caller `event_id` becomes the usage `trackingId` for idempotency |
-| Credits | Account credits and invoice credit items | Promo and voucher codes are Core tables that resolve to a credit with reason and expiry; expiry is a Core sweeper that issues a negative credit |
+| Credits | Account credits and invoice credit items | Promo and voucher codes are Core tables that resolve to a credit with reason and expiry; expiry is a Core sweeper that writes an external charge |
 | Invoices | Invoices | Read-only through Core; PDF through the invoice template plugin when the brand bundles one |
 | Payments and methods | Payments, payment methods on the brand's payment plugin | Plugin chosen per brand: `killbill-stripe-plugin` (verified), `killbill-adyen-plugin` (pinned), `killbill-paypal-express-plugin` (pending a Java plugin), or a custom plugin built with the extension guide |
 | Tax | Invoice plugin | Optional per brand; the plugin computes tax items on invoice generation |
@@ -54,12 +54,12 @@ All tenant routes require membership; reads need `billing:read`, writes need `bi
 | `GET /v1/tenants/{id}/entitlements/{feature}` | `{allowed, limit, used, remaining, reason, plan}`; `tenant:read` is enough |
 | `POST /v1/tenants/{id}/usage` and `/usage/batch` | `{subscription, unit, quantity_micro, event_id, occurred_at, dimensions}`; `usage:write`; forwarded as usage records with `trackingId` |
 | `GET /v1/tenants/{id}/usage/events`, `/usage/summary`, `/usage/billed` | Core's event list, Core's summary, and Kill Bill's billed usage for the period |
-| Wallet, redeem and staff credit routes | `/wallet`, `/wallet/redeem` and `/staff/.../wallet/credits`, described in [wallet-and-metering.md](wallet-and-metering.md) |
+| Wallet, redeem and staff credit routes | `/wallet` is described in [wallet-and-metering.md](wallet-and-metering.md). Redeem and staff credits shipped in Phase 4a as `POST /v1/tenants/{id}/credits/redeem` and `POST /v1/staff/tenants/{id}/credits`. See [Where Phase 4a differs](#where-phase-4a-differs). |
 | `GET /v1/tenants/{id}/invoices`; `GET .../invoices/{inv}`; `GET .../invoices/{inv}/pdf` | invoice list, detail, PDF when a template plugin is present |
 | `GET /v1/tenants/{id}/payments`; `POST .../payments/{pay}/refund` | staff `billing` for refunds |
 | `GET, POST, DELETE /v1/tenants/{id}/payment-methods`; `PUT .../payment-methods/{pm}/default` | shaped over the brand's plugin; `POST` returns the plugin's client-side token or redirect data, never raw card data |
-| `POST /v1/billing/webhooks/killbill` | Kill Bill push notification endpoint for this deployment; verified by shared secret and source, deduplicated, turned into Core events |
-| `GET /v1/tenants/{id}/billing/credentials` | `billing:manage`: a short-lived, brand-scoped Kill Bill credential for products that call Kill Bill directly |
+| `POST /v1/billing/webhooks/killbill/{brand}/{token}` | Kill Bill push notification endpoint for this deployment. Verified by a per-brand token derived from the shared secret and by source account, deduplicated, turned into Core events |
+| `GET /v1/tenants/{id}/billing/credentials` | `billing:manage`: a short-lived, brand-scoped Core credential for products that call Kill Bill directly, exchanged on `GET, POST /v1/tenants/{id}/billing/proxy/{path}` |
 
 ## Rules
 
@@ -67,10 +67,26 @@ All tenant routes require membership; reads need `billing:read`, writes need `bi
 - Every Core write to Kill Bill carries `X-Killbill-CreatedBy` set to the Core principal, `X-Killbill-Reason` from the request, and `X-Killbill-Comment` with the correlation ID, so Kill Bill's own audit matches Core's.
 - Kill Bill unreachable returns `503 billing_unavailable`; a Kill Bill validation error returns `422 billing_rejected` with the Kill Bill error code in `message`.
 - Promo and voucher codes: table `credit_codes` (`brand_id`, code digest, amount, currency, max redemptions, per-tenant limit, expiry, reason). Redemption is idempotent per tenant and code, and writes one Kill Bill credit with the code as the reason.
-- Credit expiry: a sweeper finds Core-issued credits past their expiry with unused balance and writes a negative credit for the remainder, audited; Kill Bill itself does not expire credits.
+- Credit expiry: a sweeper finds Core-issued credits past their expiry with unused balance and writes an external charge for the remainder, audited. Kill Bill itself does not expire credits.
+- Every write Core makes in Kill Bill is also a Core audit event, with Kill Bill IDs, plan names and amounts only.
+- A refund never exceeds what the payment captured or purchased less what it has refunded. A larger one is `422 billing_rejected` with `refund_exceeds_payment`.
 - `CheckEntitlement` fails closed: no active subscription, a blocked account, or Kill Bill unreachable all return `allowed: false` with a reason.
 - Plans, prices, trials, upgrade and downgrade rules live in the catalogue XML, not in Core code. Core validates the file against the Kill Bill schema before upload.
 - Holds before work (reserve, then settle) come from the reservation extension in [wallet-and-metering.md](wallet-and-metering.md). Reservations are holds against Kill Bill credit. They are not a customer balance.
+
+## Where Phase 4a differs
+
+Phase 4a built this contract on Kill Bill 0.24.22, as described in [billing.md](billing.md). It differs from the text above in these places, on purpose:
+
+- Credentials. Kill Bill has no short-lived tenant credentials, and a tenant's API secret opens every account of the tenant. So `GET /v1/tenants/{id}/billing/credentials` returns a 15-minute Core token, and products use it on Core's proxy route. The proxy calls Kill Bill with the brand's credentials and accepts only requests for the tenant's own account. See [billing.md](billing.md#billing-credentials-and-the-proxy).
+- Webhook path. Kill Bill cannot add headers to its callbacks and its notification does not name its tenant. So the callback is `/v1/billing/webhooks/killbill/{brand}/{token}`, with a token per brand derived from the deployment secret. A brand's Kill Bill tenant cannot post as another brand.
+- Deduplication. Kill Bill 0.24.22 sends no event ID. It sends the same body on a retry, and also when an object changes and changes back. Core deduplicates on a digest of the body and the state it reads from Kill Bill when the notification arrives. It never drops a notification whose state differs from the last one recorded for its object. Receipts are kept seven days.
+- Credit expiry. Kill Bill refuses a zero or negative credit, with error code 4009. So the sweeper writes an external charge for the unused remainder, which Kill Bill pays from the account credit. Kill Bill reports one credit balance per account, so the sweeper assumes Core credits are used oldest first and other credit last. Credit that did not come from Core is never reversed. A tenant with a pending credit waits, and a failed expiry is retried with a growing wait.
+- Redeem and staff credit routes. Codes and staff credits do not need the wallet view, so they shipped in Phase 4a as `POST /v1/tenants/{id}/credits/redeem` and `POST /v1/staff/tenants/{id}/credits`. The wallet extension reads the credit they write and adds no second redeem route.
+- Invoice PDFs. `components.yaml` pins no invoice template plugin, so the PDF route answers `404 invoice_pdf_unavailable` for an invoice of the tenant.
+- Test mode. No payment plugin takes real money in v1. `payment_plugin.mode: test` is required, and `live` is refused. Stripe needs an explicit `sk_test_` key and Adyen an explicit `TEST` environment. Every plugin's rule runs against every configuration, and `config_key` must be the plugin's own service name. Core reads the configuration as Kill Bill's Java runtime does and refuses the parts a reader could misread.
+- Plugin jars. `components.yaml` pins the SHA-256 of each plugin jar, and its repository must be `https`. Core checks the jar before KPM installs it.
+- Kill Bill server errors. Kill Bill 0.24.22 answers some invalid requests with a 500, such as a second subscription with an existing external key. Those are `503 billing_unavailable` like every 5xx. Core derives the external keys from idempotency keys and looks them up first, so a retry avoids that 500.
 
 ## Tests that gate Phase 4
 

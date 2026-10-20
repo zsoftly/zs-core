@@ -145,7 +145,9 @@ func TestParseAcceptsJSONAndAllProviderTypes(t *testing.T) {
 }
 
 func TestPaymentPluginKey(t *testing.T) {
-	if (PaymentPlugin{Name: "stripe"}).Key() != "killbill-stripe" || (PaymentPlugin{Name: "x", ConfigKey: "y"}).Key() != "y" {
+	// config_key never redirects the configuration: Validate refuses any
+	// value but the plugin's own service name.
+	if (PaymentPlugin{Name: "stripe"}).Key() != "killbill-stripe" || (PaymentPlugin{Name: "stripe", ConfigKey: "killbill-stripe"}).Key() != "killbill-stripe" {
 		t.Fatal("plugin key")
 	}
 }

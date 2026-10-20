@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ZSoftly Core API
-  version: 0.3.0
+  version: 0.4.0
   summary: The /v1 HTTP surface of ZSoftly Core.
   description: |
     ZSoftly Core serves tenants, wallets, metering, catalogue, payments,
@@ -55,6 +55,8 @@ tags:
     description: Tenant API keys.
   - name: audit
     description: The append-only audit trail.
+  - name: billing
+    description: The billing surface on Kill Bill. Kill Bill holds every balance, invoice and payment; Core stores none of them.
 paths:
   /healthz:
     get:
@@ -958,12 +960,675 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/Unavailable"
+  /v1/brands/{id}/catalogue:
+    get:
+      tags: [billing]
+      operationId: getCatalogue
+      summary: Return the brand's catalogue summary.
+      description: |
+        The catalogue version in force in the brand's Kill Bill tenant:
+        products, plans, phases, prices in minor units and usage units. Any
+        token of the brand may read it. Another brand's ID answers `404`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/BrandIdPath"
+      responses:
+        "200":
+          description: The catalogue summary.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Catalogue"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/billing:
+    get:
+      tags: [billing]
+      operationId: getBillingSummary
+      summary: Return the tenant's billing account.
+      description: |
+        Needs `billing:read`. Currency, balance and account credit come from
+        Kill Bill; Core stores none of them. `hold_reasons` lists why billing
+        changes are on hold: `tenant_suspended`, `account_blocked`,
+        `overdue_blocks_changes`, `overdue_disables_entitlement`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      responses:
+        "200":
+          description: The billing account.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BillingSummary"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/subscriptions:
+    get:
+      tags: [billing]
+      operationId: listSubscriptions
+      summary: List the tenant's subscriptions.
+      description: Needs `billing:read`. Every subscription of the tenant's Kill Bill account, in every state.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      responses:
+        "200":
+          description: The subscriptions.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SubscriptionList"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    post:
+      tags: [billing]
+      operationId: createSubscription
+      summary: Subscribe the tenant to a plan.
+      description: |
+        Needs `billing:manage`. Idempotent on `idempotency_key`: a retry with
+        the same plan returns the same subscription with `201`, another plan
+        is `409 idempotency_key_conflict`. While billing changes are on hold
+        the answer is `409 wallet_on_hold`. A plan Kill Bill refuses is `422
+        billing_rejected` with Kill Bill's error code.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SubscriptionCreate"}
+      responses:
+        "201":
+          description: The subscription.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Subscription"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/subscriptions/{sub}/change:
+    post:
+      tags: [billing]
+      operationId: changeSubscriptionPlan
+      summary: Move a subscription to another plan.
+      description: |
+        Needs `billing:manage`. `policy` is `immediate` or `end_of_term`. The
+        catalogue's change rules apply. While billing changes are on hold the
+        answer is `409 wallet_on_hold`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/SubscriptionIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SubscriptionChange"}
+      responses:
+        "200":
+          description: The subscription after the change.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Subscription"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/subscriptions/{sub}:
+    delete:
+      tags: [billing]
+      operationId: cancelSubscription
+      summary: Cancel a subscription.
+      description: Needs `billing:manage`. `policy` defaults to `end_of_term`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/SubscriptionIdPath"
+        - name: policy
+          in: query
+          schema: {type: string, enum: [immediate, end_of_term], default: end_of_term}
+        - name: reason
+          in: query
+          description: Why, recorded in Kill Bill's audit log.
+          schema: {type: string, minLength: 1, maxLength: 1000}
+      responses:
+        "200":
+          description: The subscription after the cancellation.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Subscription"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/entitlements/{feature}:
+    get:
+      tags: [billing]
+      operationId: checkEntitlement
+      summary: Check whether the tenant may use a feature now.
+      description: |
+        Needs `tenant:read`. A feature is a catalogue product name or a usage
+        unit of the plan of an active subscription. The check fails closed:
+        no active subscription, billing on hold, or Kill Bill unreachable
+        all give `allowed: false` with a reason, never an error. `limit`,
+        `used` and `remaining` are null until quotas ship.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - name: feature
+          in: path
+          required: true
+          schema: {type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$"}
+      responses:
+        "200":
+          description: The answer.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Entitlement"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/tenants/{id}/invoices:
+    get:
+      tags: [billing]
+      operationId: listInvoices
+      summary: List the tenant's invoices.
+      description: Needs `billing:read`. Newest first, without items.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of invoices.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvoicePage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/invoices/{inv}:
+    get:
+      tags: [billing]
+      operationId: getInvoice
+      summary: Return an invoice with its items.
+      description: Needs `billing:read`. An invoice of another tenant answers `404`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/InvoiceIdPath"
+      responses:
+        "200":
+          description: The invoice.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Invoice"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/invoices/{inv}/pdf:
+    get:
+      tags: [billing]
+      operationId: getInvoicePdf
+      summary: Return an invoice as PDF.
+      description: |
+        Needs `billing:read`. PDF rendering needs an invoice template plugin.
+        `components.yaml` pins none in this release, so an invoice of the
+        tenant answers `404 invoice_pdf_unavailable`. An invoice of another
+        tenant answers `404 not_found`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/InvoiceIdPath"
+      responses:
+        "200":
+          description: The PDF.
+          content:
+            application/pdf:
+              schema: {type: string, format: binary}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/payments:
+    get:
+      tags: [billing]
+      operationId: listPayments
+      summary: List the tenant's payments.
+      description: Needs `billing:read`. Newest first. Gateway messages are never returned.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of payments.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PaymentPage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/payments/{pay}/refund:
+    post:
+      tags: [billing]
+      operationId: refundPayment
+      summary: Refund part or all of a payment.
+      description: |
+        Staff with the `billing` grant in the tenant's brand only; anyone
+        else gets `404`. Needs a `reason`. Idempotent on `idempotency_key`
+        for the staff member in the tenant. The amount is in minor units of
+        the payment's currency. It must not exceed what the payment captured
+        or purchased less what it has refunded. A larger amount is `422
+        billing_rejected` with `refund_exceeds_payment` in the message, and
+        Kill Bill is not called. Each refund is audited as
+        `billing.payment.refunded`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/PaymentIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RefundRequest"}
+      responses:
+        "201":
+          description: The payment after the refund.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Payment"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/payment-methods:
+    get:
+      tags: [billing]
+      operationId: listPaymentMethods
+      summary: List the tenant's payment methods.
+      description: Needs `billing:read`. Card data and plugin details are never returned.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      responses:
+        "200":
+          description: The payment methods.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PaymentMethodList"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    post:
+      tags: [billing]
+      operationId: addPaymentMethod
+      summary: Add a payment method through the brand's payment plugin.
+      description: |
+        Needs `billing:manage`. With `hosted_page`, the plugin returns the
+        form of its hosted payment page, which can carry the provider's
+        client-side token, and the customer completes it with the provider.
+        Otherwise `external_payment_method_id` carries the token the
+        provider's own client library made, such as a Stripe payment method
+        ID. Core never sees card data. Idempotent on `idempotency_key`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PaymentMethodCreate"}
+      responses:
+        "201":
+          description: The payment method, and the hosted page form when asked for.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PaymentMethodAdded"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/payment-methods/{pm}:
+    delete:
+      tags: [billing]
+      operationId: deletePaymentMethod
+      summary: Delete a payment method.
+      description: Needs `billing:manage`. Kill Bill refuses to delete the default payment method with `422 billing_rejected`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/PaymentMethodIdPath"
+      responses:
+        "204":
+          description: The payment method was deleted.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/payment-methods/{pm}/default:
+    put:
+      tags: [billing]
+      operationId: setDefaultPaymentMethod
+      summary: Make a payment method the default.
+      description: Needs `billing:manage`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/PaymentMethodIdPath"
+      responses:
+        "200":
+          description: The payment method.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PaymentMethod"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/credits/redeem:
+    post:
+      tags: [billing]
+      operationId: redeemCreditCode
+      summary: Redeem a promo or voucher code.
+      description: |
+        Needs `billing:manage`. Writes one Kill Bill account credit with the
+        code as the reason. Idempotent per tenant and code: once the tenant
+        has used the code's per-tenant limit, the answer is the latest credit
+        with `200`. An unknown, disabled or expired code, or a code of another
+        brand or currency, is `404 credit_code_invalid`. A code at its cap is
+        `409 credit_code_exhausted`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreditRedeem"}
+      responses:
+        "200":
+          description: The tenant's earlier credit from this code.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Credit"}
+        "201":
+          description: The credit.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Credit"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/credits:
+    post:
+      tags: [billing]
+      operationId: grantCredit
+      summary: Grant a tenant a credit.
+      description: |
+        Staff with the `billing` grant in the tenant's brand only; anyone
+        else gets `404`. Writes one Kill Bill account credit with the reason.
+        With `expires_at`, the credit sweeper reverses the unused part at
+        that time. Idempotent on `idempotency_key` for the staff member in
+        the tenant: a retry returns the credit with `200`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreditGrant"}
+      responses:
+        "200":
+          description: The credit of an earlier request with this key.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Credit"}
+        "201":
+          description: The credit.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Credit"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/billing/credentials:
+    get:
+      tags: [billing]
+      operationId: getBillingCredentials
+      summary: Issue a short-lived billing credential.
+      description: |
+        Needs `billing:manage`. Kill Bill has no short-lived tenant
+        credentials, so Core issues its own 15-minute token. Send it as
+        `Authorization: Bearer <token>` to the proxy route, which calls Kill
+        Bill with the brand's credentials, limited to the tenant's own Kill
+        Bill account. Core checks the holder's membership or API key and
+        `billing:manage` again on every proxied request.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      responses:
+        "200":
+          description: The credential.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BillingCredential"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/billing/proxy/{path}:
+    get:
+      tags: [billing]
+      operationId: proxyBillingGet
+      summary: Read the tenant's Kill Bill account through Core.
+      description: |
+        Authenticated by a billing credential, `Authorization: Bearer
+        zsbc_...`. `path` is a Kill Bill path such as
+        `1.0/kb/accounts/<account_id>/invoices`, with its query. Only
+        `1.0/kb/accounts?externalKey=<tenant ID>` and paths under
+        `1.0/kb/accounts/<account_id>` of the tenant's own account are
+        accepted; anything else is `404`. Kill Bill's successful answer is
+        returned as it is; a refusal is `422 billing_rejected` with Kill
+        Bill's error code only.
+      security: [{billingCredential: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ProxyPath"
+      responses:
+        "200":
+          description: Kill Bill's answer.
+          content:
+            application/json:
+              schema: {}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    post:
+      tags: [billing]
+      operationId: proxyBillingPost
+      summary: Write to the tenant's Kill Bill account through Core.
+      description: |
+        Authenticated by a billing credential. Accepted: `POST
+        1.0/kb/accounts/<account_id>/paymentMethods` for the tenant's own
+        account with the brand's payment plugin and only the fields
+        `pluginName`, `externalKey`, `pluginInfo` and `isDefault`, and `POST
+        1.0/kb/subscriptions` naming the tenant's own account with only plan
+        fields. A `bundleExternalKey` must be absent, null or the external
+        key of one of the tenant's own bundles in Kill Bill. Price
+        overrides, billing dates, payments, credits, usage and blocking
+        states are refused with `404`. The tenant must be active. Each write
+        is audited as `billing.proxy.write` with the Kill Bill IDs.
+      security: [{billingCredential: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ProxyPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object}
+      responses:
+        "201":
+          description: Kill Bill's answer. `Location` points at the proxy route.
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/billing/webhooks/killbill/{brand}/{token}:
+    post:
+      tags: [billing]
+      operationId: receiveKillBillNotification
+      summary: Receive a Kill Bill push notification.
+      description: |
+        Kill Bill posts its push notifications here. Brand apply registers
+        the URL on the brand's Kill Bill tenant. `token` is the brand's
+        callback token, derived from `ZS_KILLBILL_WEBHOOK_SECRET`; a wrong
+        brand or token is `404`. The notification must name an account of a
+        tenant of the brand, or it is acknowledged and ignored. Notifications
+        are deduplicated on the body and the state Core reads from Kill Bill
+        when they arrive, so a retry is dropped and a change that sends the
+        same body is not. They refresh the tenant's billing standing from
+        Kill Bill, and become the Core events `billing.invoice.created`,
+        `billing.payment.succeeded`, `billing.payment.failed`,
+        `billing.overdue.changed` and `billing.subscription.changed` in the
+        outbox.
+      parameters:
+        - name: brand
+          in: path
+          required: true
+          schema: {$ref: "#/components/schemas/BrandId"}
+        - name: token
+          in: path
+          required: true
+          schema: {type: string, pattern: "^[0-9a-f]{64}$"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KillBillNotification"}
+      responses:
+        "204":
+          description: Handled, a duplicate, or ignored.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
 components:
   securitySchemes:
     bearer:
       type: http
       scheme: bearer
       description: A Keycloak access token from the brand's realm, signed with RS256, or a tenant API key `zs_<brand slug>_<random>`.
+    billingCredential:
+      type: http
+      scheme: bearer
+      description: A billing credential `zsbc_...` from `GET /v1/tenants/{id}/billing/credentials`, valid for 15 minutes.
   headers:
     RequestId:
       description: The request ID. A valid inbound `X-Request-ID` is echoed; otherwise the server assigns one.
@@ -1008,6 +1673,36 @@ components:
       required: true
       description: An API key ID.
       schema: {$ref: "#/components/schemas/ApiKeyId"}
+    SubscriptionIdPath:
+      name: sub
+      in: path
+      required: true
+      description: A Kill Bill subscription ID of the tenant.
+      schema: {$ref: "#/components/schemas/KillBillId"}
+    InvoiceIdPath:
+      name: inv
+      in: path
+      required: true
+      description: A Kill Bill invoice ID of the tenant.
+      schema: {$ref: "#/components/schemas/KillBillId"}
+    PaymentIdPath:
+      name: pay
+      in: path
+      required: true
+      description: A Kill Bill payment ID of the tenant.
+      schema: {$ref: "#/components/schemas/KillBillId"}
+    PaymentMethodIdPath:
+      name: pm
+      in: path
+      required: true
+      description: A Kill Bill payment method ID of the tenant.
+      schema: {$ref: "#/components/schemas/KillBillId"}
+    ProxyPath:
+      name: path
+      in: path
+      required: true
+      description: A Kill Bill path such as `1.0/kb/accounts/<account_id>`. It may hold slashes.
+      schema: {type: string}
     Limit:
       name: limit
       in: query
@@ -1279,7 +1974,7 @@ components:
       properties:
         target:
           type: string
-          enum: [core.brand, keycloak.realm, keycloak.authentication_flow, keycloak.required_action, keycloak.client, keycloak.client_scope, keycloak.identity_provider, keycloak.mfa_policy, killbill.tenant, killbill.catalogue, killbill.overdue, killbill.plugin_config]
+          enum: [core.brand, keycloak.realm, keycloak.authentication_flow, keycloak.required_action, keycloak.client, keycloak.client_scope, keycloak.identity_provider, keycloak.mfa_policy, killbill.tenant, killbill.catalogue, killbill.overdue, killbill.plugin_config, killbill.plugin, killbill.notification_callback]
         name: {type: string}
         action: {type: string, enum: [create, update]}
         fields:
@@ -1609,3 +2304,381 @@ components:
         secret:
           type: string
           description: "`zs_<brand slug>_<random>`. Shown once and never stored."
+    KillBillId:
+      type: string
+      description: The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+      pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    Currency:
+      type: string
+      description: An ISO 4217 currency code.
+      pattern: "^[A-Z]{3}$"
+    Money:
+      type: object
+      required: [currency, amount_minor]
+      additionalProperties: false
+      properties:
+        currency: {$ref: "#/components/schemas/Currency"}
+        amount_minor: {type: integer, format: int64, description: "The amount in minor units of the currency, such as cents."}
+    Catalogue:
+      type: object
+      required: [name, effective_date, currencies, units, products]
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        effective_date: {type: string}
+        currencies:
+          type: array
+          items: {$ref: "#/components/schemas/Currency"}
+        units:
+          type: array
+          items: {type: string}
+        products:
+          type: array
+          items: {$ref: "#/components/schemas/CatalogueProduct"}
+    CatalogueProduct:
+      type: object
+      required: [name, category, features, plans]
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        pretty_name: {type: string}
+        category: {type: string, description: "BASE, ADD_ON or STANDALONE."}
+        features:
+          type: array
+          description: What an active subscription to a plan of the product entitles to, the product name and the usage units of its plans.
+          items: {type: string}
+        plans:
+          type: array
+          items: {$ref: "#/components/schemas/CataloguePlan"}
+    CataloguePlan:
+      type: object
+      required: [name, billing_period, phases]
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        pretty_name: {type: string}
+        billing_period: {type: string}
+        phases:
+          type: array
+          items: {$ref: "#/components/schemas/CataloguePhase"}
+    CataloguePhase:
+      type: object
+      required: [type, duration, fixed_prices, recurring_prices, usage]
+      additionalProperties: false
+      properties:
+        type: {type: string, description: "TRIAL, DISCOUNT, FIXEDTERM or EVERGREEN."}
+        duration:
+          oneOf:
+            - {$ref: "#/components/schemas/PhaseDuration"}
+            - {type: "null"}
+          description: Null for an unlimited phase.
+        fixed_prices:
+          type: array
+          items: {$ref: "#/components/schemas/Money"}
+        recurring_prices:
+          type: array
+          items: {$ref: "#/components/schemas/Money"}
+        usage:
+          type: array
+          items: {$ref: "#/components/schemas/UsagePrice"}
+    PhaseDuration:
+      type: object
+      required: [unit, number]
+      additionalProperties: false
+      properties:
+        unit: {type: string}
+        number: {type: integer}
+    UsagePrice:
+      type: object
+      required: [unit, block_size, prices]
+      additionalProperties: false
+      properties:
+        unit: {type: string}
+        block_size: {type: string}
+        prices:
+          type: array
+          items: {$ref: "#/components/schemas/Money"}
+    BillingSummary:
+      type: object
+      required: [currency, balance_minor, credit_minor, overdue, on_hold, hold_reasons, payment_plugin]
+      additionalProperties: false
+      properties:
+        currency: {$ref: "#/components/schemas/Currency"}
+        balance_minor: {type: integer, format: int64, description: "What the account owes in minor units, negative when it holds credit."}
+        credit_minor: {type: integer, format: int64, description: The account credit in minor units.}
+        overdue: {$ref: "#/components/schemas/OverdueState"}
+        on_hold: {type: boolean}
+        hold_reasons:
+          type: array
+          items:
+            type: string
+            enum: [tenant_suspended, account_blocked, overdue_blocks_changes, overdue_disables_entitlement]
+        payment_plugin: {type: string, description: "The Kill Bill payment plugin of the brand, or __EXTERNAL_PAYMENT__."}
+    OverdueState:
+      type: object
+      required: [state, clear, blocks_changes, disables_entitlement]
+      additionalProperties: false
+      properties:
+        state: {type: string}
+        clear: {type: boolean}
+        blocks_changes: {type: boolean}
+        disables_entitlement: {type: boolean}
+    Subscription:
+      type: object
+      required: [id, bundle_id, product, category, plan, phase, billing_period, state]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/KillBillId"}
+        bundle_id: {type: string}
+        product: {type: string}
+        category: {type: string}
+        plan: {type: string}
+        phase: {type: string}
+        billing_period: {type: string}
+        state: {type: string, description: "PENDING, ACTIVE, BLOCKED, CANCELLED or EXPIRED."}
+        start_date: {type: string}
+        charged_through_date: {type: string}
+        cancelled_date: {type: string}
+        billing_end_date: {type: string}
+    SubscriptionList:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Subscription"}
+    SubscriptionCreate:
+      type: object
+      required: [plan, idempotency_key]
+      additionalProperties: false
+      properties:
+        plan: {type: string, minLength: 1, maxLength: 255}
+        idempotency_key: {$ref: "#/components/schemas/IdempotencyKey"}
+        reason: {type: string, maxLength: 1000, description: Recorded in Kill Bill's audit log.}
+    SubscriptionChange:
+      type: object
+      required: [plan, policy]
+      additionalProperties: false
+      properties:
+        plan: {type: string, minLength: 1, maxLength: 255}
+        policy: {type: string, enum: [immediate, end_of_term]}
+        reason: {type: string, maxLength: 1000, description: Recorded in Kill Bill's audit log.}
+    Entitlement:
+      type: object
+      required: [allowed, limit, used, remaining, reason]
+      additionalProperties: false
+      properties:
+        allowed: {type: boolean}
+        limit: {type: [integer, "null"], format: int64}
+        used: {type: [integer, "null"], format: int64}
+        remaining: {type: [integer, "null"], format: int64}
+        reason:
+          type: string
+          enum: [included_in_plan, no_active_subscription, feature_not_in_plan, wallet_on_hold, billing_unavailable, tenant_not_found, feature_invalid]
+        plan: {type: string, description: "The plan that grants the feature, when allowed."}
+    Invoice:
+      type: object
+      required: [id, number, date, target_date, status, currency, amount_minor, balance_minor, credit_adj_minor, refund_adj_minor]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/KillBillId"}
+        number: {type: string}
+        date: {type: string}
+        target_date: {type: string}
+        status: {type: string, description: "DRAFT, COMMITTED or VOID."}
+        currency: {$ref: "#/components/schemas/Currency"}
+        amount_minor: {type: integer, format: int64}
+        balance_minor: {type: integer, format: int64}
+        credit_adj_minor: {type: integer, format: int64}
+        refund_adj_minor: {type: integer, format: int64}
+        items:
+          type: array
+          description: The lines, on a single invoice only.
+          items: {$ref: "#/components/schemas/InvoiceItem"}
+    InvoiceItem:
+      type: object
+      required: [id, type, amount_minor, currency]
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        type: {type: string}
+        description: {type: string}
+        subscription_id: {type: string}
+        product: {type: string}
+        plan: {type: string}
+        phase: {type: string}
+        usage: {type: string}
+        start_date: {type: string}
+        end_date: {type: string}
+        amount_minor: {type: integer, format: int64}
+        currency: {$ref: "#/components/schemas/Currency"}
+    InvoicePage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Invoice"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    Payment:
+      type: object
+      required: [id, number, currency, payment_method_id, auth_minor, captured_minor, purchased_minor, refunded_minor, credited_minor, transactions]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/KillBillId"}
+        number: {type: string}
+        currency: {$ref: "#/components/schemas/Currency"}
+        payment_method_id: {type: string}
+        auth_minor: {type: integer, format: int64}
+        captured_minor: {type: integer, format: int64}
+        purchased_minor: {type: integer, format: int64}
+        refunded_minor: {type: integer, format: int64}
+        credited_minor: {type: integer, format: int64}
+        transactions:
+          type: array
+          items: {$ref: "#/components/schemas/PaymentTransaction"}
+    PaymentTransaction:
+      type: object
+      required: [id, type, status, effective_date, amount_minor, currency]
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        type: {type: string}
+        status: {type: string}
+        effective_date: {type: string}
+        amount_minor: {type: integer, format: int64}
+        currency: {$ref: "#/components/schemas/Currency"}
+    PaymentPage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Payment"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    RefundRequest:
+      type: object
+      required: [amount_minor, reason, idempotency_key]
+      additionalProperties: false
+      properties:
+        amount_minor: {type: integer, format: int64, minimum: 1}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+        idempotency_key: {$ref: "#/components/schemas/IdempotencyKey"}
+    PaymentMethod:
+      type: object
+      required: [id, plugin_name, is_default]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/KillBillId"}
+        plugin_name: {type: string}
+        is_default: {type: boolean}
+    PaymentMethodList:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/PaymentMethod"}
+    PluginProperty:
+      type: object
+      required: [key, value]
+      additionalProperties: false
+      properties:
+        key: {type: string, pattern: "^[A-Za-z0-9_.-]{1,64}$"}
+        value: {type: string, maxLength: 2048}
+    PaymentMethodCreate:
+      type: object
+      required: [idempotency_key]
+      additionalProperties: false
+      properties:
+        idempotency_key: {$ref: "#/components/schemas/IdempotencyKey"}
+        set_default: {type: boolean, default: false}
+        hosted_page: {type: boolean, default: false, description: Ask the plugin for its hosted payment page.}
+        hosted_page_fields:
+          type: array
+          maxItems: 20
+          description: Fields the plugin's hosted page takes, such as return URLs.
+          items: {$ref: "#/components/schemas/PluginProperty"}
+        external_payment_method_id:
+          type: string
+          maxLength: 255
+          description: The token the provider's own client library made, such as a Stripe payment method ID. Never card data.
+        plugin_properties:
+          type: array
+          maxItems: 20
+          description: Properties passed to the plugin. Never logged.
+          items: {$ref: "#/components/schemas/PluginProperty"}
+    HostedForm:
+      type: object
+      required: [fields]
+      additionalProperties: false
+      properties:
+        method: {type: string}
+        url: {type: string}
+        fields:
+          type: object
+          description: What the plugin returned, such as a provider session ID.
+    PaymentMethodAdded:
+      type: object
+      required: [payment_method]
+      additionalProperties: false
+      properties:
+        payment_method:
+          oneOf:
+            - {$ref: "#/components/schemas/PaymentMethod"}
+            - {type: "null"}
+        form: {$ref: "#/components/schemas/HostedForm"}
+    CreditRedeem:
+      type: object
+      required: [code]
+      additionalProperties: false
+      properties:
+        code: {type: string, minLength: 4, maxLength: 64}
+    CreditGrant:
+      type: object
+      required: [amount_minor, currency, reason, idempotency_key]
+      additionalProperties: false
+      properties:
+        amount_minor: {type: integer, format: int64, minimum: 1}
+        currency: {$ref: "#/components/schemas/Currency"}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+        expires_at: {type: string, format: date-time, description: When the sweeper reverses the unused part. Within 10 years.}
+        idempotency_key: {$ref: "#/components/schemas/IdempotencyKey"}
+    Credit:
+      type: object
+      required: [id, source, amount_minor, currency, killbill_credit_id, expires_at, expired_at, reversed_minor, created_at]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: "^crd_[0-7][0-9a-hjkmnp-tv-z]{25}$"}
+        source: {type: string, enum: [credit_code, staff]}
+        credit_code_id: {type: string, pattern: "^ccd_[0-7][0-9a-hjkmnp-tv-z]{25}$"}
+        amount_minor: {type: integer, format: int64}
+        currency: {$ref: "#/components/schemas/Currency"}
+        killbill_credit_id: {$ref: "#/components/schemas/KillBillId"}
+        expires_at: {type: [string, "null"], format: date-time}
+        expired_at: {type: [string, "null"], format: date-time}
+        reversed_minor: {type: integer, format: int64}
+        created_at: {type: string, format: date-time}
+    BillingCredential:
+      type: object
+      required: [token, expires_at, proxy_path, account_id, account_external_key]
+      additionalProperties: false
+      properties:
+        token: {type: string, description: "`zsbc_...`. Valid for 15 minutes."}
+        expires_at: {type: string, format: date-time}
+        proxy_path: {type: string, description: The proxy route of the tenant.}
+        account_id: {$ref: "#/components/schemas/KillBillId"}
+        account_external_key: {$ref: "#/components/schemas/TenantId"}
+    KillBillNotification:
+      type: object
+      required: [eventType]
+      properties:
+        eventType: {type: string}
+        accountId: {type: [string, "null"]}
+        objectType: {type: string}
+        objectId: {type: string}
+        metaData: {type: [string, "null"]}

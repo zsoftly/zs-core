@@ -22,6 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/zsoftly/zs-core/pkg/billing"
 	"github.com/zsoftly/zs-core/pkg/brand"
 	"github.com/zsoftly/zs-core/pkg/identity"
 	"github.com/zsoftly/zs-core/pkg/tenant"
@@ -59,6 +60,10 @@ type Options struct {
 	// tenant is 503 not_ready and memberships are mirrored to Keycloak only
 	// by the sweeper.
 	Tenants tenant.Engines
+	// Billing is the billing surface on Kill Bill. Without it the billing
+	// routes answer 503 not_ready, and entitlement checks answer allowed
+	// false.
+	Billing *billing.Service
 	// Now defaults to time.Now.
 	Now func() time.Time
 }
@@ -72,6 +77,7 @@ type server struct {
 	brandDeps  brand.Deps
 	brandsDir  string
 	tenants    tenant.Engines
+	billing    *billing.Service
 	now        func() time.Time
 }
 
@@ -90,6 +96,7 @@ func New(opts Options) http.Handler {
 		brandDeps:  opts.BrandDeps,
 		brandsDir:  opts.BrandsDir,
 		tenants:    opts.Tenants,
+		billing:    opts.Billing,
 		now:        opts.Now,
 	}
 	if s.now == nil {
@@ -129,6 +136,29 @@ func New(opts Options) http.Handler {
 	mux.Handle("POST /v1/tenants/{id}/api-keys", s.member(s.createAPIKey))
 	mux.Handle("DELETE /v1/tenants/{id}/api-keys/{key}", s.member(s.revokeAPIKey))
 	mux.Handle("GET /v1/tenants/{id}/audit/events", s.member(s.listTenantAuditEvents))
+
+	mux.Handle("GET /v1/brands/{id}/catalogue", s.authenticate(http.HandlerFunc(s.getCatalogue)))
+	mux.Handle("GET /v1/tenants/{id}/billing", s.member(s.getBillingSummary))
+	mux.Handle("GET /v1/tenants/{id}/subscriptions", s.member(s.listSubscriptions))
+	mux.Handle("POST /v1/tenants/{id}/subscriptions", s.member(s.createSubscription))
+	mux.Handle("POST /v1/tenants/{id}/subscriptions/{sub}/change", s.member(s.changeSubscriptionPlan))
+	mux.Handle("DELETE /v1/tenants/{id}/subscriptions/{sub}", s.member(s.cancelSubscription))
+	mux.Handle("GET /v1/tenants/{id}/entitlements/{feature}", s.member(s.checkEntitlement))
+	mux.Handle("GET /v1/tenants/{id}/invoices", s.member(s.listInvoices))
+	mux.Handle("GET /v1/tenants/{id}/invoices/{inv}", s.member(s.getInvoice))
+	mux.Handle("GET /v1/tenants/{id}/invoices/{inv}/pdf", s.member(s.getInvoicePDF))
+	mux.Handle("GET /v1/tenants/{id}/payments", s.member(s.listPayments))
+	mux.Handle("POST /v1/tenants/{id}/payments/{pay}/refund", s.authenticate(http.HandlerFunc(s.refundPayment)))
+	mux.Handle("GET /v1/tenants/{id}/payment-methods", s.member(s.listPaymentMethods))
+	mux.Handle("POST /v1/tenants/{id}/payment-methods", s.member(s.addPaymentMethod))
+	mux.Handle("PUT /v1/tenants/{id}/payment-methods/{pm}/default", s.member(s.setDefaultPaymentMethod))
+	mux.Handle("DELETE /v1/tenants/{id}/payment-methods/{pm}", s.member(s.deletePaymentMethod))
+	mux.Handle("POST /v1/tenants/{id}/credits/redeem", s.member(s.redeemCreditCode))
+	mux.Handle("POST /v1/staff/tenants/{id}/credits", s.authenticate(http.HandlerFunc(s.grantCredit)))
+	mux.Handle("GET /v1/tenants/{id}/billing/credentials", s.member(s.getBillingCredentials))
+	mux.HandleFunc("GET /v1/tenants/{id}/billing/proxy/{path...}", s.proxyBilling)
+	mux.HandleFunc("POST /v1/tenants/{id}/billing/proxy/{path...}", s.proxyBilling)
+	mux.HandleFunc("POST /v1/billing/webhooks/killbill/{brand}/{token}", s.receiveKillBillNotification)
 
 	var h http.Handler = s.route(mux)
 	h = s.limitBody(h)

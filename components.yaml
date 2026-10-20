@@ -31,15 +31,20 @@ components:
 killbill_plugins:
   # Kill Bill 0.24 runs Java plugins only. The Ruby plugin lines (stripe 6.x, paypal-express 6.x) do not install.
   # Versions here are the Java artifacts on Maven Central (org.kill-bill.billing.plugin.java) that KPM installs at runtime.
+  # brand apply installs a brand's payment plugin from this repository: <repository>/<group path>/<name>/<version>/<name>-<version>.jar.
+  # The repository must be https. sha256 is the SHA-256 of that jar, read from Maven Central. Brand apply checks it before KPM installs the jar.
+  repository: https://repo1.maven.org/maven2
   approved_payment_plugins:
     - name: stripe
       version: 8.0.3
       artifact: org.kill-bill.billing.plugin.java:stripe-plugin
+      sha256: 48ae54fe99092693de2b648c6d755b44170062eee9b9a471440f4c8bff1bc0dd
       source: https://github.com/killbill/killbill-stripe-plugin
       status: verified_install   # installed and started on the reference stack; no live payment exercised yet
     - name: adyen
       version: 0.10.0
       artifact: org.kill-bill.billing.plugin.java:adyen-plugin
+      sha256: b0e693f9748f13545a3fd41215d2dfd3fb83cbc2be5fcaa6177decbcb425aad6
       source: https://github.com/killbill/killbill-adyen-plugin
       status: pinned_not_installed
     - name: paypal-express
@@ -50,6 +55,7 @@ killbill_plugins:
     - name: email-notifications
       version: 0.8.1
       artifact: org.kill-bill.billing.plugin.java:killbill-email-notifications-plugin
+      sha256: 2d953e90eea23962879d1ac8f65b1c6b944d6930f060ff72dd1ac3ca7eee7328
       source: https://github.com/killbill/killbill-email-notifications-plugin
       status: pinned_not_installed
   platform_bundles_in_image:   # shipped inside killbill/killbill:0.24.22, not installed by Core

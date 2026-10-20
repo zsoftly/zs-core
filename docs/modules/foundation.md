@@ -17,6 +17,7 @@ The foundation is the shared plumbing every module uses. It fixes the error enve
 | `pkg/audit` | Append-only audit trail; see [audit.md](audit.md). |
 | `pkg/tenant` | Tenants, memberships, teams, invitations, activation and the sweeper. See [tenants.md](tenants.md). |
 | `pkg/apikey` | Tenant API keys. See [api-keys.md](api-keys.md). |
+| `pkg/billing` | The billing surface on Kill Bill: catalogue, account summary, subscriptions, invoices, payments, payment methods, credit codes, credits and their expiry, entitlements, push notifications and the billing credential proxy. See [billing.md](billing.md). |
 | `internal/config` | Environment configuration with strict validation. |
 | `internal/database` | Pool and the embedded forward-only migration runner. |
 | `internal/httpapi` | Router, middleware, health probes and the `/v1` routes. |
@@ -82,12 +83,21 @@ Clients branch on `code`. `message` is safe to show. It never carries database, 
 | ZS-1610 | `tenant_closed` | 409 | no |
 | ZS-1700 | `api_key_invalid` | 401 | no |
 | ZS-1701 | `api_key_owner_removed` | 401 | no |
+| ZS-1800 | `billing_rejected` | 422 | no |
+| ZS-1801 | `invoice_pdf_unavailable` | 404 | no |
+| ZS-1802 | `plugin_unavailable` | 422 | no |
+| ZS-1803 | `credit_code_invalid` | 404 | no |
+| ZS-1804 | `credit_code_exhausted` | 409 | no |
+| ZS-1805 | `wallet_on_hold` | 409 | no |
+| ZS-1806 | `billing_token_invalid` | 401 | no |
 
-Codes and names are stable. New codes are added. Existing codes are never reused. The ZS-1600 range covers tenants, memberships, teams and invitations, and the ZS-1700 range covers API keys. See [tenants.md](tenants.md) and [api-keys.md](api-keys.md).
+Codes and names are stable. New codes are added. Existing codes are never reused. The ZS-1600 range covers tenants, memberships, teams and invitations, the ZS-1700 range covers API keys, and the ZS-1800 range covers billing. See [tenants.md](tenants.md), [api-keys.md](api-keys.md) and [billing.md](billing.md).
+
+`billing_rejected` carries Kill Bill's numeric error code in its message and never Kill Bill's text. A Kill Bill 5xx or timeout is `billing_unavailable`.
 
 ## Public IDs
 
-Internally every ID is a UUIDv7. On the API it carries a type prefix and the UUID in lowercase Crockford base32, 26 characters: `tnt_01m5bzbkj6en5tr1ekx7m6xdae`. IDs sort by creation time. The prefixes are `brd_` brand, `tnt_` tenant, `mem_` membership, `inv_` invitation, `key_` API key, `grt_` grant, `idn_` identity, `rsv_` reservation, `usg_` usage, `ord_` order, `evt_` event and `aud_` audit event. `idgen.ParseAs` rejects an ID with the wrong prefix before any query runs.
+Internally every ID is a UUIDv7. On the API it carries a type prefix and the UUID in lowercase Crockford base32, 26 characters: `tnt_01m5bzbkj6en5tr1ekx7m6xdae`. IDs sort by creation time. The prefixes are `brd_` brand, `tnt_` tenant, `mem_` membership, `inv_` invitation, `key_` API key, `grt_` grant, `idn_` identity, `rsv_` reservation, `usg_` usage, `ord_` order, `evt_` event, `aud_` audit event, `ccd_` credit code and `crd_` credit. Objects that live in Kill Bill only, such as subscriptions, invoices and payments, keep their Kill Bill IDs. See [billing.md](billing.md). `idgen.ParseAs` rejects an ID with the wrong prefix before any query runs.
 
 ## Scope
 
@@ -148,6 +158,7 @@ Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosni
 | `GET /v1/brands/{id}`, `POST /v1/brands/{id}/apply` | A brand and brand apply, staff `operator` only; see [brands.md](brands.md). |
 | `GET /v1/audit/events` | Audit events of the caller's brand or one of its tenants, staff `operator` only; see [audit.md](audit.md). |
 | `POST /v1/tenants/personal`, `POST /v1/tenants`, `/v1/tenants/{id}/...`, `POST /v1/invitations/accept`, `POST /v1/staff/tenants/{id}/activation` | Tenants, members, teams, invitations, activation, API keys and the tenant audit trail. See [tenants.md](tenants.md), [api-keys.md](api-keys.md) and `api/openapi.yaml`. |
+| `GET /v1/brands/{id}/catalogue`, the billing routes under `/v1/tenants/{id}/...`, `POST /v1/staff/tenants/{id}/credits`, `POST /v1/billing/webhooks/killbill/{brand}/{token}` | The billing surface on Kill Bill. See [billing.md](billing.md). |
 
 ## Known limits
 

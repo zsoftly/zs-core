@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/zsoftly/zs-core/internal/components"
 	"github.com/zsoftly/zs-core/internal/httpapi"
 	"github.com/zsoftly/zs-core/internal/keycloak"
 	"github.com/zsoftly/zs-core/internal/killbill"
@@ -92,7 +93,12 @@ func (s stack) deps(t *testing.T, db *postgrestest.DB) brand.Deps {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
-	return brand.Deps{DB: db.Pool, Keycloak: s.kc, KillBill: s.kb, Secrets: secrets.Default{}, Files: root.FS()}
+	pins, err := components.Load(filepath.Join("..", "..", "components.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return brand.Deps{DB: db.Pool, Keycloak: s.kc, KillBill: s.kb, Secrets: secrets.Default{}, Files: root.FS(),
+		PaymentPlugins: pins.KillBillPlugins.ApprovedPaymentPlugins, PluginRepository: pins.KillBillPlugins.Repository}
 }
 
 var cli = brand.Options{Actor: events.Actor{Type: events.ActorService, ID: "zs-core-cli:stack-test"}, CreatedBy: "zs-core-cli:stack-test", Reason: "stack test"}
@@ -294,6 +300,7 @@ billing:
   seller: {name: ZSoftly Technologies Inc., country: CA}
   payment_plugin:
     name: stripe
+    mode: test
     config_ref: env://BRAND_ZS_SECOND__PLUGIN_CONFIG
 `
 	m, err := brand.Parse([]byte(doc))

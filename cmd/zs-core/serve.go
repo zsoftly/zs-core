@@ -9,12 +9,14 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/zsoftly/zs-core/internal/components"
 	"github.com/zsoftly/zs-core/internal/config"
 	"github.com/zsoftly/zs-core/internal/httpapi"
 	"github.com/zsoftly/zs-core/internal/keycloak"
 	"github.com/zsoftly/zs-core/internal/killbill"
 	"github.com/zsoftly/zs-core/internal/secrets"
 	"github.com/zsoftly/zs-core/migrations"
+	"github.com/zsoftly/zs-core/pkg/billing"
 	"github.com/zsoftly/zs-core/pkg/brand"
 	"github.com/zsoftly/zs-core/pkg/identity"
 	"github.com/zsoftly/zs-core/pkg/tenant"
@@ -49,6 +51,11 @@ func newAPIOptions(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, l
 		opts.BrandDeps.KillBill = kb
 	}
 	opts.Tenants = tenant.Engines{Keycloak: opts.BrandDeps.Keycloak, KillBill: opts.BrandDeps.KillBill, Secrets: resolver}
+	applyBillingDeps(&opts.BrandDeps, cfg, log)
+	if opts.BrandDeps.KillBill != nil {
+		opts.Billing = &billing.Service{DB: pool, KillBill: opts.BrandDeps.KillBill, Secrets: resolver,
+			WebhookSecret: []byte(cfg.KillBillWebhookSecret), Log: log}
+	}
 	if cfg.BrandsDir != "" {
 		if err := checkBrandsDir(ctx, cfg.BrandsDir, resolver, pool, log); err != nil {
 			return httpapi.Options{}, err
@@ -88,6 +95,36 @@ func checkBrandsDir(ctx context.Context, dir string, refs brand.SecretRefChecker
 		}
 	}
 	return nil
+}
+
+// applyBillingDeps gives brand apply the approved payment plugins of
+// components.yaml, read from the working directory, and the push
+// notification callback settings. Without components.yaml, an apply that
+// names a payment plugin is refused with plugin_unavailable.
+func applyBillingDeps(deps *brand.Deps, cfg config.Config, log *slog.Logger) {
+	deps.WebhookBaseURL = cfg.KillBillCallbackURL
+	deps.WebhookSecret = []byte(cfg.KillBillWebhookSecret)
+	m, err := components.Load(defaultComponentsFile)
+	if err != nil {
+		if log != nil {
+			log.Warn("components.yaml not loaded; brand apply refuses payment plugins", "error", err.Error())
+		}
+		return
+	}
+	deps.PaymentPlugins = m.KillBillPlugins.ApprovedPaymentPlugins
+	deps.PluginRepository = m.KillBillPlugins.Repository
+}
+
+// startCreditSweeper runs the credit expiry sweeper every interval until
+// ctx ends, when billing is configured.
+func startCreditSweeper(ctx context.Context, svc *billing.Service, interval time.Duration, log *slog.Logger) {
+	if !svc.Ready() {
+		log.Warn("credit sweeper not started: billing needs the Kill Bill admin settings")
+		return
+	}
+	sweeper := &billing.CreditSweeper{Service: svc, Log: log}
+	go sweeper.Run(ctx, interval)
+	log.Info("credit sweeper started", "interval", interval.String())
 }
 
 func newKeycloak(cfg config.Config) (*keycloak.Client, error) {

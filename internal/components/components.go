@@ -32,17 +32,22 @@ type Component struct {
 	Source   string `yaml:"source"`
 }
 
-// Plugin is a pinned Kill Bill plugin.
+// Plugin is a pinned Kill Bill plugin. Sha256 is the SHA-256 of the jar in
+// the repository, in lowercase hex. Core checks it before it asks KPM to
+// install the jar.
 type Plugin struct {
 	Name     string `yaml:"name"`
 	Version  string `yaml:"version"`
 	Artifact string `yaml:"artifact"`
+	Sha256   string `yaml:"sha256"`
 	Source   string `yaml:"source"`
 	Status   string `yaml:"status"`
 }
 
-// KillBillPlugins are the plugins Core knows about.
+// KillBillPlugins are the plugins Core knows about. Repository is the Maven
+// repository that KPM downloads plugin jars from.
 type KillBillPlugins struct {
+	Repository             string   `yaml:"repository"`
 	ApprovedPaymentPlugins []Plugin `yaml:"approved_payment_plugins"`
 	Installable            []Plugin `yaml:"installable"`
 	PlatformBundlesInImage []string `yaml:"platform_bundles_in_image"`
@@ -109,6 +114,19 @@ func (m Manifest) validate() error {
 			problems = append(problems, fmt.Sprintf("components.%s.digest %q is not sha256:<64 lowercase hex>", name, digest))
 		}
 	}
+	for _, list := range []struct {
+		path    string
+		plugins []Plugin
+	}{{"killbill_plugins.approved_payment_plugins", m.KillBillPlugins.ApprovedPaymentPlugins}, {"killbill_plugins.installable", m.KillBillPlugins.Installable}} {
+		for _, p := range list.plugins {
+			switch {
+			case p.Artifact == "" && p.Sha256 != "":
+				problems = append(problems, fmt.Sprintf("%s %s has a sha256 but no artifact", list.path, p.Name))
+			case p.Artifact != "" && !sha256Pattern.MatchString(p.Sha256):
+				problems = append(problems, fmt.Sprintf("%s %s.sha256 %q is not 64 lowercase hex", list.path, p.Name, p.Sha256))
+			}
+		}
+	}
 	if len(problems) > 0 {
 		sort.Strings(problems)
 		return errors.New("invalid components file: " + strings.Join(problems, "; "))
@@ -116,8 +134,12 @@ func (m Manifest) validate() error {
 	return nil
 }
 
-// digestPattern is the form of an image digest pin.
-var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+// digestPattern is the form of an image digest pin, and sha256Pattern the
+// form of a plugin jar digest.
+var (
+	digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+)
 
 // PinnedReference returns the image reference pinned by digest, such as
 // postgres@sha256:..., which is what the reference stack pulls.

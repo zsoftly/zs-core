@@ -208,11 +208,12 @@
         "payment_plugin": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["name", "config_ref"],
+          "required": ["name", "mode", "config_ref"],
           "properties": {
             "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
             "version": {"type": "string", "pattern": "^[0-9A-Za-z.+-]{1,50}$"},
-            "config_key": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "description": "The plugin service name Kill Bill stores the configuration under. Defaults to killbill-<name>."},
+            "mode": {"type": "string", "enum": ["test", "live"], "description": "test is the only mode v1 accepts. live is refused."},
+            "config_key": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "description": "The plugin service name Kill Bill stores the configuration under. Must be empty or killbill-<name>, which is the default."},
             "config_ref": {"$ref": "#/$defs/secretRef"}
           }
         },

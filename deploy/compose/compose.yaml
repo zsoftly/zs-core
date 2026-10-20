@@ -195,6 +195,11 @@ services:
       ZS_KILLBILL_ADMIN_USER: admin
       ZS_KILLBILL_ADMIN_PASSWORD: ${KILLBILL_ADMIN_PASSWORD:?set in .env}
       ZS_KAUI_URL: http://kaui:8080
+      # Kill Bill push notifications: brand apply registers each brand's
+      # callback under this URL, which Kill Bill reaches on the compose
+      # network, and the secret verifies them.
+      ZS_KILLBILL_WEBHOOK_SECRET: ${ZS_KILLBILL_WEBHOOK_SECRET:-}
+      ZS_KILLBILL_CALLBACK_URL: http://core:8080
       # Tenant creation reads the Kill Bill tenant secret of
       # brands/zs-reference.yaml through this reference.
       BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET: ${KILLBILL_TENANT_API_SECRET:?set in .env}

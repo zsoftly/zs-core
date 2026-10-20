@@ -26,16 +26,18 @@ const (
 	Order       Prefix = "ord"
 	Event       Prefix = "evt"
 	Audit       Prefix = "aud"
+	CreditCode  Prefix = "ccd"
+	Credit      Prefix = "crd"
 )
 
 var registered = map[Prefix]struct{}{
 	Brand: {}, Tenant: {}, Membership: {}, Invitation: {}, APIKey: {}, Grant: {}, Team: {}, Identity: {},
-	Reservation: {}, Usage: {}, Order: {}, Event: {}, Audit: {},
+	Reservation: {}, Usage: {}, Order: {}, Event: {}, Audit: {}, CreditCode: {}, Credit: {},
 }
 
 // Prefixes returns every registered prefix.
 func Prefixes() []Prefix {
-	return []Prefix{Brand, Tenant, Membership, Invitation, APIKey, Grant, Team, Identity, Reservation, Usage, Order, Event, Audit}
+	return []Prefix{Brand, Tenant, Membership, Invitation, APIKey, Grant, Team, Identity, Reservation, Usage, Order, Event, Audit, CreditCode, Credit}
 }
 
 // Valid reports whether p is a registered prefix.

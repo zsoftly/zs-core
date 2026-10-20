@@ -46,6 +46,9 @@ const (
 	EnvKillBillAdminPassword   = "ZS_KILLBILL_ADMIN_PASSWORD"
 	EnvKAUIURL                 = "ZS_KAUI_URL"
 	EnvTenantSweepInterval     = "ZS_TENANT_SWEEP_INTERVAL"
+	EnvKillBillWebhookSecret   = "ZS_KILLBILL_WEBHOOK_SECRET"
+	EnvKillBillCallbackURL     = "ZS_KILLBILL_CALLBACK_URL"
+	EnvCreditSweepInterval     = "ZS_CREDIT_SWEEP_INTERVAL"
 	reservedTestVariablePrefix = "ZS_TEST_"
 )
 
@@ -62,7 +65,10 @@ const (
 	DefaultHTTPIdleTimeout       = 120 * time.Second
 	DefaultShutdownTimeout       = 15 * time.Second
 	DefaultTenantSweepInterval   = time.Minute
+	DefaultCreditSweepInterval   = time.Hour
 	maxDatabaseMaxConns          = 1000
+	// minWebhookSecretLength is the shortest ZS_KILLBILL_WEBHOOK_SECRET.
+	minWebhookSecretLength = 32
 )
 
 var known = map[string]bool{
@@ -74,7 +80,7 @@ var known = map[string]bool{
 	EnvKeycloakAdminPassword: true, EnvKillBillURL: true, EnvKillBillAdminUser: true,
 	EnvKillBillAdminPassword: true, EnvKAUIURL: true,
 	EnvKeycloakAdminClientID: true, EnvKeycloakAdminSecret: true, EnvBrandsDir: true, EnvSecretsDir: true,
-	EnvTenantSweepInterval: true,
+	EnvTenantSweepInterval: true, EnvKillBillWebhookSecret: true, EnvKillBillCallbackURL: true, EnvCreditSweepInterval: true,
 }
 
 // Config is the validated service configuration.
@@ -120,6 +126,19 @@ type Config struct {
 	// TenantSweepInterval is how often serve completes interrupted tenant
 	// creations and corrects Keycloak Organizations towards Core.
 	TenantSweepInterval time.Duration
+
+	// KillBillWebhookSecret verifies Kill Bill push notifications, through a
+	// token per brand in the callback path, and signs billing credentials.
+	// At least 32 characters.
+	KillBillWebhookSecret string
+
+	// KillBillCallbackURL is Core's base URL as Kill Bill reaches it, such
+	// as http://core:8080. With the webhook secret, brand apply registers
+	// each brand's push notification callback under it.
+	KillBillCallbackURL string
+
+	// CreditSweepInterval is how often serve expires credits Core issued.
+	CreditSweepInterval time.Duration
 }
 
 // Load reads the configuration from environ, a list of KEY=value strings as
@@ -150,6 +169,7 @@ func Load(environ []string) (Config, error) {
 		HTTPIdleTimeout:       DefaultHTTPIdleTimeout,
 		ShutdownTimeout:       DefaultShutdownTimeout,
 		TenantSweepInterval:   DefaultTenantSweepInterval,
+		CreditSweepInterval:   DefaultCreditSweepInterval,
 	}
 	fail := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 
@@ -238,6 +258,7 @@ func Load(environ []string) (Config, error) {
 	parseDuration(EnvHTTPIdleTimeout, &cfg.HTTPIdleTimeout)
 	parseDuration(EnvShutdownTimeout, &cfg.ShutdownTimeout)
 	parseDuration(EnvTenantSweepInterval, &cfg.TenantSweepInterval)
+	parseDuration(EnvCreditSweepInterval, &cfg.CreditSweepInterval)
 
 	parseURL := func(name string, target *string) {
 		v, ok := env[name]
@@ -253,6 +274,14 @@ func Load(environ []string) (Config, error) {
 	parseURL(EnvKeycloakURL, &cfg.KeycloakURL)
 	parseURL(EnvKillBillURL, &cfg.KillBillURL)
 	parseURL(EnvKAUIURL, &cfg.KAUIURL)
+	parseURL(EnvKillBillCallbackURL, &cfg.KillBillCallbackURL)
+	if v, ok := env[EnvKillBillWebhookSecret]; ok && v != "" {
+		if len(v) < minWebhookSecretLength {
+			fail("%s must be at least %d characters", EnvKillBillWebhookSecret, minWebhookSecretLength)
+		} else {
+			cfg.KillBillWebhookSecret = v
+		}
+	}
 	cfg.KeycloakRealm = env[EnvKeycloakRealm]
 	cfg.KeycloakAdminUser = env[EnvKeycloakAdminUser]
 	cfg.KeycloakAdminPassword = env[EnvKeycloakAdminPassword]

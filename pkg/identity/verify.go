@@ -62,6 +62,10 @@ type BrandConfig struct {
 	// MFAACRValues are acr values that prove a second factor. Empty means
 	// only amr is consulted.
 	MFAACRValues []string
+	// StaffMFARequired is true when the brand's mfa policy is required or
+	// required_for_staff. Every staff token then needs evidence of a second
+	// factor, whatever its age.
+	StaffMFARequired bool
 }
 
 // PublicID returns the brand's public ID.
@@ -385,6 +389,18 @@ func mfaFrom(amr []string, acr string, mfaACR []string) bool {
 	return false
 }
 
+// RequireStaffMFA returns mfa_required when the brand of p requires a second
+// factor for staff and the token shows none: no amr value of a second factor
+// and no acr value from the brand's mfa_acr_values. It does not look at the
+// age of the authentication. RequireRecentMFA does that for sensitive
+// actions.
+func RequireStaffMFA(p Principal) error {
+	if p.Brand.StaffMFARequired && !p.MFA {
+		return zserrors.New(zserrors.CodeMFARequired, "")
+	}
+	return nil
+}
+
 // RequireRecentMFA returns recent_mfa_required unless p authenticated with a
 // second factor within window of now. A zero window means RecentMFAWindow. An
 // auth_time in the future beyond the leeway is refused.
@@ -394,6 +410,19 @@ func RequireRecentMFA(p Principal, window time.Duration, now time.Time) error {
 	}
 	if !p.MFA || p.AuthTime.IsZero() || now.Sub(p.AuthTime) > window || p.AuthTime.After(now.Add(Leeway)) {
 		return zserrors.New(zserrors.CodeRecentMFARequired, "")
+	}
+	return nil
+}
+
+// RequireRecentAuth returns recent_auth_required unless p authenticated
+// interactively, with any factor, within window of now. A zero window means
+// RecentMFAWindow.
+func RequireRecentAuth(p Principal, window time.Duration, now time.Time) error {
+	if window <= 0 {
+		window = RecentMFAWindow
+	}
+	if p.AuthTime.IsZero() || now.Sub(p.AuthTime) > window || p.AuthTime.After(now.Add(Leeway)) {
+		return zserrors.New(zserrors.CodeRecentAuthRequired, "")
 	}
 	return nil
 }

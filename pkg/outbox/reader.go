@@ -39,6 +39,7 @@ type DB interface {
 type PostgresReader struct {
 	db       DB
 	claimFor time.Duration
+	types    []string
 }
 
 // NewPostgresReader returns a reader over db with DefaultClaimDuration.
@@ -56,6 +57,19 @@ func (r *PostgresReader) WithClaimDuration(d time.Duration) *PostgresReader {
 	return &c
 }
 
+// WithEventTypes returns a copy of r that claims only events of the given
+// types. A relay that serves one consumer, such as the Keycloak Organization
+// mirror of tenants, uses it so it never takes events meant for another. With
+// no types it claims every type.
+func (r *PostgresReader) WithEventTypes(types ...string) *PostgresReader {
+	c := *r
+	c.types = append([]string(nil), types...)
+	if len(c.types) == 0 {
+		c.types = nil
+	}
+	return &c
+}
+
 // The claim locks due rows with FOR UPDATE SKIP LOCKED and stamps them with
 // the claim token and expiry in the same statement, so two relays never claim
 // the same row. The order matches outbox_dispatch_ready_idx.
@@ -67,6 +81,7 @@ WITH due AS (
       AND quarantined_at IS NULL
       AND next_attempt_at <= now()
       AND (claimed_until IS NULL OR claimed_until <= now())
+      AND ($4::text[] IS NULL OR event_type = ANY($4::text[]))
     ORDER BY next_attempt_at, occurred_at, id
     LIMIT $1
     FOR UPDATE SKIP LOCKED
@@ -90,7 +105,7 @@ func (r *PostgresReader) Claim(ctx context.Context, limit int) (Claim, error) {
 	// claim, so it ends no later than the claim in the database.
 	claim := Claim{Token: token, Until: time.Now().Add(r.claimFor)}
 
-	rows, err := r.db.Query(ctx, claimSQL, limit, r.claimFor.Seconds(), token)
+	rows, err := r.db.Query(ctx, claimSQL, limit, r.claimFor.Seconds(), token, r.types)
 	if err != nil {
 		return Claim{}, fmt.Errorf("claim outbox events: %w", err)
 	}

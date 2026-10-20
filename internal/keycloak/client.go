@@ -1,10 +1,11 @@
 // Package keycloak is a small client for the Keycloak 26.8 Admin REST API and
 // a per-realm cache of OIDC discovery and signing keys.
 //
-// It covers what brand apply and token verification need and nothing more:
-// realms, clients and their protocol mappers, client secrets, identity
-// providers, authentication flows, executions and their configuration, and
-// required actions. Every endpoint was checked against Keycloak 26.8.1.
+// It covers what brand apply, token verification and tenants need and nothing
+// more: realms, clients and their protocol mappers, client secrets, client
+// scopes, identity providers, authentication flows, sub-flows, executions and
+// their configuration, required actions, and Organizations with their
+// members. Every endpoint was checked against Keycloak 26.8.1.
 //
 // The admin token comes from the client credentials grant when an admin
 // client ID and secret are configured, otherwise from the password grant of

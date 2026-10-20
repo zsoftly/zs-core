@@ -49,7 +49,7 @@ Results are ordered by `occurred_at` then ID, newest first. The cursor encodes t
 
 ## HTTP
 
-`GET /v1/audit/events` exposes the same queries to staff with an `operator` grant in the token's brand; Phase 3b adds a route for tenant members. With `tenant_id` it returns that tenant's events inside the caller's brand. Without it, it returns the brand events. The other query parameters are `limit`, `cursor`, `actor_id`, `action`, `occurred_after` and `occurred_before` (RFC 3339). The response is:
+`GET /v1/audit/events` exposes the same queries to staff with an `operator` grant in the token's brand. With `tenant_id` it returns that tenant's events inside the caller's brand. Without it, it returns the brand events. `GET /v1/tenants/{id}/audit/events` returns one tenant's events to a member or an API key of that tenant. The caller needs `audit:read`. It takes the same parameters except `tenant_id`. The tenant audit actions are listed in [tenants.md](tenants.md#audit-actions). The other query parameters are `limit`, `cursor`, `actor_id`, `action`, `occurred_after` and `occurred_before` (RFC 3339). The response is:
 
 ```json
 {"data": [{"id": "aud_...", "brand_id": "brd_...", "tenant_id": "tnt_...",

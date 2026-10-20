@@ -376,7 +376,7 @@ func sensitiveFields(prev, m *Manifest, changes []Change) []string {
 	set := map[string]bool{}
 	for _, ch := range changes {
 		switch ch.Target {
-		case TargetMFAPolicy, TargetFlow, TargetClient, TargetIdentityProvider, TargetPluginConfig:
+		case TargetMFAPolicy, TargetFlow, TargetClient, TargetClientScope, TargetIdentityProvider, TargetPluginConfig:
 			for _, f := range ch.Fields {
 				set[f.Field] = true
 			}
@@ -633,6 +633,7 @@ var auditActions = map[string]string{
 	TargetFlow:             "brand.keycloak.flow",
 	TargetRequiredAction:   "brand.keycloak.required_action",
 	TargetClient:           "brand.keycloak.client",
+	TargetClientScope:      "brand.keycloak.client_scope",
 	TargetIdentityProvider: "brand.keycloak.identity_provider",
 	TargetMFAPolicy:        "brand.keycloak.mfa_policy",
 	TargetKillBillTenant:   "brand.killbill.tenant",

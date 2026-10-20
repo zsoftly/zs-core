@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-A brand is one product on a Core deployment: one Keycloak realm, one Kill Bill tenant and one manifest, `brands/<slug>.yaml`. The contract is in [identity-and-tenants.md](identity-and-tenants.md). This page explains how apply, diff and secrets work. `zs-core brand diff` shows what would change and changes nothing. `zs-core brand apply` makes the change. It reads the state of Core, Keycloak and Kill Bill. It computes a diff. It applies the diff one change at a time, audits each change and prints the diff. Applying the same manifest twice gives an empty diff. Secrets are references, `env://NAME` or `file:///path`, resolved at apply time and never stored, logged or shown in a diff. Each brand reaches only its own secrets: `env://BRAND_<SLUG>__...` and files under `ZS_SECRETS_DIR/<slug>/`. Over HTTP, a change to MFA, clients, identity providers, `ssl_required` or the payment plugin needs recent MFA and a reason. Apply never deletes anything in Keycloak or Kill Bill.
+A brand is one product on a Core deployment: one Keycloak realm, one Kill Bill tenant and one manifest, `brands/<slug>.yaml`. The contract is in [identity-and-tenants.md](identity-and-tenants.md). This page explains how apply, diff and secrets work. `zs-core brand diff` shows what would change and changes nothing. `zs-core brand apply` makes the change. It reads the state of Core, Keycloak and Kill Bill. It computes a diff. It applies the diff one change at a time, audits each change and prints the diff. Applying the same manifest twice gives an empty diff. Secrets are references, `env://NAME` or `file:///path`, resolved at apply time and never stored, logged or shown in a diff. Each brand reaches only its own secrets: `env://BRAND_<SLUG>__...` and files under `ZS_SECRETS_DIR/<slug>/`. Over HTTP, a change to MFA, clients, identity providers, `ssl_required` or the payment plugin needs recent MFA and a reason. With `mfa: required` or `required_for_staff`, the staff client never signs anyone in on an SSO session alone, and every staff route needs a second factor in the token. Apply never deletes anything in Keycloak or Kill Bill.
 
 ## The manifest
 
@@ -26,17 +26,18 @@ Validation uses a JSON Schema library listed in go.mod. It implements draft 2020
 
 | Manifest | Engine | How |
 | --- | --- | --- |
-| `identity` realm fields: display name, themes, locales, SSL, token lifetimes, `verify_email` | Keycloak realm | Created when missing, then the listed fields are updated. Fields the manifest omits are left alone. |
+| `identity` realm fields: display name, themes, locales, SSL, token lifetimes, `verify_email` | Keycloak realm | Created when missing, then the listed fields are updated. Fields the manifest omits are left alone. Core also enables Organizations, `identity.organizations_enabled`, because every tenant is backed by one. |
 | `customer_client`, `staff_client`, `service_clients` | Keycloak clients | Public client with PKCE S256 for customers. Confidential clients for staff and services. Each client gets an audience mapper for its own client ID. The customer and staff clients also get an AMR mapper. Tokens then carry `aud` and `amr`. |
-| `mfa` | Keycloak flows | Core creates two copies of the built-in browser flow. `zs-browser` asks for a second factor when the user has one. `zs-browser-mfa` requires OTP. Both set the AMR values `pwd` and `otp`. Core also creates `zs-post-broker-mfa`, which holds one required OTP form with the AMR value `otp`. `optional` binds `zs-browser`. `required` binds `zs-browser-mfa` and sets `zs-post-broker-mfa` as the post-broker-login flow of every identity provider, so a login through a provider also needs the second factor. `required_for_staff` binds `zs-browser` and sets `zs-browser-mfa` on the staff client. A copy of the browser flow cannot serve after a brokered login, because its password form would ask the user for a local password. |
+| `mfa` | Keycloak flows | Core creates three copies of the built-in browser flow. `zs-browser` asks for a second factor when the user has one. `zs-browser-mfa` requires OTP. `zs-browser-staff-mfa` requires OTP and disables the Cookie step. All three set the AMR values `pwd` and `otp`. Core also creates `zs-post-broker-mfa`, which holds one required OTP form with the AMR value `otp`. `optional` binds `zs-browser`. `required` binds `zs-browser-mfa` to the realm, `zs-browser-staff-mfa` to the staff client, and sets `zs-post-broker-mfa` as the post-broker-login flow of every identity provider, so a login through a provider also needs the second factor. `required_for_staff` needs the second factor for the staff client only, also through a provider. See [Staff logins](#staff-logins). A copy of the browser flow cannot serve after a brokered login, because its password form would ask the user for a local password. |
+| staff client marker | Keycloak client scope | Core creates the client scope `zs-staff-client`, which adds nothing to tokens, and makes it a default scope of the staff client. `zs-post-broker-staff-mfa` uses it to recognise the staff client. |
 | `required_actions` | Keycloak required actions | Listed actions are enabled and default for new users. Others are not default. `verify_email` uses the realm switch instead. |
-| `identity_providers` | Keycloak identity providers | OIDC, SAML, Google, Microsoft, GitHub. Keycloak masks client secrets, so Core stores the secret's SHA-256 in the provider configuration to tell whether it changed. The post-broker-login flow follows `mfa`. Other policies remove it. |
+| `identity_providers` | Keycloak identity providers | OIDC, SAML, Google, Microsoft, GitHub. Keycloak masks client secrets, so Core stores the secret's SHA-256 in the provider configuration to tell whether it changed. Every update of a provider with a secret sends the resolved secret. Keycloak 26.8.1 refuses a change of the token URL, client ID or authentication method without it. The diff shows the secret only when it changed. The post-broker-login flow follows `mfa`. `optional` removes it. |
 | `killbill_tenant_key`, `killbill_api_secret_ref` | Kill Bill tenant | Created when missing. An existing tenant must accept the referenced secret, or apply stops. |
 | `catalogue`, `overdue` | Kill Bill uploads | Uploaded when the file's SHA-256 differs from the one recorded in the tenant's `zs-core-catalogue-sha256` or `zs-core-overdue-sha256` user key. Kill Bill keeps every catalogue version and rejects a second version with the same effective date. |
 | `payment_plugin` | Kill Bill per-tenant plugin configuration | Uploaded when it differs, compared in constant time. A plugin change needs a reason on every path. A plugin change is any of these: the plugin is added or removed, its `name`, `config_key` or `config_ref` changes, or its configuration in Kill Bill differs. Over HTTP it also needs MFA within the last 15 minutes. |
 | brand row | Core `brands` table | Slug, name, realm, tenant key, secret reference, Kill Bill tenant ID, the applied manifest and its digest. The realm and the tenant key cannot change. |
 
-Apply does not handle these yet: plugin installation through KPM, the invoice plugin and templates (Phase 4), notifications and webhooks (Phase 5), and permissions (Phase 3b). They are validated and stored with the manifest.
+Apply does not handle these yet: plugin installation through KPM, the invoice plugin and templates (Phase 4), and notifications and webhooks (Phase 5). They are validated and stored with the manifest. `permissions` needs nothing in the engines: tenants read the list from the applied manifest. See [tenants.md](tenants.md#permissions).
 
 ## Diff and audit
 
@@ -49,7 +50,7 @@ Two applies of one brand never interleave: apply holds a database lock per slug 
 Some fields decide how people sign in or where money goes. An HTTP apply whose diff or manifest changes any of them needs two things. The operator token must show MFA within the last 15 minutes, or the route answers 403 `recent_mfa_required`. The request must carry a non-empty `reason`, or the route answers 400 `reason_required`. The fields are:
 
 - `identity.mfa` and `identity.mfa_acr_values`, and the authentication flows.
-- Any client: redirect URIs, web origins, secrets and flows.
+- Any client: redirect URIs, web origins, secrets and flows, and the `zs-staff-client` client scope.
 - Any identity provider.
 - `identity.ssl_required`.
 - Any `billing.payment_plugin` field, and the plugin configuration in Kill Bill.
@@ -96,6 +97,7 @@ The reference manifest references two secrets. `BRAND_ZS_REFERENCE__KEYCLOAK_STA
 - `azp` is always required. It names one of the brand's clients and appears in `aud`. The client decides the principal kind: the customer client yields a `user`, the staff client a `staff` and a service client a `service` principal.
 - `email_verified` is true for actions that need it.
 - MFA is read from `amr` and `acr`. Recent MFA means within 15 minutes.
+- On a staff route, a brand on `mfa: required` or `required_for_staff` needs MFA in the staff token, whatever its age. Without it the route answers 403 `mfa_required`. Core checks the staff grant first, so a caller without one still gets 404.
 
 Keycloak emits `otp` in `amr` for the SSO session. A re-authentication inside that session without a second factor can refresh `auth_time`. Core treats `auth_time` as the MFA time. Brands that need stronger proof set a step-up `acr` value.
 
@@ -105,4 +107,33 @@ Keys come from `ZS_KEYCLOAK_URL` and are cached for 10 minutes. They keep workin
 
 An unknown realm or audience gives 401 `token_audience_unknown`. Any other defect gives 401 `token_invalid`. A token without a verified email gives 403 `email_not_verified` where the action needs one. Unreachable keys give 503 `authentication_unavailable`.
 
-Known gap: with `required_for_staff`, a staff member who signs in through a brokered identity provider is not asked for a second factor by Keycloak, because the post-broker flow binding is per provider, not per client. Core's recent-MFA checks still refuse sensitive actions for such a session. Phase 3b binds the staff client to the MFA post-broker flow.
+## Staff logins
+
+With `required_for_staff`, Core binds `zs-browser` to the realm, sets `zs-browser-staff-mfa` on the staff client, and sets `zs-post-broker-staff-mfa` as the post-broker-login flow of every identity provider. With `required`, the staff client also gets `zs-browser-staff-mfa`.
+
+### The SSO session
+
+A person who signs in to the customer client without a second factor holds a Keycloak SSO session. In a copy of the browser flow, the Cookie step is an alternative that succeeds on that session alone. The staff client would then get a token without the second factor. `zs-browser-staff-mfa` disables Cookie. The staff client therefore always asks for the password and the second factor, also inside an SSO session.
+
+A required OTP form at the top level of the flow, after Cookie, cannot do this. Keycloak ignores the alternatives of a level that holds a required execution. Cookie, the identity provider redirector and the login forms would all stop running.
+
+Core checks the token as well. A staff token without a second factor gets 403 `mfa_required` on every staff route, whatever path issued it. See [Token verification](#token-verification).
+
+Apply converges a realm whose staff client is still bound to `zs-browser-mfa` to `zs-browser-staff-mfa`. The diff shows it as an `identity.mfa` change.
+
+### Execution priorities
+
+Keycloak 26.8.1 reads the priority of an execution from the request that changes its requirement, and sets it to 0 when the request leaves it out. The execution then moves to the front of its flow. Core sends the current priority with every requirement change. An earlier apply that left the second-factor sub-flow in front of the password form broke every password login: Keycloak ran the OTP form before it knew the user. Apply moves the sub-flow back behind the password form and shows it as `executions.conditional-2fa-subflow.priority` in the diff.
+
+### Logins through a provider
+
+Keycloak binds a post-broker-login flow to an identity provider, never to a client. A client's flow overrides cover only the browser and direct grant flows. So with `required_for_staff`, Core gives every identity provider the flow `zs-post-broker-staff-mfa`:
+
+1. A sub-flow, CONDITIONAL, that holds "Condition - client scope" on `zs-staff-client` and a required OTP form with the AMR value `otp`.
+2. A required "Allow access" execution. Keycloak fails a top-level flow in which nothing succeeded, which is what the skipped sub-flow alone would leave for a customer login.
+
+The condition is true when `zs-staff-client` is a default client scope of the client that asked for the login. Only the staff client has it. A brokered login through the staff client therefore needs the second factor, and one through the customer client does not. Core still refuses sensitive actions without recent MFA, whatever the flow did.
+
+The test `TestRequiredForStaffBindsBrokeredStaffLoginsOnTheStack` in `internal/stacktest` checks this on Keycloak 26.8.1. It signs in through a second realm that plays the provider. The staff client is asked to set up a one-time password, the customer client gets an authorization code, and with `optional` the staff client gets a code too.
+
+The test `TestStaffClientRefusesSSOWithoutSecondFactorOnTheStack` checks the SSO session. It signs in to the customer client with a password only, then asks the staff client for a code in the same browser. Keycloak shows the login form and then asks to set up a one-time password. A staff token from the password grant, issued while the brand was `optional`, gets 403 `mfa_required` once the brand is `required_for_staff`. With `required`, a password login on the customer client reaches the one-time password after the password form.

@@ -9,6 +9,8 @@
 //	zs-core grant add      give a staff principal a scope in one brand
 //	zs-core grant revoke   take a scope away from a staff principal
 //	zs-core grant list     list the staff grants of a brand
+//	zs-core tenant suspend|reactivate|close  change a tenant's status in Core and the engines
+//	zs-core tenant sweep   run one pass of the tenant sweeper
 //
 // Configuration comes from the environment only; see docs/configuration.md.
 package main
@@ -55,6 +57,9 @@ Commands:
                    --reason <text> --operator <name> [--issuer <url>]
   grant list     list the staff grants of a brand
                    --brand <slug>
+  tenant suspend|reactivate|close  change a tenant's status in Core, Kill Bill and Keycloak
+                   --brand <slug> --tenant <tnt_...> --reason <text> --operator <name>
+  tenant sweep   complete interrupted tenant creations and correct Keycloak Organizations once
 
 Configuration is read from ZS_* environment variables; see docs/configuration.md.
 `
@@ -83,6 +88,8 @@ func run(args, environ []string, stdout, stderr io.Writer) int {
 		return runBrand(args[1:], environ, stdout, stderr)
 	case "grant":
 		return runGrant(args[1:], environ, stdout, stderr)
+	case "tenant":
+		return runTenant(args[1:], environ, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -154,6 +161,7 @@ func serve(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	startTenantSweeper(ctx, pool, api.Tenants, cfg.TenantSweepInterval, log)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,

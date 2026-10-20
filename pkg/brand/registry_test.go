@@ -223,3 +223,13 @@ func TestRegistryShortTTLRefreshesOnTime(t *testing.T) {
 		}
 	}
 }
+
+func TestVerificationConfigCarriesTheStaffMFARule(t *testing.T) {
+	for policy, want := range map[string]bool{MFAOptional: false, MFARequired: true, MFARequiredForStaff: true} {
+		m := &Manifest{}
+		m.Identity.MFA = policy
+		if got := VerificationConfig(Record{Manifest: m}).StaffMFARequired; got != want {
+			t.Errorf("%s: StaffMFARequired = %v, want %v", policy, got, want)
+		}
+	}
+}

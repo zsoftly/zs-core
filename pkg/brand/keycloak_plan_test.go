@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,15 +17,19 @@ import (
 // fakeKeycloak serves the admin endpoints the identity provider and
 // post-broker flow plans use, for one realm, and records every write.
 type fakeKeycloak struct {
-	mu     sync.Mutex
-	idps   map[string]keycloak.IdentityProvider
-	flows  map[string][]keycloak.Execution
-	writes []string
+	mu    sync.Mutex
+	idps  map[string]keycloak.IdentityProvider
+	flows map[string][]keycloak.Execution
+	// parents maps a sub-flow alias to the flow that holds it.
+	parents map[string]string
+	configs map[string]keycloak.AuthenticatorConfig
+	writes  []string
 }
 
 func newFakeKeycloak(t *testing.T) (*fakeKeycloak, *keycloak.Client) {
 	t.Helper()
-	f := &fakeKeycloak{idps: map[string]keycloak.IdentityProvider{}, flows: map[string][]keycloak.Execution{}}
+	f := &fakeKeycloak{idps: map[string]keycloak.IdentityProvider{}, flows: map[string][]keycloak.Execution{},
+		parents: map[string]string{}, configs: map[string]keycloak.AuthenticatorConfig{}}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
 	kc, err := keycloak.New(keycloak.Config{URL: srv.URL, AdminUser: "admin", AdminPassword: "pw"})
@@ -69,7 +74,9 @@ func (f *fakeKeycloak) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == flowsPath:
 		var list []keycloak.Flow
 		for alias := range f.flows {
-			list = append(list, keycloak.Flow{ID: alias + "-id", Alias: alias, TopLevel: true})
+			if _, sub := f.parents[alias]; !sub {
+				list = append(list, keycloak.Flow{ID: alias + "-id", Alias: alias, TopLevel: true})
+			}
 		}
 		reply(list)
 	case r.Method == http.MethodPost && path == flowsPath:
@@ -79,12 +86,20 @@ func (f *fakeKeycloak) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, flowsPath+"/") && strings.HasSuffix(path, "/executions"):
 		alias := strings.TrimSuffix(strings.TrimPrefix(path, flowsPath+"/"), "/executions")
-		execs, ok := f.flows[alias]
-		if !ok {
+		if _, ok := f.flows[alias]; !ok {
 			http.NotFound(w, r)
 			return
 		}
-		reply(execs)
+		reply(f.expand(alias, 0))
+	case r.Method == http.MethodPost && strings.HasSuffix(path, "/executions/flow"):
+		alias := strings.TrimSuffix(strings.TrimPrefix(path, flowsPath+"/"), "/executions/flow")
+		var in map[string]string
+		_ = json.Unmarshal(body, &in)
+		f.flows[alias] = append(f.flows[alias], keycloak.Execution{ID: "exec-sub-" + in["alias"], AuthenticationFlow: true,
+			DisplayName: in["alias"], Requirement: "DISABLED"})
+		f.flows[in["alias"]] = []keycloak.Execution{}
+		f.parents[in["alias"]] = alias
+		w.WriteHeader(http.StatusCreated)
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/executions/execution"):
 		alias := strings.TrimSuffix(strings.TrimPrefix(path, flowsPath+"/"), "/executions/execution")
 		var in map[string]string
@@ -92,17 +107,33 @@ func (f *fakeKeycloak) serve(w http.ResponseWriter, r *http.Request) {
 		f.flows[alias] = append(f.flows[alias], keycloak.Execution{ID: "exec-" + in["provider"], ProviderID: in["provider"], Requirement: "DISABLED"})
 		w.WriteHeader(http.StatusCreated)
 	case r.Method == http.MethodPut && strings.HasPrefix(path, flowsPath+"/") && strings.HasSuffix(path, "/executions"):
-		alias := strings.TrimSuffix(strings.TrimPrefix(path, flowsPath+"/"), "/executions")
-		var in map[string]string
+		var in struct {
+			ID          string `json:"id"`
+			Requirement string `json:"requirement"`
+			Priority    *int   `json:"priority"`
+		}
 		_ = json.Unmarshal(body, &in)
-		for i, e := range f.flows[alias] {
-			if e.ID == in["id"] {
-				f.flows[alias][i].Requirement = in["requirement"]
+		for flow := range f.flows {
+			for i, e := range f.flows[flow] {
+				if e.ID == in.ID {
+					f.flows[flow][i].Requirement = in.Requirement
+					// Keycloak 26.8.1 takes the priority from the request
+					// and uses 0 when it is missing.
+					f.flows[flow][i].Priority = 0
+					if in.Priority != nil {
+						f.flows[flow][i].Priority = *in.Priority
+					}
+					slices.SortStableFunc(f.flows[flow], func(a, b keycloak.Execution) int { return a.Priority - b.Priority })
+				}
 			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodPost && strings.HasPrefix(path, base+"/authentication/executions/") && strings.HasSuffix(path, "/config"):
 		execID := strings.TrimSuffix(strings.TrimPrefix(path, base+"/authentication/executions/"), "/config")
+		var cfg keycloak.AuthenticatorConfig
+		_ = json.Unmarshal(body, &cfg)
+		cfg.ID = "cfg-" + execID
+		f.configs[cfg.ID] = cfg
 		for alias, execs := range f.flows {
 			for i, e := range execs {
 				if e.ID == execID {
@@ -112,11 +143,35 @@ func (f *fakeKeycloak) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusCreated)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, base+"/authentication/config/"):
-		reply(keycloak.AuthenticatorConfig{ID: strings.TrimPrefix(path, base+"/authentication/config/"),
+		id := strings.TrimPrefix(path, base+"/authentication/config/")
+		if cfg, ok := f.configs[id]; ok {
+			reply(cfg)
+			return
+		}
+		reply(keycloak.AuthenticatorConfig{ID: id,
 			Config: map[string]string{"default.reference.value": "otp", "default.reference.maxAge": amrMaxAge}})
+	case r.Method == http.MethodPut && strings.HasPrefix(path, base+"/authentication/config/"):
+		var cfg keycloak.AuthenticatorConfig
+		_ = json.Unmarshal(body, &cfg)
+		f.configs[cfg.ID] = cfg
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		http.Error(w, "unexpected "+r.Method+" "+path, http.StatusTeapot)
 	}
+}
+
+// expand lists a flow's executions with its sub-flows' executions inline,
+// one level deeper, as Keycloak does.
+func (f *fakeKeycloak) expand(alias string, level int) []keycloak.Execution {
+	out := []keycloak.Execution{}
+	for _, e := range f.flows[alias] {
+		e.Level = level
+		out = append(out, e)
+		if e.AuthenticationFlow {
+			out = append(out, f.expand(e.DisplayName, level+1)...)
+		}
+	}
+	return out
 }
 
 func runChanges(t *testing.T, changes []Change) {
@@ -178,7 +233,7 @@ func TestRequiredMFABindsEveryIdentityProvider(t *testing.T) {
 		t.Fatalf("second plan = %v, %v", fieldNames(again), err)
 	}
 
-	for _, policy := range []string{MFAOptional, MFARequiredForStaff} {
+	for policy, want := range map[string]string{MFAOptional: "", MFARequiredForStaff: FlowPostBrokerStaffMFA} {
 		f.idps["corp"] = keycloak.IdentityProvider{Alias: "corp", ProviderID: "oidc", Enabled: true, PostBrokerLoginFlowAlias: FlowPostBrokerMFA,
 			Config: idpConfig(m.Identity.IdentityProviders[0])}
 		other := clone(t, m)
@@ -192,8 +247,8 @@ func TestRequiredMFABindsEveryIdentityProvider(t *testing.T) {
 			t.Fatalf("%s: diff = %v", policy, got)
 		}
 		runChanges(t, changes)
-		if f.idps["corp"].PostBrokerLoginFlowAlias != "" {
-			t.Fatalf("%s: binding kept", policy)
+		if f.idps["corp"].PostBrokerLoginFlowAlias != want {
+			t.Fatalf("%s: binding = %q, want %q", policy, f.idps["corp"].PostBrokerLoginFlowAlias, want)
 		}
 	}
 }
@@ -259,4 +314,238 @@ func planPostBroker(t *testing.T, f *fakeKeycloak, kc *keycloak.Client) []Change
 		t.Fatal(err)
 	}
 	return changes
+}
+
+// The staff post-broker flow holds one CONDITIONAL sub-flow: the client
+// scope condition on StaffClientScope and a required OTP form. Core creates
+// it, finds nothing to do the second time, and repairs a tampered condition.
+func TestStaffPostBrokerFlowIsCreatedAndConverged(t *testing.T) {
+	f, kc := newFakeKeycloak(t)
+	plan := func() []Change {
+		t.Helper()
+		f.mu.Lock()
+		_, exists := f.flows[FlowPostBrokerStaffMFA]
+		f.mu.Unlock()
+		changes, err := planStaffPostBrokerFlow(context.Background(), kc, "r", exists)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return changes
+	}
+	changes := plan()
+	if len(changes) != 1 || changes[0].Action != ActionCreate || len(changes[0].Fields) != 10 {
+		t.Fatalf("changes = %v", fieldNames(changes))
+	}
+	runChanges(t, changes)
+	execs := f.expand(FlowPostBrokerStaffMFA, 0)
+	if len(execs) != 4 || !execs[0].AuthenticationFlow || execs[0].Requirement != "CONDITIONAL" ||
+		execs[1].ProviderID != clientScopeCondition || execs[1].Requirement != "REQUIRED" || execs[1].Level != 1 ||
+		execs[2].ProviderID != otpFormProvider || execs[2].Requirement != "REQUIRED" || execs[2].AuthenticationConfig == "" ||
+		execs[3].ProviderID != allowAccess || execs[3].Requirement != "REQUIRED" || execs[3].Level != 0 {
+		t.Fatalf("flow = %+v", execs)
+	}
+	cond := f.configs[execs[1].AuthenticationConfig]
+	if cond.Config["client_scope"] != StaffClientScope || cond.Config["negate"] != "false" {
+		t.Fatalf("condition config = %+v", cond)
+	}
+	if again := plan(); len(again) != 0 {
+		t.Fatalf("second plan = %v", fieldNames(again))
+	}
+
+	// Someone negates the condition: Core sets it back.
+	cond.Config["negate"] = "true"
+	f.configs[cond.ID] = cond
+	changes = plan()
+	if got := fieldNames(changes); len(got) != 1 || got[0] != FlowPostBrokerStaffMFA+" executions."+clientScopeCondition+".config" {
+		t.Fatalf("negated condition diff = %v", got)
+	}
+	runChanges(t, changes)
+	if f.configs[cond.ID].Config["negate"] != "false" {
+		t.Fatalf("condition after repair = %+v", f.configs[cond.ID])
+	}
+	if again := plan(); len(again) != 0 {
+		t.Fatalf("plan after repair = %v", fieldNames(again))
+	}
+}
+
+// Keycloak refuses a provider update that changes the token URL without the
+// secret, so Core sends the resolved secret with every update of a provider
+// that has one, and the diff shows the secret only when it changed.
+func TestProviderUpdateCarriesTheSecret(t *testing.T) {
+	f, kc := newFakeKeycloak(t)
+	m := reference(t)
+	m.Identity.Realm = "r"
+	ref := "env://BRAND_ZS_REFERENCE__IDP"
+	p := IdentityProvider{Alias: "corp", Type: "oidc", ClientID: "x", ClientSecretRef: ref, Issuer: "https://idp.example.test",
+		AuthorizationURL: "https://idp.example.test/a", TokenURL: "https://idp.example.test/t", JWKSURL: "https://idp.example.test/k"}
+	m.Identity.IdentityProviders = []IdentityProvider{p}
+	cfg := idpConfig(p)
+	cfg["tokenUrl"] = "https://drifted.example.test/t"
+	cfg["clientSecret"] = keycloak.SecretMask
+	cfg[idpSecretDigestKey] = secretDigest("s3cret")
+	f.idps["corp"] = keycloak.IdentityProvider{Alias: "corp", ProviderID: "oidc", Enabled: true, Config: cfg}
+	changes, err := planIdentityProviders(context.Background(), kc, m, resolved{ref: "s3cret"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(fieldNames(changes), "|")
+	if got != "corp identity.identity_providers[corp].config.tokenUrl" {
+		t.Fatalf("diff = %s", got)
+	}
+	runChanges(t, changes)
+	if f.idps["corp"].Config["clientSecret"] != "s3cret" || f.idps["corp"].Config["tokenUrl"] != p.TokenURL {
+		t.Fatalf("update = %+v", f.idps["corp"].Config)
+	}
+}
+
+// seedBrowserCopy stores a copy of the built-in browser flow under alias, as
+// Keycloak 26.8.1 copies it: Cookie and the identity provider redirector as
+// alternatives, then the login forms with a conditional second factor.
+func (f *fakeKeycloak) seedBrowserCopy(alias string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	forms, twoFactor := alias+" forms", alias+" Browser - Conditional 2FA"
+	f.flows[alias] = []keycloak.Execution{
+		{ID: alias + "-cookie", ProviderID: "auth-cookie", Requirement: "ALTERNATIVE", Priority: 10},
+		{ID: alias + "-redirector", ProviderID: "identity-provider-redirector", Requirement: "ALTERNATIVE", Priority: 25},
+		{ID: alias + "-forms", AuthenticationFlow: true, DisplayName: forms, Requirement: "ALTERNATIVE", Priority: 30},
+	}
+	f.flows[forms] = []keycloak.Execution{
+		{ID: alias + "-password", ProviderID: "auth-username-password-form", Requirement: "REQUIRED", Priority: 10},
+		{ID: alias + "-2fa", AuthenticationFlow: true, DisplayName: twoFactor, Requirement: "CONDITIONAL", Priority: 20},
+	}
+	f.flows[twoFactor] = []keycloak.Execution{
+		{ID: alias + "-condition", ProviderID: "conditional-user-configured", Requirement: "REQUIRED", Priority: 10},
+		{ID: alias + "-otp", ProviderID: "auth-otp-form", Requirement: "ALTERNATIVE", Priority: 30},
+	}
+	f.parents[forms], f.parents[twoFactor] = alias, forms
+}
+
+func requirementOf(execs []keycloak.Execution, provider string) string {
+	for _, e := range execs {
+		if e.ProviderID == provider && e.Level == 0 {
+			return e.Requirement
+		}
+	}
+	for _, e := range execs {
+		if e.ProviderID == provider {
+			return e.Requirement
+		}
+	}
+	return ""
+}
+
+// The staff client's flow cannot be satisfied by a Keycloak SSO session
+// alone: its Cookie step is disabled and its second factor required. The
+// customer flows keep Cookie, so single sign-on still works for them.
+func TestStaffBrowserFlowDisablesCookie(t *testing.T) {
+	ctx := context.Background()
+	f, kc := newFakeKeycloak(t)
+	for _, spec := range browserFlows {
+		f.seedBrowserCopy(spec.alias)
+		execs, err := kc.Executions(ctx, "r", spec.alias)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ops, err := flowOps(ctx, kc, "r", spec, execs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, op := range ops {
+			if err := op.run(ctx); err != nil {
+				t.Fatalf("%s: %s: %v", spec.alias, op.field.Field, err)
+			}
+		}
+		execs, err = kc.Executions(ctx, "r", spec.alias)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantCookie := "ALTERNATIVE"
+		if spec.alias == FlowStaffMFA {
+			wantCookie = "DISABLED"
+		}
+		if got := requirementOf(execs, "auth-cookie"); got != wantCookie {
+			t.Errorf("%s: cookie %s, want %s", spec.alias, got, wantCookie)
+		}
+		wantOTP := "ALTERNATIVE"
+		if spec.mfa {
+			wantOTP = "REQUIRED"
+		}
+		if got := requirementOf(execs, "auth-otp-form"); got != wantOTP {
+			t.Errorf("%s: otp %s, want %s", spec.alias, got, wantOTP)
+		}
+		again, err := flowOps(ctx, kc, "r", spec, execs)
+		if err != nil || len(again) != 0 {
+			t.Errorf("%s does not converge: %d ops, %v", spec.alias, len(again), err)
+		}
+		// The password form still runs before the second factor.
+		if !passwordBeforeTwoFactor(execs) {
+			t.Errorf("%s: the second-factor sub-flow runs before the password form: %+v", spec.alias, execs)
+		}
+	}
+	if !(browserFlows[2].alias == FlowStaffMFA && browserFlows[2].noCookie && browserFlows[2].mfa) {
+		t.Fatal("FlowStaffMFA must require the second factor and disable Cookie")
+	}
+}
+
+func passwordBeforeTwoFactor(execs []keycloak.Execution) bool {
+	password, twoFactor := -1, -1
+	for i, e := range execs {
+		switch {
+		case e.ProviderID == "auth-username-password-form":
+			password = i
+		case e.AuthenticationFlow && strings.HasSuffix(e.DisplayName, "Conditional 2FA"):
+			twoFactor = i
+		}
+	}
+	return password >= 0 && twoFactor > password
+}
+
+// An earlier apply that set requirements without priorities left the
+// second-factor sub-flow in front of the password form, where Keycloak fails
+// every password login. Apply moves it back behind the form.
+func TestBrowserFlowOrderIsRepaired(t *testing.T) {
+	ctx := context.Background()
+	f, kc := newFakeKeycloak(t)
+	f.seedBrowserCopy(FlowMFA)
+	f.mu.Lock()
+	forms := FlowMFA + " forms"
+	f.flows[forms][1].Priority, f.flows[forms][1].Requirement = 0, "REQUIRED"
+	slices.SortStableFunc(f.flows[forms], func(a, b keycloak.Execution) int { return a.Priority - b.Priority })
+	f.mu.Unlock()
+	spec := browserFlows[1]
+	execs, err := kc.Executions(ctx, "r", FlowMFA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passwordBeforeTwoFactor(execs) {
+		t.Fatal("the seed is not broken")
+	}
+	ops, err := flowOps(ctx, kc, "r", spec, execs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(opFields(ops), "executions.conditional-2fa-subflow.priority") {
+		t.Fatalf("no priority repair in %v", opFields(ops))
+	}
+	for _, op := range ops {
+		if err := op.run(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	execs, _ = kc.Executions(ctx, "r", FlowMFA)
+	if !passwordBeforeTwoFactor(execs) {
+		t.Fatalf("order not repaired: %+v", execs)
+	}
+	if again, _ := flowOps(ctx, kc, "r", spec, execs); len(again) != 0 {
+		t.Fatalf("not converged: %v", opFields(again))
+	}
+}
+
+func opFields(ops []flowOp) []string {
+	out := make([]string, len(ops))
+	for i, op := range ops {
+		out[i] = op.field.Field
+	}
+	return out
 }

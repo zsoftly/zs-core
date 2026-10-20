@@ -45,6 +45,7 @@ const (
 	EnvKillBillAdminUser       = "ZS_KILLBILL_ADMIN_USER"
 	EnvKillBillAdminPassword   = "ZS_KILLBILL_ADMIN_PASSWORD"
 	EnvKAUIURL                 = "ZS_KAUI_URL"
+	EnvTenantSweepInterval     = "ZS_TENANT_SWEEP_INTERVAL"
 	reservedTestVariablePrefix = "ZS_TEST_"
 )
 
@@ -60,6 +61,7 @@ const (
 	DefaultHTTPWriteTimeout      = 30 * time.Second
 	DefaultHTTPIdleTimeout       = 120 * time.Second
 	DefaultShutdownTimeout       = 15 * time.Second
+	DefaultTenantSweepInterval   = time.Minute
 	maxDatabaseMaxConns          = 1000
 )
 
@@ -72,6 +74,7 @@ var known = map[string]bool{
 	EnvKeycloakAdminPassword: true, EnvKillBillURL: true, EnvKillBillAdminUser: true,
 	EnvKillBillAdminPassword: true, EnvKAUIURL: true,
 	EnvKeycloakAdminClientID: true, EnvKeycloakAdminSecret: true, EnvBrandsDir: true, EnvSecretsDir: true,
+	EnvTenantSweepInterval: true,
 }
 
 // Config is the validated service configuration.
@@ -113,6 +116,10 @@ type Config struct {
 	// brand slug. A file:// reference of brand <slug> must resolve inside
 	// SecretsDir/<slug>/. When empty, file:// references are refused.
 	SecretsDir string
+
+	// TenantSweepInterval is how often serve completes interrupted tenant
+	// creations and corrects Keycloak Organizations towards Core.
+	TenantSweepInterval time.Duration
 }
 
 // Load reads the configuration from environ, a list of KEY=value strings as
@@ -142,6 +149,7 @@ func Load(environ []string) (Config, error) {
 		HTTPWriteTimeout:      DefaultHTTPWriteTimeout,
 		HTTPIdleTimeout:       DefaultHTTPIdleTimeout,
 		ShutdownTimeout:       DefaultShutdownTimeout,
+		TenantSweepInterval:   DefaultTenantSweepInterval,
 	}
 	fail := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 
@@ -229,6 +237,7 @@ func Load(environ []string) (Config, error) {
 	parseDuration(EnvHTTPWriteTimeout, &cfg.HTTPWriteTimeout)
 	parseDuration(EnvHTTPIdleTimeout, &cfg.HTTPIdleTimeout)
 	parseDuration(EnvShutdownTimeout, &cfg.ShutdownTimeout)
+	parseDuration(EnvTenantSweepInterval, &cfg.TenantSweepInterval)
 
 	parseURL := func(name string, target *string) {
 		v, ok := env[name]

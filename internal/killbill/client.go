@@ -1,9 +1,10 @@
 // Package killbill is a small client for the Kill Bill 0.24 REST API.
 //
-// It covers what brand apply needs: tenant lookup and creation with the admin
-// credentials, and, with a tenant's API key and secret, per-tenant plugin
-// configuration, user key-values, catalogue upload and overdue upload. Every
-// endpoint was checked against Kill Bill 0.24.22.
+// It covers what brand apply and tenants need: tenant lookup and creation
+// with the admin credentials, and, with a tenant's API key and secret,
+// per-tenant plugin configuration, user key-values, catalogue upload, overdue
+// upload, and accounts: creation, lookup by external key, blocking states and
+// closure. Every endpoint was checked against Kill Bill 0.24.22.
 //
 // Every write carries the X-Killbill-CreatedBy, X-Killbill-Reason and
 // X-Killbill-Comment headers from a CallContext, so Kill Bill's own audit log

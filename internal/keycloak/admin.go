@@ -181,6 +181,7 @@ type Execution struct {
 	AuthenticationConfig string `json:"authenticationConfig,omitempty"`
 	Level                int    `json:"level"`
 	Index                int    `json:"index"`
+	Priority             int    `json:"priority"`
 }
 
 // AuthenticatorConfig is the configuration of one execution.
@@ -241,10 +242,44 @@ func (c *Client) Executions(ctx context.Context, realm, flowAlias string) ([]Exe
 	return list, err
 }
 
-// UpdateExecutionRequirement sets the requirement of one execution.
+// UpdateExecutionRequirement sets the requirement of one execution and keeps
+// its priority. Keycloak 26.8.1 takes the priority from the same request and
+// sets it to 0 when the request leaves it out, which moves the execution to
+// the front of its flow.
 func (c *Client) UpdateExecutionRequirement(ctx context.Context, realm, flowAlias, executionID, requirement string) error {
+	exec, err := c.execution(ctx, realm, flowAlias, executionID)
+	if err != nil {
+		return err
+	}
+	return c.updateExecution(ctx, realm, flowAlias, executionID, requirement, exec.Priority)
+}
+
+// SetExecutionPriority sets the priority of one execution and keeps its
+// requirement. A lower priority runs first among the executions of a flow.
+func (c *Client) SetExecutionPriority(ctx context.Context, realm, flowAlias, executionID string, priority int) error {
+	exec, err := c.execution(ctx, realm, flowAlias, executionID)
+	if err != nil {
+		return err
+	}
+	return c.updateExecution(ctx, realm, flowAlias, executionID, exec.Requirement, priority)
+}
+
+func (c *Client) execution(ctx context.Context, realm, flowAlias, executionID string) (Execution, error) {
+	execs, err := c.Executions(ctx, realm, flowAlias)
+	if err != nil {
+		return Execution{}, err
+	}
+	for _, e := range execs {
+		if e.ID == executionID {
+			return e, nil
+		}
+	}
+	return Execution{}, fmt.Errorf("execution %s of flow %s: %w", executionID, flowAlias, ErrNotFound)
+}
+
+func (c *Client) updateExecution(ctx context.Context, realm, flowAlias, executionID, requirement string, priority int) error {
 	_, err := c.call(ctx, "update execution", http.MethodPut, authPath(realm)+"/flows/"+url.PathEscape(flowAlias)+"/executions",
-		map[string]string{"id": executionID, "requirement": requirement}, nil)
+		map[string]any{"id": executionID, "requirement": requirement, "priority": priority}, nil)
 	return err
 }
 

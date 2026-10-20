@@ -195,6 +195,9 @@ services:
       ZS_KILLBILL_ADMIN_USER: admin
       ZS_KILLBILL_ADMIN_PASSWORD: ${KILLBILL_ADMIN_PASSWORD:?set in .env}
       ZS_KAUI_URL: http://kaui:8080
+      # Tenant creation reads the Kill Bill tenant secret of
+      # brands/zs-reference.yaml through this reference.
+      BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET: ${KILLBILL_TENANT_API_SECRET:?set in .env}
     depends_on:
       postgres:
         condition: service_healthy

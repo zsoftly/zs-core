@@ -20,6 +20,7 @@ import (
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/identity"
 	"github.com/zsoftly/zs-core/pkg/idgen"
+	"github.com/zsoftly/zs-core/pkg/scope"
 )
 
 var (
@@ -219,6 +220,42 @@ func TestStaffRoutes(t *testing.T) {
 	}
 }
 
+// With mfa required or required_for_staff, a staff token needs evidence of a
+// second factor on every staff route, however recent its sign-in. Without a
+// grant the answer stays 404, so the MFA rule reveals nothing to outsiders.
+func TestRequireStaffNeedsSecondFactorWhenTheBrandRequiresIt(t *testing.T) {
+	strict := authBrand
+	strict.StaffMFARequired = true
+	staffCtx := func(b identity.BrandConfig, mfa bool) context.Context {
+		ctx := identity.WithPrincipal(context.Background(), identity.Principal{
+			Brand: b, Kind: identity.KindStaff, Issuer: authIssuer, Subject: "staff-1", MFA: mfa, AuthTime: time.Now(),
+		})
+		return scope.WithBrand(ctx, b.ID)
+	}
+	cases := []struct {
+		name    string
+		brand   identity.BrandConfig
+		mfa     bool
+		granted bool
+		want    string
+	}{
+		{"strict without second factor", strict, false, true, "mfa_required"},
+		{"strict with second factor", strict, true, true, "ok"},
+		{"strict without grant", strict, false, false, "not_found"},
+		{"optional without second factor", authBrand, false, true, "ok"},
+	}
+	for _, tc := range cases {
+		_, err := RequireStaff(staffCtx(tc.brand, tc.mfa), grantDB{granted: tc.granted}, identity.StaffOperator)
+		got := "ok"
+		if err != nil {
+			got = errName(err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestApplyBrandRequiresManifestMediaType(t *testing.T) {
 	h := authServer(grantDB{granted: true}, false)
 	req := httptest.NewRequest(http.MethodPost, "/v1/brands/"+idgen.Format(idgen.Brand, authBrand.ID)+"/apply", strings.NewReader("slug: x"))
@@ -285,5 +322,25 @@ func TestRecordIdentityReadsFirst(t *testing.T) {
 	s.now = func() time.Time { return now.Add(identity.LastSeenGranularity) }
 	if _, err := s.recordIdentity(context.Background(), p); errName(err) != "authentication_unavailable" {
 		t.Fatalf("identity seen five minutes ago did not write: %v", err)
+	}
+}
+
+// An API key is told apart from a token by its prefix, and its verification
+// fails closed: a database that cannot be reached is 503, never 401 or a pass.
+func TestAPIKeyAuthenticationFailsClosed(t *testing.T) {
+	key := "zs_zs-reference_" + strings.Repeat("A", 43)
+	if rec, code := call(t, authServer(failingDB{}, false), http.MethodGet, "/v1/me", key); rec.Code != http.StatusServiceUnavailable || code != "authentication_unavailable" {
+		t.Fatalf("database down: %d %s", rec.Code, code)
+	}
+	if rec, code := call(t, New(Options{}), http.MethodGet, "/v1/me", key); rec.Code != http.StatusServiceUnavailable || code != "authentication_unavailable" {
+		t.Fatalf("no database: %d %s", rec.Code, code)
+	}
+	// Without a key the tenant routes answer 401 like every /v1 route.
+	if rec, code := call(t, authServer(grantDB{}, false), http.MethodGet, "/v1/tenants/"+idgen.Format(idgen.Tenant, idgen.MustNewV7()), ""); rec.Code != http.StatusUnauthorized || code != "unauthenticated" {
+		t.Fatalf("no credential: %d %s", rec.Code, code)
+	}
+	// A token without a recorded identity has no membership: 404.
+	if rec, code := call(t, authServer(grantDB{}, false), http.MethodGet, "/v1/tenants/"+idgen.Format(idgen.Tenant, idgen.MustNewV7()), signToken(t, "zs-customer", nil)); rec.Code != http.StatusNotFound || code != "tenant_not_found" {
+		t.Fatalf("no identity: %d %s", rec.Code, code)
 	}
 }

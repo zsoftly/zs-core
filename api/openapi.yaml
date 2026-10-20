@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ZSoftly Core API
-  version: 0.2.0
+  version: 0.3.0
   summary: The /v1 HTTP surface of ZSoftly Core.
   description: |
     ZSoftly Core serves tenants, wallets, metering, catalogue, payments,
@@ -14,15 +14,28 @@ info:
     `limit` and `cursor` in and `next_cursor` out. Commands that change state
     carry an `idempotency_key` field in the request body.
 
-    Every `/v1` request carries a Keycloak access token as `Authorization:
-    Bearer <token>`. The token's issuer (one realm per brand) and its
-    audience and authorized party (clients the brand's manifest declares)
-    choose the brand. A token never acts outside its brand. An unknown realm
-    or client is `401 token_audience_unknown`, any other defect is `401
-    token_invalid`, and when the signing keys or the database cannot be
-    reached the answer is `503 authentication_unavailable`, never 401.
-    Staff routes also need an active staff grant with the named scope in the
-    same brand; without one they answer `404 not_found`.
+    Every `/v1` request carries a Keycloak access token or a tenant API key
+    as `Authorization: Bearer <credential>`. An API key starts with `zs_`.
+    The token's issuer (one realm per brand) and its audience and authorized
+    party (clients the brand's manifest declares) choose the brand, and an
+    API key's prefix names it. A credential never acts outside its brand. An
+    unknown realm or client is `401 token_audience_unknown`, any other
+    defect is `401 token_invalid` or `401 api_key_invalid`, and when the
+    signing keys or the database cannot be reached the answer is `503
+    authentication_unavailable`, never 401. Staff routes also need an active
+    staff grant with the named scope in the same brand; without one they
+    answer `404 not_found`. When the brand's MFA policy is `required` or
+    `required_for_staff`, a staff token with a grant also needs evidence of
+    a second factor, `otp` or another second factor in `amr` or an `acr`
+    from the brand's `mfa_acr_values`, however old: without it the answer is
+    `403 mfa_required`.
+
+    Tenant routes, `/v1/tenants/{id}/...`, need an active membership of the
+    caller in the tenant, or an API key of that tenant. Without one, or when
+    the tenant is closed, or for a write to a suspended tenant, the answer is
+    `404 tenant_not_found`. Each route then needs a permission, and its
+    absence is `403 permission_denied`. API keys work on tenant routes only,
+    and never on a route that needs recent multi-factor authentication.
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -36,6 +49,10 @@ tags:
     description: The caller's identity.
   - name: brands
     description: Brands and brand apply. Staff `operator` only.
+  - name: tenants
+    description: Tenants, members, teams, invitations and activation.
+  - name: api-keys
+    description: Tenant API keys.
   - name: audit
     description: The append-only audit trail.
 paths:
@@ -79,8 +96,9 @@ paths:
       description: |
         Returns the identity the token represents in its brand. The identity
         is recorded on the first request with a verified email; until then
-        `id` is null. `memberships` lists the caller's tenants and is empty
-        until tenants exist.
+        `id` is null. `memberships` lists the caller's active memberships in
+        tenants that are not closed, at most 200. A staff or service token
+        has none.
       security: [{bearer: []}]
       responses:
         "200":
@@ -100,7 +118,10 @@ paths:
       tags: [brands]
       operationId: getBrand
       summary: Return a brand.
-      description: Staff `operator` of the same brand only. Any other caller gets `404`.
+      description: |
+        Staff `operator` of the same brand only. Any other caller gets `404`.
+        A staff token without a second factor gets `403 mfa_required` when
+        the brand requires one for staff.
       security: [{bearer: []}]
       parameters:
         - $ref: "#/components/parameters/BrandIdPath"
@@ -115,6 +136,8 @@ paths:
               schema: {$ref: "#/components/schemas/Brand"}
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -181,14 +204,713 @@ paths:
           $ref: "#/components/responses/Unprocessable"
         "503":
           $ref: "#/components/responses/Unavailable"
+  /v1/tenants/personal:
+    post:
+      tags: [tenants]
+      operationId: ensurePersonalTenant
+      summary: Create or return the caller's personal tenant.
+      description: |
+        A customer token with a verified email only. Returns the caller's
+        personal tenant in the brand, creating it when there is none: one per
+        identity. Creating it creates a Keycloak Organization and a Kill Bill
+        account and nothing in a payment plugin. Its name is the caller's
+        display name cut to 100 characters, or `Personal`. `200` returns an
+        existing tenant and `201` a new one. An engine failure is a retryable
+        `503`. A second request while the first is still creating the tenant
+        waits up to 5 seconds and returns the same tenant, or answers a
+        retryable `503 not_ready`.
+      security: [{bearer: []}]
+      responses:
+        "200":
+          description: The existing personal tenant.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Tenant"}
+        "201":
+          description: The personal tenant was created.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Tenant"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants:
+    post:
+      tags: [tenants]
+      operationId: createTenant
+      summary: Create an organization tenant with the caller as owner.
+      description: |
+        A customer token with a verified email only. Requires
+        `idempotency_key`, scoped to the brand and the caller: the same key
+        and payload return the same tenant, a different payload is `409
+        idempotency_key_conflict`. Core creates a Keycloak Organization and a
+        Kill Bill account whose external key is the tenant ID, then the
+        tenant. When an engine fails, no tenant is written, the failure is
+        audited and the answer is a retryable `503`. A retry with the same
+        key, or the sweeper, completes the same tenant.
+      security: [{bearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TenantCreate"}
+      responses:
+        "201":
+          description: The tenant.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Tenant"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}:
+    get:
+      tags: [tenants]
+      operationId: getTenant
+      summary: Return a tenant.
+      description: Needs `tenant:read`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      responses:
+        "200":
+          description: The tenant.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Tenant"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    patch:
+      tags: [tenants]
+      operationId: updateTenant
+      summary: Change a tenant's name or billing country.
+      description: Needs `tenant:update`. A suspended tenant answers `404 tenant_not_found` to every write.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TenantUpdate"}
+      responses:
+        "200":
+          description: The tenant.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Tenant"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/members:
+    get:
+      tags: [tenants]
+      operationId: listMembers
+      summary: List the tenant's members.
+      description: Needs `member:read`. Removed members are not listed. Oldest first.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of members.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MemberPage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/members/{mem}:
+    patch:
+      tags: [tenants]
+      operationId: updateMember
+      summary: Change a member's role or suspend and reinstate a member.
+      description: |
+        Needs `member:update` and multi-factor authentication within the last
+        15 minutes. The caller must hold every permission the member's
+        current and new role imply, and only an owner changes an owner. The
+        last active owner cannot be demoted or suspended: `409 last_owner`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/MembershipIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/MemberUpdate"}
+      responses:
+        "200":
+          description: The member.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Member"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    delete:
+      tags: [tenants]
+      operationId: removeMember
+      summary: Remove a member.
+      description: |
+        Needs `member:remove` and multi-factor authentication within the last
+        15 minutes. The member's tokens and API keys stop working at the next
+        request. The last active owner cannot be removed: `409 last_owner`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/MembershipIdPath"
+      responses:
+        "204":
+          description: The member was removed.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/ownership/transfer:
+    post:
+      tags: [tenants]
+      operationId: transferOwnership
+      summary: Transfer ownership to an active admin.
+      description: |
+        The caller must be an owner with `tenant:transfer` and multi-factor
+        authentication within the last 15 minutes. The target becomes an owner
+        and the caller an admin, in one transaction.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/OwnershipTransfer"}
+      responses:
+        "200":
+          description: Both memberships after the transfer.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/OwnershipTransferResult"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/teams:
+    get:
+      tags: [tenants]
+      operationId: listTeams
+      summary: List the tenant's teams.
+      description: Needs `team:read`. Oldest first. The system teams `owners`, `admins` and `members` are locked.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of teams.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TeamPage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    post:
+      tags: [tenants]
+      operationId: createTeam
+      summary: Create a team.
+      description: Needs `team:manage`. The team starts with no members and no grants.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TeamCreate"}
+      responses:
+        "201":
+          description: The team.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Team"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/teams/{tm}:
+    patch:
+      tags: [tenants]
+      operationId: updateTeam
+      summary: Rename a team.
+      description: Needs `team:manage` and every permission the team grants. A locked team answers `409 team_locked`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/TeamIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TeamUpdate"}
+      responses:
+        "200":
+          description: The team.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Team"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    delete:
+      tags: [tenants]
+      operationId: deleteTeam
+      summary: Delete a team.
+      description: Needs `team:manage` and every permission the team grants. A locked team answers `409 team_locked`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/TeamIdPath"
+      responses:
+        "204":
+          description: The team was deleted.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/teams/{tm}/members:
+    put:
+      tags: [tenants]
+      operationId: setTeamMembers
+      summary: Replace the members of a team.
+      description: Needs `team:manage` and every permission the team grants. A locked team answers `409 team_locked`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/TeamIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TeamMembers"}
+      responses:
+        "200":
+          description: The team.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Team"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/teams/{tm}/grants:
+    put:
+      tags: [tenants]
+      operationId: setTeamGrants
+      summary: Replace the permissions a team grants.
+      description: |
+        Needs `team:manage`. Every permission must be built in or registered
+        by the brand (`400 permission_unknown`), and the caller must hold
+        every permission the team grants before and after the change.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/TeamIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TeamGrants"}
+      responses:
+        "200":
+          description: The team.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Team"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/invitations:
+    get:
+      tags: [tenants]
+      operationId: listInvitations
+      summary: List the tenant's invitations.
+      description: Needs `member:invite`. Oldest first. Tokens are never listed.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of invitations.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvitationPage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    post:
+      tags: [tenants]
+      operationId: createInvitation
+      summary: Invite an email address with a non-owner role.
+      description: |
+        Needs `member:invite` and every permission the role implies. The
+        clear token is in this response only. It expires after 7 days. A
+        personal tenant answers `409 tenant_kind_unsupported`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/InvitationCreate"}
+      responses:
+        "201":
+          description: The invitation and its token.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvitationCreated"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/invitations/{inv}:
+    delete:
+      tags: [tenants]
+      operationId: revokeInvitation
+      summary: Revoke a pending invitation.
+      description: Needs `member:invite`. An invitation that is not pending answers `404 invitation_not_found`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/InvitationIdPath"
+      responses:
+        "204":
+          description: The invitation was revoked.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/invitations/accept:
+    post:
+      tags: [tenants]
+      operationId: acceptInvitation
+      summary: Accept an invitation.
+      description: |
+        A customer token with a verified email that equals the invited
+        address, compared case-insensitively (`403
+        invitation_email_mismatch`), and an authentication within the last 15
+        minutes (`403 recent_auth_required`). An expired, revoked or unknown
+        invitation answers `404 invitation_not_found`. So does an invitation
+        whose inviter is no longer an active member with `member:invite` and
+        every permission the invited role implies. Core then revokes it and
+        audits `tenant.invitation.refused_stale_inviter`. A removed member who
+        accepts gets a new membership with a new ID.
+      security: [{bearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/InvitationAccept"}
+      responses:
+        "200":
+          description: The new membership and its tenant.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvitationAccepted"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/activation:
+    get:
+      tags: [tenants]
+      operationId: getTenantActivation
+      summary: Return the tenant's activation state and its latest decisions.
+      description: Needs `tenant:read`. Decisions are newest first, at most 50.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      responses:
+        "200":
+          description: The activation state.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ActivationState"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/activation:
+    post:
+      tags: [tenants]
+      operationId: decideTenantActivation
+      summary: Record an activation decision.
+      description: |
+        Staff with the `activation` grant in the tenant's brand only; anyone
+        else gets `404`. A staff token without a second factor gets `403
+        mfa_required` when the brand requires one for staff. Decisions are
+        append-only. The route is idempotent on `request_id`: the same request
+        ID and payload return the stored decision with `200`, a different
+        payload is `409 idempotency_key_conflict`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ActivationDecisionRequest"}
+      responses:
+        "200":
+          description: The stored decision for this request ID.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ActivationDecision"}
+        "201":
+          description: The decision was recorded.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ActivationDecision"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/api-keys:
+    get:
+      tags: [api-keys]
+      operationId: listApiKeys
+      summary: List the tenant's API keys.
+      description: Needs `apikey:read`. Revoked and expired keys are listed. Secrets never are.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of API keys.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApiKeyPage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    post:
+      tags: [api-keys]
+      operationId: createApiKey
+      summary: Create an API key.
+      description: |
+        Needs `apikey:create` and multi-factor authentication within the last
+        15 minutes, so an API key cannot create another. The permissions must
+        be registered and held by the caller. The key expires after 90 days
+        by default and after 365 days at most. The secret is in this
+        response only.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ApiKeyCreate"}
+      responses:
+        "201":
+          description: The key and its secret.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApiKeyCreated"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/api-keys/{key}:
+    delete:
+      tags: [api-keys]
+      operationId: revokeApiKey
+      summary: Revoke an API key.
+      description: Needs `apikey:revoke`. The key stops working at once. A key of another tenant answers `404`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ApiKeyIdPath"
+        - name: reason
+          in: query
+          description: Why the key is revoked. Recorded in audit.
+          schema: {type: string, minLength: 1, maxLength: 1000}
+      responses:
+        "204":
+          description: The key was revoked.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/audit/events:
+    get:
+      tags: [audit]
+      operationId: listTenantAuditEvents
+      summary: List the tenant's audit events.
+      description: Needs `audit:read`. Newest first. Filters combine with AND.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: actor_id
+          in: query
+          description: Only events by this actor.
+          schema: {type: string, minLength: 1, maxLength: 255}
+        - name: action
+          in: query
+          description: Only events with this action, such as `tenant.member.added`.
+          schema: {$ref: "#/components/schemas/Action"}
+        - name: occurred_after
+          in: query
+          description: Only events at or after this time (RFC 3339).
+          schema: {type: string, format: date-time}
+        - name: occurred_before
+          in: query
+          description: Only events before this time (RFC 3339).
+          schema: {type: string, format: date-time}
+      responses:
+        "200":
+          description: One page of audit events.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuditEventPage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
   /v1/audit/events:
     get:
       tags: [audit]
       operationId: listAuditEvents
       summary: List audit events of the caller's brand.
       description: |
-        Staff `operator` of the brand only; Phase 3b adds a route for tenant
-        members. With `tenant_id`, returns the events of that tenant of the
+        Staff `operator` of the brand only. A staff token without a second
+        factor gets `403 mfa_required` when the brand requires one for staff.
+        Tenant members use `/v1/tenants/{id}/audit/events`. With `tenant_id`, returns the events of that tenant of the
         brand; without it, returns the brand's own events, such as brand
         applies, staff grants and new identities. Newest first. Filters
         combine with AND. `occurred_after` is inclusive and `occurred_before`
@@ -230,6 +952,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -239,8 +963,7 @@ components:
     bearer:
       type: http
       scheme: bearer
-      bearerFormat: JWT
-      description: A Keycloak access token from the brand's realm, signed with RS256.
+      description: A Keycloak access token from the brand's realm, signed with RS256, or a tenant API key `zs_<brand slug>_<random>`.
   headers:
     RequestId:
       description: The request ID. A valid inbound `X-Request-ID` is echoed; otherwise the server assigns one.
@@ -255,6 +978,36 @@ components:
       required: true
       description: A brand ID.
       schema: {$ref: "#/components/schemas/BrandId"}
+    TenantIdPath:
+      name: id
+      in: path
+      required: true
+      description: A tenant ID. A tenant the caller is not an active member of answers `404 tenant_not_found`.
+      schema: {$ref: "#/components/schemas/TenantId"}
+    MembershipIdPath:
+      name: mem
+      in: path
+      required: true
+      description: A membership ID.
+      schema: {$ref: "#/components/schemas/MembershipId"}
+    TeamIdPath:
+      name: tm
+      in: path
+      required: true
+      description: A team ID.
+      schema: {$ref: "#/components/schemas/TeamId"}
+    InvitationIdPath:
+      name: inv
+      in: path
+      required: true
+      description: An invitation ID.
+      schema: {$ref: "#/components/schemas/InvitationId"}
+    ApiKeyIdPath:
+      name: key
+      in: path
+      required: true
+      description: An API key ID.
+      schema: {$ref: "#/components/schemas/ApiKeyId"}
     Limit:
       name: limit
       in: query
@@ -469,8 +1222,14 @@ components:
           format: date-time
     Membership:
       type: object
-      description: A membership of the caller in a tenant. Added in Phase 3b.
-      additionalProperties: true
+      description: An active membership of the caller, with its tenant.
+      required: [id, role, status, tenant]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/MembershipId"}
+        role: {$ref: "#/components/schemas/Role"}
+        status: {type: string, enum: [active]}
+        tenant: {$ref: "#/components/schemas/Tenant"}
     Me:
       type: object
       required: [identity, memberships]
@@ -520,7 +1279,7 @@ components:
       properties:
         target:
           type: string
-          enum: [core.brand, keycloak.realm, keycloak.authentication_flow, keycloak.required_action, keycloak.client, keycloak.identity_provider, keycloak.mfa_policy, killbill.tenant, killbill.catalogue, killbill.overdue, killbill.plugin_config]
+          enum: [core.brand, keycloak.realm, keycloak.authentication_flow, keycloak.required_action, keycloak.client, keycloak.client_scope, keycloak.identity_provider, keycloak.mfa_policy, killbill.tenant, killbill.catalogue, killbill.overdue, killbill.plugin_config]
         name: {type: string}
         action: {type: string, enum: [create, update]}
         fields:
@@ -539,3 +1298,314 @@ components:
           type: array
           items: {$ref: "#/components/schemas/BrandChange"}
         applied: {type: boolean}
+    MembershipId:
+      type: string
+      description: A membership ID.
+      pattern: "^mem_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    TeamId:
+      type: string
+      description: A team ID.
+      pattern: "^tm_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    InvitationId:
+      type: string
+      description: An invitation ID.
+      pattern: "^inv_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    ApiKeyId:
+      type: string
+      description: An API key ID.
+      pattern: "^key_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    Permission:
+      type: string
+      description: A `resource:action` permission, built in or registered by the brand.
+      pattern: "^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*$"
+      maxLength: 100
+    Role:
+      type: string
+      description: |
+        `owner` holds every permission. `admin` holds every permission except
+        `billing:*` and `tenant:transfer`. `billing_admin` holds `billing:*`.
+        `member` holds what its teams grant.
+      enum: [owner, admin, billing_admin, member]
+    BillingCountry:
+      type: string
+      description: An ISO 3166-1 alpha-2 country code in upper case.
+      pattern: "^[A-Z]{2}$"
+    Tenant:
+      type: object
+      required: [id, brand_id, kind, slug, name, status, activation, billing_country, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/TenantId"}
+        brand_id: {$ref: "#/components/schemas/BrandId"}
+        kind: {type: string, enum: [personal, organization]}
+        slug: {type: string}
+        name: {type: string, minLength: 1, maxLength: 100}
+        status:
+          type: string
+          description: "`suspended` blocks every write and keeps reads. `closed` is terminal."
+          enum: [active, suspended, closed]
+        activation: {type: string, enum: [pending, approved, rejected]}
+        billing_country: {type: [string, "null"]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    TenantCreate:
+      type: object
+      required: [idempotency_key, name]
+      additionalProperties: false
+      properties:
+        idempotency_key: {$ref: "#/components/schemas/IdempotencyKey"}
+        name: {type: string, minLength: 1, maxLength: 100}
+        billing_country: {$ref: "#/components/schemas/BillingCountry"}
+    TenantUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        billing_country:
+          description: A country code, or an empty string to clear it.
+          type: string
+          pattern: "^([A-Z]{2})?$"
+    Member:
+      type: object
+      required: [id, tenant_id, identity_id, email, display_name, role, status, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/MembershipId"}
+        tenant_id: {$ref: "#/components/schemas/TenantId"}
+        identity_id: {$ref: "#/components/schemas/IdentityId"}
+        email: {type: [string, "null"]}
+        display_name: {type: [string, "null"]}
+        role: {$ref: "#/components/schemas/Role"}
+        status: {type: string, enum: [active, suspended, removed]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    MemberPage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Member"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    MemberUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        role: {$ref: "#/components/schemas/Role"}
+        status:
+          type: string
+          description: Suspend or reinstate a member. Remove a member with DELETE.
+          enum: [active, suspended]
+    OwnershipTransfer:
+      type: object
+      required: [membership_id]
+      additionalProperties: false
+      properties:
+        membership_id: {$ref: "#/components/schemas/MembershipId"}
+    OwnershipTransferResult:
+      type: object
+      required: [from, to]
+      additionalProperties: false
+      properties:
+        from: {$ref: "#/components/schemas/Member"}
+        to: {$ref: "#/components/schemas/Member"}
+    Team:
+      type: object
+      required: [id, name, system, locked, permissions, membership_ids, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/TeamId"}
+        name: {type: string}
+        system:
+          type: boolean
+          description: True for `owners`, `admins` and `members`, which follow the membership roles.
+        locked:
+          type: boolean
+          description: True when Core manages the team's name and members. Its grants can still change.
+        permissions:
+          type: array
+          items: {$ref: "#/components/schemas/Permission"}
+        membership_ids:
+          type: array
+          items: {$ref: "#/components/schemas/MembershipId"}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    TeamPage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Team"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    TeamCreate:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+    TeamUpdate:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+    TeamMembers:
+      type: object
+      required: [membership_ids]
+      additionalProperties: false
+      properties:
+        membership_ids:
+          type: array
+          maxItems: 200
+          items: {$ref: "#/components/schemas/MembershipId"}
+    TeamGrants:
+      type: object
+      required: [permissions]
+      additionalProperties: false
+      properties:
+        permissions:
+          type: array
+          maxItems: 200
+          items: {$ref: "#/components/schemas/Permission"}
+    Invitation:
+      type: object
+      required: [id, tenant_id, email, role, status, expires_at, accepted_at, revoked_at, created_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/InvitationId"}
+        tenant_id: {$ref: "#/components/schemas/TenantId"}
+        email: {type: string}
+        role: {$ref: "#/components/schemas/Role"}
+        status: {type: string, enum: [pending, accepted, revoked, expired]}
+        expires_at: {type: string, format: date-time}
+        accepted_at: {type: [string, "null"], format: date-time}
+        revoked_at: {type: [string, "null"], format: date-time}
+        created_at: {type: string, format: date-time}
+    InvitationPage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Invitation"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    InvitationCreate:
+      type: object
+      required: [email, role]
+      additionalProperties: false
+      properties:
+        email: {type: string, minLength: 3, maxLength: 320}
+        role: {type: string, enum: [admin, billing_admin, member]}
+    InvitationCreated:
+      type: object
+      required: [invitation, token]
+      additionalProperties: false
+      properties:
+        invitation: {$ref: "#/components/schemas/Invitation"}
+        token:
+          type: string
+          description: The clear invitation token. Shown once and never stored.
+    InvitationAccept:
+      type: object
+      required: [token]
+      additionalProperties: false
+      properties:
+        token: {type: string, minLength: 1, maxLength: 128}
+    InvitationAccepted:
+      type: object
+      required: [membership, tenant]
+      additionalProperties: false
+      properties:
+        membership: {$ref: "#/components/schemas/Member"}
+        tenant: {$ref: "#/components/schemas/Tenant"}
+    ActivationDecision:
+      type: object
+      required: [state, reason, request_id, actor, decided_at]
+      additionalProperties: false
+      properties:
+        state: {type: string, enum: [pending, approved, rejected]}
+        reason: {type: string}
+        request_id: {type: string}
+        actor: {$ref: "#/components/schemas/Actor"}
+        decided_at: {type: string, format: date-time}
+    ActivationDecisionRequest:
+      type: object
+      required: [state, reason, request_id]
+      additionalProperties: false
+      properties:
+        state: {type: string, enum: [pending, approved, rejected]}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+        request_id:
+          type: string
+          description: Client-chosen ID that makes the decision safe to retry.
+          minLength: 8
+          maxLength: 255
+          pattern: "^[\\x21-\\x7E]+$"
+    ActivationState:
+      type: object
+      required: [state, decisions]
+      additionalProperties: false
+      properties:
+        state: {type: string, enum: [pending, approved, rejected]}
+        decisions:
+          type: array
+          items: {$ref: "#/components/schemas/ActivationDecision"}
+    ApiKey:
+      type: object
+      required: [id, tenant_id, name, prefix, permissions, created_by_membership_id, expires_at, last_used_at, revoked_at, created_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/ApiKeyId"}
+        tenant_id: {$ref: "#/components/schemas/TenantId"}
+        name: {type: string}
+        prefix:
+          type: string
+          description: The start of the secret, for display.
+        permissions:
+          type: array
+          items: {$ref: "#/components/schemas/Permission"}
+        created_by_membership_id: {$ref: "#/components/schemas/MembershipId"}
+        expires_at: {type: string, format: date-time}
+        last_used_at:
+          type: [string, "null"]
+          format: date-time
+          description: Updated at most once a minute.
+        revoked_at: {type: [string, "null"], format: date-time}
+        created_at: {type: string, format: date-time}
+    ApiKeyPage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/ApiKey"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    ApiKeyCreate:
+      type: object
+      required: [name, permissions]
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        permissions:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: {$ref: "#/components/schemas/Permission"}
+        expires_at:
+          type: string
+          format: date-time
+          description: Defaults to 90 days from now. At most 365 days from now.
+    ApiKeyCreated:
+      type: object
+      required: [api_key, secret]
+      additionalProperties: false
+      properties:
+        api_key: {$ref: "#/components/schemas/ApiKey"}
+        secret:
+          type: string
+          description: "`zs_<brand slug>_<random>`. Shown once and never stored."

@@ -92,3 +92,30 @@ func TestBrandLevelScope(t *testing.T) {
 		t.Fatalf("empty context: %v", err)
 	}
 }
+
+func TestRequireFailsClosed(t *testing.T) {
+	s, err := New(idgen.MustNewV7(), idgen.MustNewV7())
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := WithPermissions(WithContext(context.Background(), s), []string{"tenant:read", "member:read"})
+	if err := Require(full, "tenant:read"); err != nil {
+		t.Fatalf("held permission refused: %v", err)
+	}
+	for name, ctx := range map[string]context.Context{
+		"missing permission": full,
+		"no permissions":     WithContext(context.Background(), s),
+		"brand scope only":   WithPermissions(WithBrand(context.Background(), s.Brand), []string{"tenant:update"}),
+		"no scope":           WithPermissions(context.Background(), []string{"tenant:update"}),
+	} {
+		if err := Require(ctx, "tenant:update"); !zserrors.IsCode(err, zserrors.CodePermissionDenied) {
+			t.Errorf("%s: Require = %v, want permission_denied", name, err)
+		}
+	}
+	if err := Require(full, ""); !zserrors.IsCode(err, zserrors.CodePermissionDenied) {
+		t.Errorf("empty permission: %v", err)
+	}
+	if got := Permissions(full); len(got) != 2 || got[0] != "member:read" {
+		t.Errorf("Permissions = %v", got)
+	}
+}

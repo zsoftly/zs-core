@@ -109,7 +109,7 @@ Every ZSoftly product needs the same things: a company with members and roles, a
 
 ## Status
 
-ZSoftly Core is under active development. Expect bugs, breaking changes, and gaps in the documentation until the first stable release. The architecture and the module contracts are being written before any code lands. Watch the issues for the first design documents, and report anything that breaks.
+ZSoftly Core is under active development. Expect bugs, breaking changes, and gaps in the documentation until the first stable release. The architecture and the module contracts are being written before any code lands. Issues and external pull requests are closed while the module contracts settle; see [CONTRIBUTING.md](CONTRIBUTING.md) for how to reach the maintainers and when contributions open.
 
 ## License
 

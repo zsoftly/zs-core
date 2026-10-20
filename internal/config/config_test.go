@@ -35,6 +35,7 @@ func TestOverrides(t *testing.T) {
 		"ZS_HTTP_WRITE_TIMEOUT=11s",
 		"ZS_HTTP_IDLE_TIMEOUT=1m",
 		"ZS_SHUTDOWN_TIMEOUT=3s",
+		"ZS_TENANT_SWEEP_INTERVAL=2m",
 		"ZS_BRANDS_DIR=/etc/zs-core/brands",
 		"ZS_SECRETS_DIR=/run/zs-core/secrets/",
 		"ZS_TEST_POSTGRES_URL=postgres://ignored",
@@ -46,7 +47,8 @@ func TestOverrides(t *testing.T) {
 		cfg.LogFormat != "text" || cfg.MigrateOnStart || cfg.BrandsDir != "/etc/zs-core/brands" ||
 		cfg.SecretsDir != "/run/zs-core/secrets" ||
 		cfg.HTTPReadHeaderTimeout != 2*time.Second || cfg.HTTPReadTimeout != 10*time.Second ||
-		cfg.HTTPWriteTimeout != 11*time.Second || cfg.HTTPIdleTimeout != time.Minute || cfg.ShutdownTimeout != 3*time.Second {
+		cfg.HTTPWriteTimeout != 11*time.Second || cfg.HTTPIdleTimeout != time.Minute || cfg.ShutdownTimeout != 3*time.Second ||
+		cfg.TenantSweepInterval != 2*time.Minute {
 		t.Fatalf("overrides not applied: %+v", cfg)
 	}
 }

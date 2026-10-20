@@ -10,6 +10,7 @@ package scope
 
 import (
 	"context"
+	"sort"
 
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/idgen"
@@ -115,4 +116,53 @@ func FromContext(ctx context.Context) (Scope, error) {
 		return Scope{}, err
 	}
 	return s, nil
+}
+
+// ErrPermissionDenied is returned by Require when the caller lacks the
+// permission.
+var ErrPermissionDenied = zserrors.New(zserrors.CodePermissionDenied, "")
+
+type permissionsKey struct{}
+
+// permissionSet is immutable once stored in a context.
+type permissionSet map[string]struct{}
+
+// WithPermissions returns a context carrying the caller's effective
+// permissions in the tenant of the scope. Scope resolution sets them once per
+// request after it has loaded the membership.
+func WithPermissions(ctx context.Context, permissions []string) context.Context {
+	set := make(permissionSet, len(permissions))
+	for _, p := range permissions {
+		set[p] = struct{}{}
+	}
+	return context.WithValue(ctx, permissionsKey{}, set)
+}
+
+// Permissions returns the effective permissions in ctx, sorted. It returns
+// nil when scope resolution set none.
+func Permissions(ctx context.Context) []string {
+	set, _ := ctx.Value(permissionsKey{}).(permissionSet)
+	if set == nil {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Require returns nil when the caller holds permission, a "resource:action"
+// string, in the tenant of ctx. It fails closed: a context without a complete
+// scope or without resolved permissions is permission_denied.
+func Require(ctx context.Context, permission string) error {
+	if _, err := FromContext(ctx); err != nil {
+		return ErrPermissionDenied
+	}
+	set, _ := ctx.Value(permissionsKey{}).(permissionSet)
+	if _, ok := set[permission]; !ok || permission == "" {
+		return ErrPermissionDenied
+	}
+	return nil
 }

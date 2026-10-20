@@ -198,6 +198,7 @@ func VerificationConfig(rec Record) identity.BrandConfig {
 		CustomerClientID: m.Identity.CustomerClient.ClientID,
 		StaffClientID:    m.Identity.StaffClient.ClientID,
 		MFAACRValues:     append([]string(nil), m.Identity.MFAACRValues...),
+		StaffMFARequired: m.Identity.MFA == MFARequired || m.Identity.MFA == MFARequiredForStaff,
 	}
 	for _, sc := range m.Identity.ServiceClients {
 		cfg.ServiceClientIDs = append(cfg.ServiceClientIDs, sc.ClientID)

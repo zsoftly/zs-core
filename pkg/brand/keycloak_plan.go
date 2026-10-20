@@ -12,9 +12,18 @@ import (
 	"github.com/zsoftly/zs-core/internal/keycloak"
 )
 
-// Flow aliases Core manages in every brand realm. FlowOptional and FlowMFA
-// are copies of the built-in browser flow. FlowMFA makes the conditional
-// second-factor step required; FlowOptional keeps it conditional.
+// Flow aliases Core manages in every brand realm. FlowOptional, FlowMFA and
+// FlowStaffMFA are copies of the built-in browser flow. FlowMFA makes the
+// conditional second-factor step required; FlowOptional keeps it
+// conditional. FlowStaffMFA is FlowMFA with the Cookie step disabled: it is
+// the browser flow of the staff client whenever mfa is required or
+// required_for_staff. A Keycloak SSO session from the customer client may
+// hold no second factor, and the Cookie step alone would satisfy the flow
+// with it. Without it, the staff client always asks for the password and the
+// second factor. A required OTP form at the top level next to Cookie cannot
+// do this: Keycloak ignores the alternatives of a level that holds a
+// required execution, so Cookie, the identity provider redirector and the
+// login forms would all stop running.
 // FlowPostBrokerMFA holds a required OTP form only. With mfa required it is
 // the post-broker-login flow of every identity provider, so a login through
 // a provider also needs the second factor. A copy of the browser flow cannot
@@ -23,8 +32,10 @@ import (
 const (
 	FlowOptional      = "zs-browser"
 	FlowMFA           = "zs-browser-mfa"
+	FlowStaffMFA      = "zs-browser-staff-mfa"
 	FlowPostBrokerMFA = "zs-post-broker-mfa"
 	builtinFlow       = "browser"
+	cookieProvider    = "auth-cookie"
 	// amrMaxAge is how long, in seconds, an authenticator's AMR value stays
 	// in the tokens of a session. It matches Keycloak's default SSO session
 	// maximum; recency is judged from auth_time, not from amr.
@@ -62,6 +73,9 @@ func realmFields(m *Manifest) []field {
 		{"identity.internationalization_enabled", "internationalizationEnabled", true},
 		{"identity.default_locale", "defaultLocale", id.DefaultLocale},
 		{"identity.required_actions.verify_email", "verifyEmail", containsString(id.RequiredActions, "verify_email")},
+		// Tenants are backed by Keycloak Organizations, which answer 404
+		// until the realm enables them.
+		{"identity.organizations_enabled", "organizationsEnabled", true},
 	}
 	if id.LoginTheme != "" {
 		fs = append(fs, field{"identity.login_theme", "loginTheme", id.LoginTheme})
@@ -197,6 +211,12 @@ func planKeycloak(ctx context.Context, kc *keycloak.Client, m *Manifest, sec res
 	}
 	changes = append(changes, clients...)
 
+	staffScope, err := planStaffClientScope(ctx, kc, m, staffClient, exists)
+	if err != nil {
+		return nil, err
+	}
+	changes = append(changes, staffScope...)
+
 	idps, err := planIdentityProviders(ctx, kc, m, sec, exists)
 	if err != nil {
 		return nil, err
@@ -217,17 +237,25 @@ type flowLayout struct {
 	otp        keycloak.Execution
 	twoFactor  keycloak.Execution
 	conditions []keycloak.Execution
+	cookie     keycloak.Execution
+	// twoFactorFirst is true when the second-factor sub-flow runs before
+	// the password form at the same level.
+	twoFactorFirst bool
 }
 
 func layoutOf(alias string, execs []keycloak.Execution) (flowLayout, error) {
 	var l flowLayout
-	otpAt := -1
+	otpAt, passwordAt := -1, -1
 	for i, e := range execs {
 		switch e.ProviderID {
 		case "auth-username-password-form":
-			l.password = e
+			l.password, passwordAt = e, i
 		case "auth-otp-form":
 			l.otp, otpAt = e, i
+		case cookieProvider:
+			if e.Level == 0 && l.cookie.ID == "" {
+				l.cookie = e
+			}
 		}
 	}
 	if l.password.ID == "" || otpAt < 0 {
@@ -243,6 +271,7 @@ func layoutOf(alias string, execs []keycloak.Execution) (flowLayout, error) {
 	if start < 0 {
 		return l, fmt.Errorf("flow %s has no sub-flow around the OTP form", alias)
 	}
+	l.twoFactorFirst = l.twoFactor.Level == l.password.Level && start < passwordAt
 	for i := start + 1; i < len(execs) && execs[i].Level >= l.otp.Level; i++ {
 		e := execs[i]
 		if e.Level == l.otp.Level && len(e.ProviderID) > len("conditional-") && e.ProviderID[:len("conditional-")] == "conditional-" {
@@ -257,9 +286,24 @@ type flowOp struct {
 	run   func(ctx context.Context) error
 }
 
+// browserFlowSpec is one copy of the browser flow Core manages: whether its
+// second factor is required, and whether its Cookie step is disabled.
+type browserFlowSpec struct {
+	alias    string
+	mfa      bool
+	noCookie bool
+}
+
+var browserFlows = []browserFlowSpec{
+	{alias: FlowOptional},
+	{alias: FlowMFA, mfa: true},
+	{alias: FlowStaffMFA, mfa: true, noCookie: true},
+}
+
 // flowOps returns what a copy of the browser flow needs to match Core's
 // layout. When the flow does not exist yet, every op is listed.
-func flowOps(ctx context.Context, kc *keycloak.Client, realm, alias string, mfa bool, execs []keycloak.Execution) ([]flowOp, error) {
+func flowOps(ctx context.Context, kc *keycloak.Client, realm string, spec browserFlowSpec, execs []keycloak.Execution) ([]flowOp, error) {
+	alias, mfa := spec.alias, spec.mfa
 	l, err := layoutOf(alias, execs)
 	if err != nil {
 		return nil, err
@@ -276,6 +320,21 @@ func flowOps(ctx context.Context, kc *keycloak.Client, realm, alias string, mfa 
 				return kc.UpdateExecutionRequirement(ctx, realm, alias, id, want)
 			},
 		})
+	}
+	if l.twoFactorFirst {
+		// An earlier apply set the requirement without the priority, and
+		// Keycloak moved the sub-flow in front of the password form, where
+		// it fails for want of a user. The built-in flow spaces them by 10.
+		id, priority := l.twoFactor.ID, l.password.Priority+10
+		ops = append(ops, flowOp{
+			field: FieldChange{Field: "executions.conditional-2fa-subflow.priority", Before: l.twoFactor.Priority, After: priority},
+			run: func(ctx context.Context) error {
+				return kc.SetExecutionPriority(ctx, realm, alias, id, priority)
+			},
+		})
+	}
+	if spec.noCookie && l.cookie.ID != "" {
+		require(cookieProvider, l.cookie, "DISABLED")
 	}
 	if mfa {
 		require("conditional-2fa-subflow", l.twoFactor, "REQUIRED")
@@ -442,13 +501,13 @@ func planFlows(ctx context.Context, kc *keycloak.Client, realm string, realmExis
 		}
 	}
 	var changes []Change
-	for _, spec := range []struct {
-		alias string
-		mfa   bool
-	}{{FlowOptional, false}, {FlowMFA, true}} {
+	for _, spec := range browserFlows {
 		alias, mfa := spec.alias, spec.mfa
 		if !existing[alias] {
 			fields := []FieldChange{{Field: "copy_of", After: builtinFlow}}
+			if spec.noCookie {
+				fields = append(fields, FieldChange{Field: "executions." + cookieProvider + ".requirement", After: "DISABLED"})
+			}
 			if mfa {
 				fields = append(fields, FieldChange{Field: "executions.conditional-2fa-subflow.requirement", After: "REQUIRED"},
 					FieldChange{Field: "executions.auth-otp-form.requirement", After: "REQUIRED"})
@@ -461,7 +520,7 @@ func planFlows(ctx context.Context, kc *keycloak.Client, realm string, realmExis
 					if err := kc.CopyFlow(ctx, realm, builtinFlow, alias); err != nil {
 						return err
 					}
-					return runFlowOps(ctx, kc, realm, alias, mfa)
+					return runFlowOps(ctx, kc, realm, spec)
 				},
 			})
 			continue
@@ -470,7 +529,7 @@ func planFlows(ctx context.Context, kc *keycloak.Client, realm string, realmExis
 		if err != nil {
 			return nil, err
 		}
-		ops, err := flowOps(ctx, kc, realm, alias, mfa, execs)
+		ops, err := flowOps(ctx, kc, realm, spec, execs)
 		if err != nil {
 			return nil, err
 		}
@@ -483,7 +542,7 @@ func planFlows(ctx context.Context, kc *keycloak.Client, realm string, realmExis
 		}
 		changes = append(changes, Change{
 			Target: TargetFlow, Name: alias, Action: ActionUpdate, Fields: fields,
-			run: func(ctx context.Context, st *runState) error { return runFlowOps(ctx, kc, realm, alias, mfa) },
+			run: func(ctx context.Context, st *runState) error { return runFlowOps(ctx, kc, realm, spec) },
 		})
 	}
 
@@ -491,7 +550,12 @@ func planFlows(ctx context.Context, kc *keycloak.Client, realm string, realmExis
 	if err != nil {
 		return nil, err
 	}
-	return append(changes, post...), nil
+	changes = append(changes, post...)
+	staffPost, err := planStaffPostBrokerFlow(ctx, kc, realm, existing[FlowPostBrokerStaffMFA])
+	if err != nil {
+		return nil, err
+	}
+	return append(changes, staffPost...), nil
 }
 
 // planPostBrokerFlow returns the change that creates or converges
@@ -527,12 +591,12 @@ func planPostBrokerFlow(ctx context.Context, kc *keycloak.Client, realm string, 
 
 // runFlowOps reads the flow again and converges it, so it is correct whether
 // the flow was just copied or already existed.
-func runFlowOps(ctx context.Context, kc *keycloak.Client, realm, alias string, mfa bool) error {
-	execs, err := kc.Executions(ctx, realm, alias)
+func runFlowOps(ctx context.Context, kc *keycloak.Client, realm string, spec browserFlowSpec) error {
+	execs, err := kc.Executions(ctx, realm, spec.alias)
 	if err != nil {
 		return err
 	}
-	ops, err := flowOps(ctx, kc, realm, alias, mfa, execs)
+	ops, err := flowOps(ctx, kc, realm, spec, execs)
 	if err != nil {
 		return err
 	}
@@ -983,7 +1047,11 @@ func planIdentityProviders(ctx context.Context, kc *keycloak.Client, m *Manifest
 		for k, v := range cfg {
 			merged[k] = v
 		}
-		if secretChanged {
+		// Keycloak 26.8.1 refuses an update that changes the token URL, the
+		// client ID or the authentication method without the secret, so
+		// every update carries the resolved secret when the manifest has
+		// one. The mask keeps the stored secret of a provider without one.
+		if secret != "" {
 			merged["clientSecret"] = secret
 			merged[idpSecretDigestKey] = secretDigest(secret)
 		} else if _, ok := merged["clientSecret"]; ok {
@@ -1007,10 +1075,15 @@ func planIdentityProviders(ctx context.Context, kc *keycloak.Client, m *Manifest
 
 // postBrokerFlow returns the post-broker-login flow every identity provider
 // of the brand must have: FlowPostBrokerMFA when mfa is required, so a login
-// through a provider needs the second factor too, and none otherwise.
+// through a provider needs the second factor too, FlowPostBrokerStaffMFA when
+// mfa is required_for_staff, so a login through a provider for the staff
+// client needs it, and none otherwise.
 func postBrokerFlow(m *Manifest) string {
-	if m.Identity.MFA == MFARequired {
+	switch m.Identity.MFA {
+	case MFARequired:
 		return FlowPostBrokerMFA
+	case MFARequiredForStaff:
+		return FlowPostBrokerStaffMFA
 	}
 	return ""
 }
@@ -1024,7 +1097,10 @@ func sortedKeys(m map[string]string) []string {
 	return keys
 }
 
-// currentMFA describes the policy the realm's flow bindings implement.
+// currentMFA describes the policy the realm's flow bindings implement. With
+// required and required_for_staff the staff client is bound to FlowStaffMFA,
+// so a realm that binds it to anything else, such as FlowMFA before Core
+// added FlowStaffMFA, does not implement the policy and apply converges it.
 func currentMFA(realmRep, staffClient keycloak.Object, flowIDs map[string]string) string {
 	browser, _ := realmRep["browserFlow"].(string)
 	staffOverride := ""
@@ -1033,13 +1109,13 @@ func currentMFA(realmRep, staffClient keycloak.Object, flowIDs map[string]string
 			staffOverride, _ = overrides["browser"].(string)
 		}
 	}
-	mfaID := flowIDs[FlowMFA]
+	staffID := flowIDs[FlowStaffMFA]
 	switch {
-	case browser == FlowMFA && (staffOverride == "" || staffOverride == mfaID):
+	case browser == FlowMFA && staffID != "" && staffOverride == staffID:
 		return MFARequired
 	case browser == FlowOptional && staffOverride == "":
 		return MFAOptional
-	case browser == FlowOptional && mfaID != "" && staffOverride == mfaID:
+	case browser == FlowOptional && staffID != "" && staffOverride == staffID:
 		return MFARequiredForStaff
 	}
 	if staffOverride != "" {
@@ -1076,21 +1152,21 @@ func planMFA(ctx context.Context, kc *keycloak.Client, m *Manifest, realmRep, st
 			if err != nil {
 				return err
 			}
-			mfaID := ""
+			staffFlowID := ""
 			for _, f := range flows {
-				if f.Alias == FlowMFA {
-					mfaID = f.ID
+				if f.Alias == FlowStaffMFA {
+					staffFlowID = f.ID
 				}
 			}
-			if mfaID == "" {
-				return fmt.Errorf("flow %s is missing: %w", FlowMFA, keycloak.ErrNotFound)
+			if staffFlowID == "" {
+				return fmt.Errorf("flow %s is missing: %w", FlowStaffMFA, keycloak.ErrNotFound)
 			}
 			browser, override := FlowOptional, ""
 			switch want {
 			case MFARequired:
-				browser = FlowMFA
+				browser, override = FlowMFA, staffFlowID
 			case MFARequiredForStaff:
-				override = mfaID
+				override = staffFlowID
 			}
 			if err := kc.UpdateRealm(ctx, realm, keycloak.Object{"browserFlow": browser}); err != nil {
 				return err

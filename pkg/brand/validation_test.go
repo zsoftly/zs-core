@@ -296,7 +296,7 @@ func TestMFAPolicyRefusesThePasswordGrant(t *testing.T) {
 }
 
 func TestPostBrokerFlowFollowsTheMFAPolicy(t *testing.T) {
-	for mfa, want := range map[string]string{MFAOptional: "", MFARequiredForStaff: "", MFARequired: FlowPostBrokerMFA} {
+	for mfa, want := range map[string]string{MFAOptional: "", MFARequiredForStaff: FlowPostBrokerStaffMFA, MFARequired: FlowPostBrokerMFA} {
 		m := reference(t)
 		m.Identity.MFA = mfa
 		if got := postBrokerFlow(m); got != want {

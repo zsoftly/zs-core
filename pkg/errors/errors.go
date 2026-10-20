@@ -34,6 +34,8 @@ type Definition struct {
 //	ZS-1300..1399 pagination
 //	ZS-1400..1499 scope and authentication
 //	ZS-1500..1599 brands
+//	ZS-1600..1699 tenants, memberships, teams and invitations
+//	ZS-1700..1799 API keys
 const (
 	CodeInternal             Code = "ZS-1000"
 	CodeValidation           Code = "ZS-1001"
@@ -68,12 +70,28 @@ const (
 	CodeAuthenticationUnavailable Code = "ZS-1404"
 	CodeEmailNotVerified          Code = "ZS-1405"
 	CodeRecentMFARequired         Code = "ZS-1406"
+	CodeMFARequired               Code = "ZS-1407"
 
 	CodeBrandManifestInvalid Code = "ZS-1500"
 	CodeBrandApplyRejected   Code = "ZS-1501"
 	CodeBrandApplyInProgress Code = "ZS-1502"
 	CodeSecretUnresolved     Code = "ZS-1503"
 	CodeSecretRefInvalid     Code = "ZS-1504"
+
+	CodeTenantNotFound          Code = "ZS-1600"
+	CodePermissionDenied        Code = "ZS-1601"
+	CodeLastOwner               Code = "ZS-1602"
+	CodeInvitationNotFound      Code = "ZS-1603"
+	CodeInvitationEmailMismatch Code = "ZS-1604"
+	CodePermissionUnknown       Code = "ZS-1605"
+	CodeTeamLocked              Code = "ZS-1606"
+	CodeAlreadyMember           Code = "ZS-1607"
+	CodeTenantKindUnsupported   Code = "ZS-1608"
+	CodeRecentAuthRequired      Code = "ZS-1609"
+	CodeTenantClosed            Code = "ZS-1610"
+
+	CodeAPIKeyInvalid      Code = "ZS-1700"
+	CodeAPIKeyOwnerRemoved Code = "ZS-1701"
 )
 
 var definitions = []Definition{
@@ -106,11 +124,25 @@ var definitions = []Definition{
 	{CodeAuthenticationUnavailable, "authentication_unavailable", http.StatusServiceUnavailable, true, "Authentication is temporarily unavailable."},
 	{CodeEmailNotVerified, "email_not_verified", http.StatusForbidden, false, "A verified email address is required."},
 	{CodeRecentMFARequired, "recent_mfa_required", http.StatusForbidden, false, "Sign in again with multi-factor authentication."},
+	{CodeMFARequired, "mfa_required", http.StatusForbidden, false, "This brand requires multi-factor authentication for staff. Sign in again with a second factor."},
 	{CodeBrandManifestInvalid, "brand_manifest_invalid", http.StatusBadRequest, false, "The brand manifest is invalid."},
 	{CodeBrandApplyRejected, "brand_apply_rejected", http.StatusUnprocessableEntity, false, "An engine rejected part of the brand manifest."},
 	{CodeBrandApplyInProgress, "brand_apply_in_progress", http.StatusConflict, true, "Another apply of this brand is in progress."},
 	{CodeSecretUnresolved, "secret_unresolved", http.StatusUnprocessableEntity, false, "A secret reference in the brand manifest could not be resolved."},
 	{CodeSecretRefInvalid, "secret_ref_invalid", http.StatusUnprocessableEntity, false, "A secret reference in the brand manifest is outside the brand's namespace."},
+	{CodeTenantNotFound, "tenant_not_found", http.StatusNotFound, false, "The tenant was not found."},
+	{CodePermissionDenied, "permission_denied", http.StatusForbidden, false, "The caller does not have the permission this action needs."},
+	{CodeLastOwner, "last_owner", http.StatusConflict, false, "The last active owner cannot be removed, suspended or demoted."},
+	{CodeInvitationNotFound, "invitation_not_found", http.StatusNotFound, false, "The invitation was not found, has expired or was revoked."},
+	{CodeInvitationEmailMismatch, "invitation_email_mismatch", http.StatusForbidden, false, "The invitation was sent to another email address."},
+	{CodePermissionUnknown, "permission_unknown", http.StatusBadRequest, false, "A permission is not registered for this brand."},
+	{CodeTeamLocked, "team_locked", http.StatusConflict, false, "This team is locked."},
+	{CodeAlreadyMember, "already_member", http.StatusConflict, false, "The caller is already a member of this tenant."},
+	{CodeTenantKindUnsupported, "tenant_kind_unsupported", http.StatusConflict, false, "This action is not available for this kind of tenant."},
+	{CodeRecentAuthRequired, "recent_auth_required", http.StatusForbidden, false, "Sign in again to continue."},
+	{CodeTenantClosed, "tenant_closed", http.StatusConflict, false, "The tenant is closed. Closing is final."},
+	{CodeAPIKeyInvalid, "api_key_invalid", http.StatusUnauthorized, false, "The API key is invalid, expired or revoked."},
+	{CodeAPIKeyOwnerRemoved, "api_key_owner_removed", http.StatusUnauthorized, false, "The member who created this API key is no longer active."},
 }
 
 var byCode = func() map[Code]Definition {

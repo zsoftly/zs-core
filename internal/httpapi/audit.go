@@ -14,9 +14,9 @@ import (
 	"github.com/zsoftly/zs-core/pkg/scope"
 )
 
-// listAuditEvents is a staff operator route until Phase 3b adds the tenant
-// member path. With tenant_id it lists that tenant's events inside the
-// caller's brand; without it, the brand's own events.
+// listAuditEvents is the staff operator route. With tenant_id it lists that
+// tenant's events inside the caller's brand; without it, the brand's own
+// events. Tenant members use listTenantAuditEvents.
 func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 	p, err := s.requireStaff(r.Context(), identity.StaffOperator)
 	if err != nil {
@@ -28,6 +28,28 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	filter := auditFilter(params)
+
+	var page audit.Page
+	if params.TenantId != nil {
+		tenant, perr := idgen.ParseAs(idgen.Tenant, *params.TenantId)
+		if perr != nil {
+			s.writeError(w, r, scope.ErrInvalid)
+			return
+		}
+		page, err = audit.Query(r.Context(), s.db, scope.Scope{Brand: p.Brand.ID, Tenant: tenant}, filter)
+	} else {
+		page, err = audit.QueryBrand(r.Context(), s.db, p.Brand.ID, filter)
+	}
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, auditPageBody(page))
+}
+
+// auditFilter turns the query parameters into an audit filter.
+func auditFilter(params gen.ListAuditEventsParams) audit.Filter {
 	filter := audit.Filter{}
 	if params.Limit != nil {
 		filter.Limit = *params.Limit
@@ -47,22 +69,11 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 	if params.OccurredBefore != nil {
 		filter.OccurredBefore = *params.OccurredBefore
 	}
+	return filter
+}
 
-	var page audit.Page
-	if params.TenantId != nil {
-		tenant, perr := idgen.ParseAs(idgen.Tenant, *params.TenantId)
-		if perr != nil {
-			s.writeError(w, r, scope.ErrInvalid)
-			return
-		}
-		page, err = audit.Query(r.Context(), s.db, scope.Scope{Brand: p.Brand.ID, Tenant: tenant}, filter)
-	} else {
-		page, err = audit.QueryBrand(r.Context(), s.db, p.Brand.ID, filter)
-	}
-	if err != nil {
-		s.writeError(w, r, err)
-		return
-	}
+// auditPageBody renders a page of audit events.
+func auditPageBody(page audit.Page) gen.AuditEventPage {
 	body := gen.AuditEventPage{Data: make([]gen.AuditEvent, 0, len(page.Events))}
 	if page.NextCursor != "" {
 		next := page.NextCursor
@@ -96,7 +107,7 @@ func (s *server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		body.Data = append(body.Data, item)
 	}
-	s.writeJSON(w, r, http.StatusOK, body)
+	return body
 }
 
 // parseListAuditEventsParams reads the query string into the generated

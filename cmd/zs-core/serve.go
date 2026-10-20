@@ -17,6 +17,7 @@ import (
 	"github.com/zsoftly/zs-core/migrations"
 	"github.com/zsoftly/zs-core/pkg/brand"
 	"github.com/zsoftly/zs-core/pkg/identity"
+	"github.com/zsoftly/zs-core/pkg/tenant"
 )
 
 // brandRegistryTTL is how long serve caches the applied brands.
@@ -47,6 +48,7 @@ func newAPIOptions(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, l
 	if kb, err := newKillBill(cfg); err == nil {
 		opts.BrandDeps.KillBill = kb
 	}
+	opts.Tenants = tenant.Engines{Keycloak: opts.BrandDeps.Keycloak, KillBill: opts.BrandDeps.KillBill, Secrets: resolver}
 	if cfg.BrandsDir != "" {
 		if err := checkBrandsDir(ctx, cfg.BrandsDir, resolver, pool, log); err != nil {
 			return httpapi.Options{}, err
@@ -97,4 +99,20 @@ func newKeycloak(cfg config.Config) (*keycloak.Client, error) {
 
 func newKillBill(cfg config.Config) (*killbill.Client, error) {
 	return killbill.New(killbill.Config{URL: cfg.KillBillURL, AdminUser: cfg.KillBillAdminUser, AdminPassword: cfg.KillBillAdminPassword})
+}
+
+// startTenantSweeper runs the tenant sweeper every interval until ctx ends,
+// and the relays that mirror membership changes to Keycloak Organizations,
+// when the engines are configured. Without them tenants cannot be created
+// and there is nothing to sweep or mirror.
+func startTenantSweeper(ctx context.Context, pool *pgxpool.Pool, engines tenant.Engines, interval time.Duration, log *slog.Logger) {
+	if !engines.Ready() {
+		log.Warn("tenant sweeper not started: tenant creation needs the Keycloak and Kill Bill admin settings")
+		return
+	}
+	sweeper := &tenant.Sweeper{DB: pool, Engines: engines, Log: log}
+	go sweeper.Run(ctx, interval)
+	log.Info("tenant sweeper started", "interval", interval.String())
+	go tenant.RunMirror(ctx, pool, engines, log)
+	log.Info("keycloak organization mirror started", "workers", tenant.MirrorWorkers)
 }

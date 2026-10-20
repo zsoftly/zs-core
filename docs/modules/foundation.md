@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-The foundation is the shared plumbing every module uses. It fixes the error envelope, the public ID format, the brand and tenant scope, idempotent commands, the event envelope and the transactional outbox. It also runs the migrations and serves the health probes. All of it is importable from `pkg/` and takes a `pgx.Tx` where it writes, so a product can call it inside its own transaction. The HTTP server in `internal/httpapi` only translates. Every `/v1` request needs a Keycloak token. See [identity-and-tenants.md](identity-and-tenants.md) and [brands.md](brands.md).
+The foundation is the shared plumbing every module uses. It fixes the error envelope, the public ID format, the brand and tenant scope, idempotent commands, the event envelope and the transactional outbox. It also runs the migrations and serves the health probes. All of it is importable from `pkg/` and takes a `pgx.Tx` where it writes, so a product can call it inside its own transaction. The HTTP server in `internal/httpapi` only translates. Every `/v1` request needs a Keycloak token or, on tenant routes, a tenant API key. See [identity-and-tenants.md](identity-and-tenants.md), [brands.md](brands.md) and [tenants.md](tenants.md).
 
 ## Packages
 
@@ -15,6 +15,8 @@ The foundation is the shared plumbing every module uses. It fixes the error enve
 | `pkg/events` | The versioned event envelope. |
 | `pkg/outbox` | Transactional outbox writer, reader and relay with retries. |
 | `pkg/audit` | Append-only audit trail; see [audit.md](audit.md). |
+| `pkg/tenant` | Tenants, memberships, teams, invitations, activation and the sweeper. See [tenants.md](tenants.md). |
+| `pkg/apikey` | Tenant API keys. See [api-keys.md](api-keys.md). |
 | `internal/config` | Environment configuration with strict validation. |
 | `internal/database` | Pool and the embedded forward-only migration runner. |
 | `internal/httpapi` | Router, middleware, health probes and the `/v1` routes. |
@@ -61,15 +63,27 @@ Clients branch on `code`. `message` is safe to show. It never carries database, 
 | ZS-1404 | `authentication_unavailable` | 503 | yes |
 | ZS-1405 | `email_not_verified` | 403 | no |
 | ZS-1406 | `recent_mfa_required` | 403 | no |
+| ZS-1407 | `mfa_required` | 403 | no |
 | ZS-1500 | `brand_manifest_invalid` | 400 | no |
 | ZS-1501 | `brand_apply_rejected` | 422 | no |
 | ZS-1502 | `brand_apply_in_progress` | 409 | yes |
 | ZS-1503 | `secret_unresolved` | 422 | no |
 | ZS-1504 | `secret_ref_invalid` | 422 | no |
+| ZS-1600 | `tenant_not_found` | 404 | no |
+| ZS-1601 | `permission_denied` | 403 | no |
+| ZS-1602 | `last_owner` | 409 | no |
+| ZS-1603 | `invitation_not_found` | 404 | no |
+| ZS-1604 | `invitation_email_mismatch` | 403 | no |
+| ZS-1605 | `permission_unknown` | 400 | no |
+| ZS-1606 | `team_locked` | 409 | no |
+| ZS-1607 | `already_member` | 409 | no |
+| ZS-1608 | `tenant_kind_unsupported` | 409 | no |
+| ZS-1609 | `recent_auth_required` | 403 | no |
+| ZS-1610 | `tenant_closed` | 409 | no |
+| ZS-1700 | `api_key_invalid` | 401 | no |
+| ZS-1701 | `api_key_owner_removed` | 401 | no |
 
-Codes and names are stable. New codes are added. Existing codes are never reused.
-
-Phase 3b adds the tenant and API key codes.
+Codes and names are stable. New codes are added. Existing codes are never reused. The ZS-1600 range covers tenants, memberships, teams and invitations, and the ZS-1700 range covers API keys. See [tenants.md](tenants.md) and [api-keys.md](api-keys.md).
 
 ## Public IDs
 
@@ -78,6 +92,8 @@ Internally every ID is a UUIDv7. On the API it carries a type prefix and the UUI
 ## Scope
 
 A `scope.Scope` holds a brand and a tenant. `Bind` turns it into query arguments with the brand as `$1` and the tenant as `$2`, and returns `scope_required` if either is missing. Queries in Core filter on both columns. Brand-level routes carry a scope with the brand set and the tenant unset. `scope.BrandFromContext` reads it. `scope.FromContext` and `Bind` refuse it. A brand route therefore cannot reach tenant rows by accident.
+
+Tenant routes carry a full scope and the caller's effective permissions, which scope resolution sets with `scope.WithPermissions`. Handlers call `scope.Require(ctx, "resource:action")`. It fails closed: without a full scope, or without the permission, it returns `permission_denied`.
 
 ## Idempotency
 
@@ -111,6 +127,8 @@ An event envelope carries these fields:
 
 `outbox.Write` inserts the envelope in the caller's transaction. A `Relay` reads due events oldest first, hands each to a handler and marks it published on success. A failure is retried after 5 seconds, doubling up to 5 minutes, and the event is quarantined after 10 failures by default. A relay claims the events it reads for 5 minutes. If the relay crashes, the events become due again when the claim ends. A relay whose claim expired cannot mark an event published. Delivery is at least once. Consumers deduplicate on the event ID.
 
+A reader made with `WithEventTypes` claims only the listed event types. The first consumer is the Keycloak Organization mirror of tenants, which claims only `tenant.mirror` events. A relay for another consumer must not claim them. See [tenants.md](tenants.md#the-organization-mirror).
+
 ## HTTP behaviour
 
 Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `X-Request-ID`. The server also follows these rules:
@@ -129,6 +147,7 @@ Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosni
 | `GET /v1/me` | The caller's identity; see [identity-and-tenants.md](identity-and-tenants.md). |
 | `GET /v1/brands/{id}`, `POST /v1/brands/{id}/apply` | A brand and brand apply, staff `operator` only; see [brands.md](brands.md). |
 | `GET /v1/audit/events` | Audit events of the caller's brand or one of its tenants, staff `operator` only; see [audit.md](audit.md). |
+| `POST /v1/tenants/personal`, `POST /v1/tenants`, `/v1/tenants/{id}/...`, `POST /v1/invitations/accept`, `POST /v1/staff/tenants/{id}/activation` | Tenants, members, teams, invitations, activation, API keys and the tenant audit trail. See [tenants.md](tenants.md), [api-keys.md](api-keys.md) and `api/openapi.yaml`. |
 
 ## Known limits
 

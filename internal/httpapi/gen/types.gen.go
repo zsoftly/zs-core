@@ -7,6 +7,69 @@ import (
 	"time"
 )
 
+// Defines values for ActivationDecisionState.
+const (
+	ActivationDecisionStateApproved ActivationDecisionState = "approved"
+	ActivationDecisionStatePending  ActivationDecisionState = "pending"
+	ActivationDecisionStateRejected ActivationDecisionState = "rejected"
+)
+
+// Valid indicates whether the value is a known member of the ActivationDecisionState enum.
+func (e ActivationDecisionState) Valid() bool {
+	switch e {
+	case ActivationDecisionStateApproved:
+		return true
+	case ActivationDecisionStatePending:
+		return true
+	case ActivationDecisionStateRejected:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ActivationDecisionRequestState.
+const (
+	ActivationDecisionRequestStateApproved ActivationDecisionRequestState = "approved"
+	ActivationDecisionRequestStatePending  ActivationDecisionRequestState = "pending"
+	ActivationDecisionRequestStateRejected ActivationDecisionRequestState = "rejected"
+)
+
+// Valid indicates whether the value is a known member of the ActivationDecisionRequestState enum.
+func (e ActivationDecisionRequestState) Valid() bool {
+	switch e {
+	case ActivationDecisionRequestStateApproved:
+		return true
+	case ActivationDecisionRequestStatePending:
+		return true
+	case ActivationDecisionRequestStateRejected:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ActivationStateState.
+const (
+	ActivationStateStateApproved ActivationStateState = "approved"
+	ActivationStateStatePending  ActivationStateState = "pending"
+	ActivationStateStateRejected ActivationStateState = "rejected"
+)
+
+// Valid indicates whether the value is a known member of the ActivationStateState enum.
+func (e ActivationStateState) Valid() bool {
+	switch e {
+	case ActivationStateStateApproved:
+		return true
+	case ActivationStateStatePending:
+		return true
+	case ActivationStateStateRejected:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for ActorType.
 const (
 	ActorTypeApiKey   ActorType = "api_key"
@@ -99,6 +162,7 @@ const (
 	BrandChangeTargetCoreBrand                  BrandChangeTarget = "core.brand"
 	BrandChangeTargetKeycloakAuthenticationFlow BrandChangeTarget = "keycloak.authentication_flow"
 	BrandChangeTargetKeycloakClient             BrandChangeTarget = "keycloak.client"
+	BrandChangeTargetKeycloakClientScope        BrandChangeTarget = "keycloak.client_scope"
 	BrandChangeTargetKeycloakIdentityProvider   BrandChangeTarget = "keycloak.identity_provider"
 	BrandChangeTargetKeycloakMfaPolicy          BrandChangeTarget = "keycloak.mfa_policy"
 	BrandChangeTargetKeycloakRealm              BrandChangeTarget = "keycloak.realm"
@@ -117,6 +181,8 @@ func (e BrandChangeTarget) Valid() bool {
 	case BrandChangeTargetKeycloakAuthenticationFlow:
 		return true
 	case BrandChangeTargetKeycloakClient:
+		return true
+	case BrandChangeTargetKeycloakClientScope:
 		return true
 	case BrandChangeTargetKeycloakIdentityProvider:
 		return true
@@ -178,8 +244,224 @@ func (e IdentityKind) Valid() bool {
 	}
 }
 
+// Defines values for InvitationStatus.
+const (
+	InvitationStatusAccepted InvitationStatus = "accepted"
+	InvitationStatusExpired  InvitationStatus = "expired"
+	InvitationStatusPending  InvitationStatus = "pending"
+	InvitationStatusRevoked  InvitationStatus = "revoked"
+)
+
+// Valid indicates whether the value is a known member of the InvitationStatus enum.
+func (e InvitationStatus) Valid() bool {
+	switch e {
+	case InvitationStatusAccepted:
+		return true
+	case InvitationStatusExpired:
+		return true
+	case InvitationStatusPending:
+		return true
+	case InvitationStatusRevoked:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for InvitationCreateRole.
+const (
+	InvitationCreateRoleAdmin        InvitationCreateRole = "admin"
+	InvitationCreateRoleBillingAdmin InvitationCreateRole = "billing_admin"
+	InvitationCreateRoleMember       InvitationCreateRole = "member"
+)
+
+// Valid indicates whether the value is a known member of the InvitationCreateRole enum.
+func (e InvitationCreateRole) Valid() bool {
+	switch e {
+	case InvitationCreateRoleAdmin:
+		return true
+	case InvitationCreateRoleBillingAdmin:
+		return true
+	case InvitationCreateRoleMember:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for MemberStatus.
+const (
+	MemberStatusActive    MemberStatus = "active"
+	MemberStatusRemoved   MemberStatus = "removed"
+	MemberStatusSuspended MemberStatus = "suspended"
+)
+
+// Valid indicates whether the value is a known member of the MemberStatus enum.
+func (e MemberStatus) Valid() bool {
+	switch e {
+	case MemberStatusActive:
+		return true
+	case MemberStatusRemoved:
+		return true
+	case MemberStatusSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for MemberUpdateStatus.
+const (
+	MemberUpdateStatusActive    MemberUpdateStatus = "active"
+	MemberUpdateStatusSuspended MemberUpdateStatus = "suspended"
+)
+
+// Valid indicates whether the value is a known member of the MemberUpdateStatus enum.
+func (e MemberUpdateStatus) Valid() bool {
+	switch e {
+	case MemberUpdateStatusActive:
+		return true
+	case MemberUpdateStatusSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for MembershipStatus.
+const (
+	MembershipStatusActive MembershipStatus = "active"
+)
+
+// Valid indicates whether the value is a known member of the MembershipStatus enum.
+func (e MembershipStatus) Valid() bool {
+	switch e {
+	case MembershipStatusActive:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for Role.
+const (
+	RoleAdmin        Role = "admin"
+	RoleBillingAdmin Role = "billing_admin"
+	RoleMember       Role = "member"
+	RoleOwner        Role = "owner"
+)
+
+// Valid indicates whether the value is a known member of the Role enum.
+func (e Role) Valid() bool {
+	switch e {
+	case RoleAdmin:
+		return true
+	case RoleBillingAdmin:
+		return true
+	case RoleMember:
+		return true
+	case RoleOwner:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TenantActivation.
+const (
+	TenantActivationApproved TenantActivation = "approved"
+	TenantActivationPending  TenantActivation = "pending"
+	TenantActivationRejected TenantActivation = "rejected"
+)
+
+// Valid indicates whether the value is a known member of the TenantActivation enum.
+func (e TenantActivation) Valid() bool {
+	switch e {
+	case TenantActivationApproved:
+		return true
+	case TenantActivationPending:
+		return true
+	case TenantActivationRejected:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TenantKind.
+const (
+	TenantKindOrganization TenantKind = "organization"
+	TenantKindPersonal     TenantKind = "personal"
+)
+
+// Valid indicates whether the value is a known member of the TenantKind enum.
+func (e TenantKind) Valid() bool {
+	switch e {
+	case TenantKindOrganization:
+		return true
+	case TenantKindPersonal:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TenantStatus.
+const (
+	TenantStatusActive    TenantStatus = "active"
+	TenantStatusClosed    TenantStatus = "closed"
+	TenantStatusSuspended TenantStatus = "suspended"
+)
+
+// Valid indicates whether the value is a known member of the TenantStatus enum.
+func (e TenantStatus) Valid() bool {
+	switch e {
+	case TenantStatusActive:
+		return true
+	case TenantStatusClosed:
+		return true
+	case TenantStatusSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
 // Action A dotted lowercase action name.
 type Action = string
+
+// ActivationDecision defines model for ActivationDecision.
+type ActivationDecision struct {
+	Actor     Actor                   `json:"actor"`
+	DecidedAt time.Time               `json:"decided_at"`
+	Reason    string                  `json:"reason"`
+	RequestId string                  `json:"request_id"`
+	State     ActivationDecisionState `json:"state"`
+}
+
+// ActivationDecisionState defines model for ActivationDecision.State.
+type ActivationDecisionState string
+
+// ActivationDecisionRequest defines model for ActivationDecisionRequest.
+type ActivationDecisionRequest struct {
+	Reason string `json:"reason"`
+
+	// RequestId Client-chosen ID that makes the decision safe to retry.
+	RequestId string                         `json:"request_id"`
+	State     ActivationDecisionRequestState `json:"state"`
+}
+
+// ActivationDecisionRequestState defines model for ActivationDecisionRequest.State.
+type ActivationDecisionRequestState string
+
+// ActivationState defines model for ActivationState.
+type ActivationState struct {
+	Decisions []ActivationDecision `json:"decisions"`
+	State     ActivationStateState `json:"state"`
+}
+
+// ActivationStateState defines model for ActivationState.State.
+type ActivationStateState string
 
 // Actor defines model for Actor.
 type Actor struct {
@@ -190,6 +472,57 @@ type Actor struct {
 
 // ActorType defines model for Actor.Type.
 type ActorType string
+
+// ApiKey defines model for ApiKey.
+type ApiKey struct {
+	CreatedAt time.Time `json:"created_at"`
+
+	// CreatedByMembershipId A membership ID.
+	CreatedByMembershipId MembershipId `json:"created_by_membership_id"`
+	ExpiresAt             time.Time    `json:"expires_at"`
+
+	// Id An API key ID.
+	Id ApiKeyId `json:"id"`
+
+	// LastUsedAt Updated at most once a minute.
+	LastUsedAt  *time.Time   `json:"last_used_at"`
+	Name        string       `json:"name"`
+	Permissions []Permission `json:"permissions"`
+
+	// Prefix The start of the secret, for display.
+	Prefix    string     `json:"prefix"`
+	RevokedAt *time.Time `json:"revoked_at"`
+
+	// TenantId A tenant ID.
+	TenantId TenantId `json:"tenant_id"`
+}
+
+// ApiKeyCreate defines model for ApiKeyCreate.
+type ApiKeyCreate struct {
+	// ExpiresAt Defaults to 90 days from now. At most 365 days from now.
+	ExpiresAt   *time.Time   `json:"expires_at,omitempty"`
+	Name        string       `json:"name"`
+	Permissions []Permission `json:"permissions"`
+}
+
+// ApiKeyCreated defines model for ApiKeyCreated.
+type ApiKeyCreated struct {
+	ApiKey ApiKey `json:"api_key"`
+
+	// Secret `zs_<brand slug>_<random>`. Shown once and never stored.
+	Secret string `json:"secret"`
+}
+
+// ApiKeyId An API key ID.
+type ApiKeyId = string
+
+// ApiKeyPage defines model for ApiKeyPage.
+type ApiKeyPage struct {
+	Data []ApiKey `json:"data"`
+
+	// NextCursor The cursor for the next page, or null on the last page.
+	NextCursor *NextCursor `json:"next_cursor"`
+}
 
 // AuditEvent defines model for AuditEvent.
 type AuditEvent struct {
@@ -227,6 +560,9 @@ type AuditEventPage struct {
 
 // AuditOutcome defines model for AuditOutcome.
 type AuditOutcome string
+
+// BillingCountry An ISO 3166-1 alpha-2 country code in upper case.
+type BillingCountry = string
 
 // Brand defines model for Brand.
 type Brand struct {
@@ -354,20 +690,268 @@ type IdentityKind string
 // IdentityId An identity ID.
 type IdentityId = string
 
+// Invitation defines model for Invitation.
+type Invitation struct {
+	AcceptedAt *time.Time `json:"accepted_at"`
+	CreatedAt  time.Time  `json:"created_at"`
+	Email      string     `json:"email"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+
+	// Id An invitation ID.
+	Id        InvitationId `json:"id"`
+	RevokedAt *time.Time   `json:"revoked_at"`
+
+	// Role `owner` holds every permission. `admin` holds every permission except
+	// `billing:*` and `tenant:transfer`. `billing_admin` holds `billing:*`.
+	// `member` holds what its teams grant.
+	Role   Role             `json:"role"`
+	Status InvitationStatus `json:"status"`
+
+	// TenantId A tenant ID.
+	TenantId TenantId `json:"tenant_id"`
+}
+
+// InvitationStatus defines model for Invitation.Status.
+type InvitationStatus string
+
+// InvitationAccept defines model for InvitationAccept.
+type InvitationAccept struct {
+	Token string `json:"token"`
+}
+
+// InvitationAccepted defines model for InvitationAccepted.
+type InvitationAccepted struct {
+	Membership Member `json:"membership"`
+	Tenant     Tenant `json:"tenant"`
+}
+
+// InvitationCreate defines model for InvitationCreate.
+type InvitationCreate struct {
+	Email string               `json:"email"`
+	Role  InvitationCreateRole `json:"role"`
+}
+
+// InvitationCreateRole defines model for InvitationCreate.Role.
+type InvitationCreateRole string
+
+// InvitationCreated defines model for InvitationCreated.
+type InvitationCreated struct {
+	Invitation Invitation `json:"invitation"`
+
+	// Token The clear invitation token. Shown once and never stored.
+	Token string `json:"token"`
+}
+
+// InvitationId An invitation ID.
+type InvitationId = string
+
+// InvitationPage defines model for InvitationPage.
+type InvitationPage struct {
+	Data []Invitation `json:"data"`
+
+	// NextCursor The cursor for the next page, or null on the last page.
+	NextCursor *NextCursor `json:"next_cursor"`
+}
+
 // Me defines model for Me.
 type Me struct {
 	Identity    Identity     `json:"identity"`
 	Memberships []Membership `json:"memberships"`
 }
 
-// Membership A membership of the caller in a tenant. Added in Phase 3b.
-type Membership map[string]interface{}
+// Member defines model for Member.
+type Member struct {
+	CreatedAt   time.Time `json:"created_at"`
+	DisplayName *string   `json:"display_name"`
+	Email       *string   `json:"email"`
+
+	// Id A membership ID.
+	Id MembershipId `json:"id"`
+
+	// IdentityId An identity ID.
+	IdentityId IdentityId `json:"identity_id"`
+
+	// Role `owner` holds every permission. `admin` holds every permission except
+	// `billing:*` and `tenant:transfer`. `billing_admin` holds `billing:*`.
+	// `member` holds what its teams grant.
+	Role   Role         `json:"role"`
+	Status MemberStatus `json:"status"`
+
+	// TenantId A tenant ID.
+	TenantId  TenantId  `json:"tenant_id"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// MemberStatus defines model for Member.Status.
+type MemberStatus string
+
+// MemberPage defines model for MemberPage.
+type MemberPage struct {
+	Data []Member `json:"data"`
+
+	// NextCursor The cursor for the next page, or null on the last page.
+	NextCursor *NextCursor `json:"next_cursor"`
+}
+
+// MemberUpdate defines model for MemberUpdate.
+type MemberUpdate struct {
+	// Role `owner` holds every permission. `admin` holds every permission except
+	// `billing:*` and `tenant:transfer`. `billing_admin` holds `billing:*`.
+	// `member` holds what its teams grant.
+	Role *Role `json:"role,omitempty"`
+
+	// Status Suspend or reinstate a member. Remove a member with DELETE.
+	Status *MemberUpdateStatus `json:"status,omitempty"`
+}
+
+// MemberUpdateStatus Suspend or reinstate a member. Remove a member with DELETE.
+type MemberUpdateStatus string
+
+// Membership An active membership of the caller, with its tenant.
+type Membership struct {
+	// Id A membership ID.
+	Id MembershipId `json:"id"`
+
+	// Role `owner` holds every permission. `admin` holds every permission except
+	// `billing:*` and `tenant:transfer`. `billing_admin` holds `billing:*`.
+	// `member` holds what its teams grant.
+	Role   Role             `json:"role"`
+	Status MembershipStatus `json:"status"`
+	Tenant Tenant           `json:"tenant"`
+}
+
+// MembershipStatus defines model for Membership.Status.
+type MembershipStatus string
+
+// MembershipId A membership ID.
+type MembershipId = string
 
 // NextCursor The cursor for the next page, or null on the last page.
 type NextCursor = string
 
+// OwnershipTransfer defines model for OwnershipTransfer.
+type OwnershipTransfer struct {
+	// MembershipId A membership ID.
+	MembershipId MembershipId `json:"membership_id"`
+}
+
+// OwnershipTransferResult defines model for OwnershipTransferResult.
+type OwnershipTransferResult struct {
+	From Member `json:"from"`
+	To   Member `json:"to"`
+}
+
+// Permission A `resource:action` permission, built in or registered by the brand.
+type Permission = string
+
+// Role `owner` holds every permission. `admin` holds every permission except
+// `billing:*` and `tenant:transfer`. `billing_admin` holds `billing:*`.
+// `member` holds what its teams grant.
+type Role string
+
+// Team defines model for Team.
+type Team struct {
+	CreatedAt time.Time `json:"created_at"`
+
+	// Id A team ID.
+	Id TeamId `json:"id"`
+
+	// Locked True when Core manages the team's name and members. Its grants can still change.
+	Locked        bool           `json:"locked"`
+	MembershipIds []MembershipId `json:"membership_ids"`
+	Name          string         `json:"name"`
+	Permissions   []Permission   `json:"permissions"`
+
+	// System True for `owners`, `admins` and `members`, which follow the membership roles.
+	System    bool      `json:"system"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TeamCreate defines model for TeamCreate.
+type TeamCreate struct {
+	Name string `json:"name"`
+}
+
+// TeamGrants defines model for TeamGrants.
+type TeamGrants struct {
+	Permissions []Permission `json:"permissions"`
+}
+
+// TeamId A team ID.
+type TeamId = string
+
+// TeamMembers defines model for TeamMembers.
+type TeamMembers struct {
+	MembershipIds []MembershipId `json:"membership_ids"`
+}
+
+// TeamPage defines model for TeamPage.
+type TeamPage struct {
+	Data []Team `json:"data"`
+
+	// NextCursor The cursor for the next page, or null on the last page.
+	NextCursor *NextCursor `json:"next_cursor"`
+}
+
+// TeamUpdate defines model for TeamUpdate.
+type TeamUpdate struct {
+	Name string `json:"name"`
+}
+
+// Tenant defines model for Tenant.
+type Tenant struct {
+	Activation     TenantActivation `json:"activation"`
+	BillingCountry *string          `json:"billing_country"`
+
+	// BrandId A brand ID.
+	BrandId   BrandId   `json:"brand_id"`
+	CreatedAt time.Time `json:"created_at"`
+
+	// Id A tenant ID.
+	Id   TenantId   `json:"id"`
+	Kind TenantKind `json:"kind"`
+	Name string     `json:"name"`
+	Slug string     `json:"slug"`
+
+	// Status `suspended` blocks every write and keeps reads. `closed` is terminal.
+	Status    TenantStatus `json:"status"`
+	UpdatedAt time.Time    `json:"updated_at"`
+}
+
+// TenantActivation defines model for Tenant.Activation.
+type TenantActivation string
+
+// TenantKind defines model for Tenant.Kind.
+type TenantKind string
+
+// TenantStatus `suspended` blocks every write and keeps reads. `closed` is terminal.
+type TenantStatus string
+
+// TenantCreate defines model for TenantCreate.
+type TenantCreate struct {
+	// BillingCountry An ISO 3166-1 alpha-2 country code in upper case.
+	BillingCountry *BillingCountry `json:"billing_country,omitempty"`
+
+	// IdempotencyKey Client-chosen key that makes a command safe to retry. Scoped to the
+	// brand, the tenant and the actor. A retry with the same payload returns
+	// the original result; a different payload returns `409
+	// idempotency_key_conflict`.
+	IdempotencyKey IdempotencyKey `json:"idempotency_key"`
+	Name           string         `json:"name"`
+}
+
 // TenantId A tenant ID.
 type TenantId = string
+
+// TenantUpdate defines model for TenantUpdate.
+type TenantUpdate struct {
+	// BillingCountry A country code, or an empty string to clear it.
+	BillingCountry *string `json:"billing_country,omitempty"`
+	Name           *string `json:"name,omitempty"`
+}
+
+// ApiKeyIdPath An API key ID.
+type ApiKeyIdPath = ApiKeyId
 
 // BrandIdPath A brand ID.
 type BrandIdPath = BrandId
@@ -375,8 +959,20 @@ type BrandIdPath = BrandId
 // Cursor defines model for Cursor.
 type Cursor = string
 
+// InvitationIdPath An invitation ID.
+type InvitationIdPath = InvitationId
+
 // Limit defines model for Limit.
 type Limit = int
+
+// MembershipIdPath A membership ID.
+type MembershipIdPath = MembershipId
+
+// TeamIdPath A team ID.
+type TeamIdPath = TeamId
+
+// TenantIdPath A tenant ID.
+type TenantIdPath = TenantId
 
 // BadRequest The body of every error response.
 type BadRequest = ErrorEnvelope
@@ -429,5 +1025,104 @@ type ApplyBrandParams struct {
 	Reason *string `form:"reason,omitempty" json:"reason,omitempty"`
 }
 
+// ListApiKeysParams defines parameters for ListApiKeys.
+type ListApiKeysParams struct {
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// RevokeApiKeyParams defines parameters for RevokeApiKey.
+type RevokeApiKeyParams struct {
+	// Reason Why the key is revoked. Recorded in audit.
+	Reason *string `form:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// ListTenantAuditEventsParams defines parameters for ListTenantAuditEvents.
+type ListTenantAuditEventsParams struct {
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+
+	// ActorId Only events by this actor.
+	ActorId *string `form:"actor_id,omitempty" json:"actor_id,omitempty"`
+
+	// Action Only events with this action, such as `tenant.member.added`.
+	Action *Action `form:"action,omitempty" json:"action,omitempty"`
+
+	// OccurredAfter Only events at or after this time (RFC 3339).
+	OccurredAfter *time.Time `form:"occurred_after,omitempty" json:"occurred_after,omitempty"`
+
+	// OccurredBefore Only events before this time (RFC 3339).
+	OccurredBefore *time.Time `form:"occurred_before,omitempty" json:"occurred_before,omitempty"`
+}
+
+// ListInvitationsParams defines parameters for ListInvitations.
+type ListInvitationsParams struct {
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// ListMembersParams defines parameters for ListMembers.
+type ListMembersParams struct {
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// ListTeamsParams defines parameters for ListTeams.
+type ListTeamsParams struct {
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
 // ApplyBrandJSONRequestBody defines body for ApplyBrand for application/json ContentType.
 type ApplyBrandJSONRequestBody = BrandManifest
+
+// AcceptInvitationJSONRequestBody defines body for AcceptInvitation for application/json ContentType.
+type AcceptInvitationJSONRequestBody = InvitationAccept
+
+// DecideTenantActivationJSONRequestBody defines body for DecideTenantActivation for application/json ContentType.
+type DecideTenantActivationJSONRequestBody = ActivationDecisionRequest
+
+// CreateTenantJSONRequestBody defines body for CreateTenant for application/json ContentType.
+type CreateTenantJSONRequestBody = TenantCreate
+
+// UpdateTenantJSONRequestBody defines body for UpdateTenant for application/json ContentType.
+type UpdateTenantJSONRequestBody = TenantUpdate
+
+// CreateApiKeyJSONRequestBody defines body for CreateApiKey for application/json ContentType.
+type CreateApiKeyJSONRequestBody = ApiKeyCreate
+
+// CreateInvitationJSONRequestBody defines body for CreateInvitation for application/json ContentType.
+type CreateInvitationJSONRequestBody = InvitationCreate
+
+// UpdateMemberJSONRequestBody defines body for UpdateMember for application/json ContentType.
+type UpdateMemberJSONRequestBody = MemberUpdate
+
+// TransferOwnershipJSONRequestBody defines body for TransferOwnership for application/json ContentType.
+type TransferOwnershipJSONRequestBody = OwnershipTransfer
+
+// CreateTeamJSONRequestBody defines body for CreateTeam for application/json ContentType.
+type CreateTeamJSONRequestBody = TeamCreate
+
+// UpdateTeamJSONRequestBody defines body for UpdateTeam for application/json ContentType.
+type UpdateTeamJSONRequestBody = TeamUpdate
+
+// SetTeamGrantsJSONRequestBody defines body for SetTeamGrants for application/json ContentType.
+type SetTeamGrantsJSONRequestBody = TeamGrants
+
+// SetTeamMembersJSONRequestBody defines body for SetTeamMembers for application/json ContentType.
+type SetTeamMembersJSONRequestBody = TeamMembers

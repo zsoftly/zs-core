@@ -37,7 +37,7 @@ curl -i http://127.0.0.1:8080/healthz
 curl -i http://127.0.0.1:8080/readyz
 ```
 
-Every `/v1` route needs a Keycloak access token from the realm of an applied brand, sent as `Authorization: Bearer <token>`:
+Every `/v1` route needs a Keycloak access token from the realm of an applied brand, sent as `Authorization: Bearer <token>`. Tenant routes also take a tenant API key, `Bearer zs_<brand slug>_...`:
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/me -H "Authorization: Bearer $TOKEN"
@@ -60,7 +60,13 @@ bin/zs-core grant add --brand zs-reference --subject <keycloak user id> --scope 
 bin/zs-core grant revoke --brand zs-reference --subject <keycloak user id> --scope operator \
   --reason '<why>' --operator <you>
 bin/zs-core grant list --brand zs-reference
+bin/zs-core tenant suspend --brand zs-reference --tenant tnt_... --reason '<why>' --operator <you>
+bin/zs-core tenant reactivate --brand zs-reference --tenant tnt_... --reason '<why>' --operator <you>
+bin/zs-core tenant close --brand zs-reference --tenant tnt_... --reason '<why>' --operator <you>
+bin/zs-core tenant sweep        # complete interrupted tenant creations and correct Organizations once
 ```
+
+The `tenant` commands need the Keycloak and Kill Bill admin settings and the brand's secret references. See [modules/tenants.md](modules/tenants.md).
 
 `brand diff` and `brand apply` print the diff as JSON. They need the database with migrations applied and the Keycloak and Kill Bill admin settings. `grant add` and `grant revoke` read the realm issuer from Keycloak discovery unless you pass `--issuer`. They refuse an issuer of another realm. `brand apply` reads the manifest's secrets from `BRAND_<SLUG>__` variables, such as `BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET`. See [modules/brands.md](modules/brands.md).
 
@@ -86,6 +92,8 @@ Unit tests sit next to the code and need nothing but Go.
 
 Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. Tests in different packages therefore run in parallel against one server without seeing each other's rows.
 
+The tenant and API key integration tests in `pkg/tenant`, `pkg/apikey` and `internal/httpapi` need Postgres only. `internal/enginetest` serves the Keycloak Organizations and Kill Bill account endpoints Core uses from memory, over HTTP, so the real clients run against it. It makes either engine answer 503 on demand. It also inserts applied brands and identities and signs access tokens for them with a test key. The endpoints it serves are the ones the stack tests check against the real servers.
+
 The harness in `internal/postgrestest` chooses the server like this:
 
 1. If `ZS_TEST_POSTGRES_URL` is set, it uses that server. The URL must point at a loopback host, because the tests create and drop schemas there.
@@ -103,7 +111,30 @@ ZS_TEST_POSTGRES_URL='postgres://zs:zs-test@127.0.0.1:55432/zs_core_test?sslmode
 
 ### Tests against the reference stack
 
-`internal/stacktest` holds the tests that need a running Keycloak and Kill Bill. They apply `brands/zs-reference.yaml` twice and expect an empty second diff. They change the login theme and the MFA policy and expect exactly those two fields in the diff and in audit. They use real tokens from the password grant against `GET /v1/me` and the staff routes. Over HTTP they check that a sensitive change without recent MFA is refused, that another brand's secrets and files are out of reach, and that changing only a payment plugin's `config_ref` is gated. They apply a second brand, `zs-second`, and check that it cannot act in `zs-reference`. They set `zs-second` to `mfa: required` and check in Keycloak that every identity provider runs the `zs-post-broker-mfa` flow, then set it back. The tests skip unless `ZS_TEST_KEYCLOAK_URL` is set. They change the stack. Run them only on a build host stack after `make stack-up` and `make stack-bootstrap`. Run `make stack-reset` afterwards.
+`internal/stacktest` holds the tests that need a running Keycloak and Kill Bill. They apply `brands/zs-reference.yaml` twice and expect an empty second diff. They change the login theme and the MFA policy and expect exactly those two fields in the diff and in audit. They use real tokens from the password grant against `GET /v1/me` and the staff routes. Over HTTP they check that a sensitive change without recent MFA is refused, that another brand's secrets and files are out of reach, and that changing only a payment plugin's `config_ref` is gated. They apply a second brand, `zs-second`, and check that it cannot act in `zs-reference`. They set `zs-second` to `mfa: required` and check in Keycloak that every identity provider runs the `zs-post-broker-mfa` flow, then set it back.
+
+The tenant stack tests cover the Phase 3 gates with a real Keycloak and Kill Bill:
+
+- `TestTenantsOnTheStack` runs these checks:
+  - A tenant created while Kill Bill is unreachable gets 503, no tenant row and an Organization that carries the tenant ID.
+  - The sweeper then completes the same tenant, and the Kill Bill account's external key is the tenant ID.
+  - Creation is idempotent.
+  - Each brand's Kill Bill accounts live in its own Kill Bill tenant.
+  - A `zs-second` token reads, creates and accepts nothing in `zs-reference`.
+  - An invitation fails for another email and succeeds for the same email in another case.
+  - A member's live token and API key work, and the key shrinks when the member is demoted.
+  - Both fail on the next request once the member is removed, and after the sweeper runs the Organization no longer lists the member.
+  - Invited back, the member gets a new membership and the old key stays `401 api_key_invalid`.
+  - Unreachable signing keys give 503.
+  - An activation grant of `zs-second` acts in `zs-second` only.
+  - Suspension adds the Kill Bill blocking state and disables the Organization, reads continue and writes stop.
+  - Reactivation lifts both, and closure closes the Kill Bill account. A closed tenant cannot be reactivated: `tenant_closed`.
+- `TestRequiredForStaffBindsBrokeredStaffLoginsOnTheStack` sets `zs-second` to `mfa: required_for_staff` with an extra identity provider. It creates a second realm that plays the provider and signs in through it as a browser would. The staff client is asked for a one-time password, the customer client gets an authorization code, and with `optional` the staff client gets a code too.
+- `TestStaffClientRefusesSSOWithoutSecondFactorOnTheStack` sets `zs-second` to `mfa: required_for_staff`. It signs in to the customer client with a password only, as a browser would, then asks the staff client for a code in the same browser. Keycloak asks for the password and a one-time password instead of reusing the session. Core answers `403 mfa_required` to a staff token without a second factor. With `mfa: required`, a password login reaches the one-time password after the password form.
+
+Keycloak 26.8.1 puts no `auth_time` and no `amr` in password grant tokens, so those tokens never pass a recent authentication or recent MFA check. The stack tests run the steps that need one, member changes, API key creation and invitation acceptance, through the library as the identities the real tokens recorded.
+
+The tests skip unless `ZS_TEST_KEYCLOAK_URL` is set. They change the stack. Run them only on a build host stack after `make stack-up` and `make stack-bootstrap`. Run `make stack-reset` afterwards.
 
 | Variable | Value on the reference stack |
 | --- | --- |

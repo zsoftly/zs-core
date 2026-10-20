@@ -30,13 +30,18 @@ ZSoftly Core reads its configuration from environment variables only, there is n
 | `ZS_KILLBILL_ADMIN_PASSWORD` | text | none | no | Password of that administrator. Never logged. |
 | `ZS_KAUI_URL` | `http(s)://host[:port]` | none | no | Base URL of KAUI. When unset, `doctor` skips the KAUI check. |
 | `ZS_BRANDS_DIR` | directory | none | no | Directory of brand manifests, `<slug>.yaml`. `serve` validates every manifest at start, secret references included, and refuses to start on an invalid one. It logs any manifest that differs from what was last applied. Apply stays an explicit step. File references in `POST /v1/brands/{id}/apply` of brand `<slug>` must start with `<slug>/` and resolve inside `ZS_BRANDS_DIR/<slug>/`. See [modules/brands.md](modules/brands.md). |
+| `ZS_TENANT_SWEEP_INTERVAL` | Go duration | `1m` | no | How often `serve` completes interrupted tenant creations and corrects Keycloak Organizations towards Core. The sweeper runs only when the Keycloak and Kill Bill admin settings are present. See [modules/tenants.md](modules/tenants.md#the-sweeper). |
 | `ZS_SECRETS_DIR` | absolute directory | none | no | Directory of file secrets for brand manifests, one subdirectory per brand slug. A `file://` reference of brand `<slug>` must resolve inside `ZS_SECRETS_DIR/<slug>/`. When unset, every `file://` reference is refused. See [modules/brands.md](modules/brands.md#secrets). |
 
 Booleans accept exactly `true` or `false`. Durations use Go syntax, such as `500ms`, `30s` or `2m`, and must be positive.
 
 ## Component settings
 
-`serve` needs `ZS_KEYCLOAK_URL`. It reads the issuer and signing keys of every applied brand's realm from that URL. Core never fetches keys from a URL a token names. Without the Keycloak and Kill Bill admin settings, `serve` still verifies tokens, and `POST /v1/brands/{id}/apply` answers `503 not_ready`.
+`serve` needs `ZS_KEYCLOAK_URL`. It reads the issuer and signing keys of every applied brand's realm from that URL. Core never fetches keys from a URL a token names. Without the Keycloak and Kill Bill admin settings, `serve` still verifies tokens and serves existing tenants.
+
+`POST /v1/brands/{id}/apply`, `POST /v1/tenants` and `POST /v1/tenants/personal` then answer `503 not_ready`, and the tenant sweeper does not run.
+
+Tenant creation reads each brand's Kill Bill tenant secret from the brand's secret reference. So `serve` needs the `BRAND_<SLUG>__` variables or `ZS_SECRETS_DIR` files of every brand that creates tenants.
 
 `zs-core brand apply` and `brand diff` need three settings: `ZS_KEYCLOAK_URL`, Keycloak admin credentials (a user and password, or a client ID and secret), and `ZS_KILLBILL_URL` with the Kill Bill admin user and password. `migrate` ignores the component settings. `zs-core doctor` uses them to check that a running stack matches `components.yaml`, and needs `ZS_DATABASE_URL` for the database check. Each URL must be `http://` or `https://` with a host. A URL with a user name or password is a configuration error. Put credentials in the `*_ADMIN_USER` and `*_ADMIN_PASSWORD` settings. An admin user without its password, a client ID without its secret, or the reverse, is a configuration error.
 

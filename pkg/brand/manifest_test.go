@@ -170,7 +170,7 @@ func TestAuditDetailsNeverCarryRedactedValues(t *testing.T) {
 }
 
 func TestCurrentMFA(t *testing.T) {
-	ids := map[string]string{FlowMFA: "mfa-id", FlowOptional: "opt-id"}
+	ids := map[string]string{FlowMFA: "mfa-id", FlowOptional: "opt-id", FlowStaffMFA: "staff-id"}
 	staff := func(override string) map[string]any {
 		return map[string]any{"authenticationFlowBindingOverrides": map[string]any{"browser": override}}
 	}
@@ -178,8 +178,14 @@ func TestCurrentMFA(t *testing.T) {
 		browser, override, want string
 	}{
 		{FlowOptional, "", MFAOptional},
-		{FlowMFA, "", MFARequired},
-		{FlowOptional, "mfa-id", MFARequiredForStaff},
+		{FlowMFA, "staff-id", MFARequired},
+		{FlowOptional, "staff-id", MFARequiredForStaff},
+		// The staff client bound to a flow whose Cookie step can satisfy a
+		// login alone does not implement required or required_for_staff,
+		// so apply converges it to FlowStaffMFA.
+		{FlowMFA, "", `unmanaged (browser flow "zs-browser-mfa")`},
+		{FlowMFA, "mfa-id", `unmanaged (browser flow "zs-browser-mfa", staff override)`},
+		{FlowOptional, "mfa-id", `unmanaged (browser flow "zs-browser", staff override)`},
 		{"browser", "", `unmanaged (browser flow "browser")`},
 	}
 	for _, c := range cases {

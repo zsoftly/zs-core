@@ -343,6 +343,20 @@ func TestRequireRecentMFA(t *testing.T) {
 	}
 }
 
+func TestRequireStaffMFA(t *testing.T) {
+	strict := BrandConfig{StaffMFARequired: true}
+	if err := RequireStaffMFA(Principal{Brand: strict}); code(err) != "mfa_required" {
+		t.Fatalf("strict brand without a second factor: %v", err)
+	}
+	// Evidence of a second factor is enough, whatever its age.
+	if err := RequireStaffMFA(Principal{Brand: strict, MFA: true, AuthTime: testNow.Add(-10 * time.Hour)}); err != nil {
+		t.Fatalf("strict brand with a second factor: %v", err)
+	}
+	if err := RequireStaffMFA(Principal{Brand: BrandConfig{}}); err != nil {
+		t.Fatalf("optional brand: %v", err)
+	}
+}
+
 func TestPrincipalContext(t *testing.T) {
 	if _, err := PrincipalFromContext(context.Background()); code(err) != "unauthenticated" {
 		t.Fatalf("empty context: %v", err)
@@ -382,5 +396,27 @@ func TestRecentMFAReadsAuthTimeAsTheSecondFactorTime(t *testing.T) {
 	p, err = v.Verify(context.Background(), token(t, func(_, c map[string]any) { c["amr"], c["acr"] = []string{"pwd"}, "gold" }))
 	if err != nil || !p.MFA {
 		t.Fatalf("pwd with step-up acr: mfa=%v err=%v", p.MFA, err)
+	}
+}
+
+func TestRequireRecentAuth(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	cases := map[string]struct {
+		authTime time.Time
+		ok       bool
+	}{
+		"just now":          {now.Add(-time.Minute), true},
+		"no auth_time":      {time.Time{}, false},
+		"too old":           {now.Add(-16 * time.Minute), false},
+		"far in the future": {now.Add(5 * time.Minute), false},
+	}
+	for name, c := range cases {
+		err := RequireRecentAuth(Principal{AuthTime: c.authTime}, 0, now)
+		if (err == nil) != c.ok {
+			t.Errorf("%s: %v", name, err)
+		}
+		if err != nil && !zserrors.IsCode(err, zserrors.CodeRecentAuthRequired) {
+			t.Errorf("%s: code %v", name, err)
+		}
 	}
 }

@@ -330,3 +330,26 @@ func TestDeferredEventWaitsWithoutBlockingTheNext(t *testing.T) {
 		t.Fatalf("second pass = %d, %v, %v", count, err, delivered)
 	}
 }
+
+// A reader with event types claims only those types and leaves the others
+// due for another reader.
+func TestReaderWithEventTypesClaimsOnlyThoseTypes(t *testing.T) {
+	db := postgrestest.New(t)
+	ctx := context.Background()
+	mine, other := newEvent(t, "tenant.mirror"), newEvent(t, "test.other")
+	writeEvents(t, db, other, mine)
+	claim, err := outbox.NewPostgresReader(db.Pool).WithEventTypes("tenant.mirror").Claim(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claim.Events) != 1 || claim.Events[0].ID != mine.ID {
+		t.Fatalf("filtered claim = %+v", claim.Events)
+	}
+	claim, err = outbox.NewPostgresReader(db.Pool).Claim(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claim.Events) != 1 || claim.Events[0].ID != other.ID {
+		t.Fatalf("unfiltered claim after the filtered one = %+v", claim.Events)
+	}
+}

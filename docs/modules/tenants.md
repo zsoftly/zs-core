@@ -1,0 +1,178 @@
+# Tenants
+
+## TL;DR
+
+A tenant is a personal or organization account inside one brand. The contract is in [identity-and-tenants.md](identity-and-tenants.md). This page explains how Core implements it. Each tenant has a Keycloak Organization and a Kill Bill account, both carrying the Core tenant ID. Core writes the tenant row only after both exist. If an engine fails, Core writes nothing, audits the failure and returns a retryable 503. A sweeper in `serve` finishes such creations later. A person acts in a tenant only through an active membership. Permissions are the union of the role's permissions and the member's team grants. Nobody grants a permission they do not hold. Every write checks the caller again under the tenant row lock. A removed membership stays removed, with its API keys revoked. Closing is final. The code is `pkg/tenant`.
+
+## Kinds, roles and statuses
+
+| Kind | Members | Created by |
+| --- | --- | --- |
+| `personal` | Its creator only. It takes no invitations: `409 tenant_kind_unsupported`. | `POST /v1/tenants/personal`, one per identity and brand. |
+| `organization` | Anyone invited and accepted. | `POST /v1/tenants` with an `idempotency_key`. |
+
+| Role | Implies |
+| --- | --- |
+| `owner` | Every registered permission. |
+| `admin` | Every registered permission except `billing:*` and `tenant:transfer`. |
+| `billing_admin` | `billing:*` only. |
+| `member` | Nothing. A member has what its teams grant. |
+
+A tenant is `active`, `suspended` or `closed`. A membership is `active`, `suspended` or `removed`. Only an active membership in an active tenant writes. A suspended tenant keeps its reads. Closed is terminal.
+
+A tenant name is 1 to 100 characters. Kill Bill stores the account name, which is the tenant name, in a varchar(100), and refuses a longer one. A longer name is `400 validation_failed` before Core calls an engine.
+
+A removed membership is never reactivated. It stays in `memberships` as history. When the person accepts a new invitation, Core inserts a new membership with a new `mem_` ID. An identity has at most one membership in a tenant that is not removed.
+
+## Permissions
+
+The registered permissions of a brand are the built-ins plus the `permissions` list of its manifest, as last applied. The built-ins are listed in the contract. A permission is a `resource:action` string. A grant of anything else is `400 permission_unknown`.
+
+Core computes effective permissions on every request:
+
+1. Take what the role implies, out of the registered permissions.
+2. Add every permission granted to a team the member belongs to.
+3. Keep only the registered permissions. A permission the brand stops registering stops working.
+4. A membership that is not active has none.
+
+Every tenant has three system teams: `owners`, `admins` and `members`. They are created with the tenant and locked. Core keeps their members in step with the roles, in the same transaction as each role change. An owner is in `owners` and `members`, an admin in `admins` and `members`, and everyone else in `members`. A removed member leaves every team. The `members` team starts with `tenant:read`, `member:read` and `team:read`, so every member can see the tenant, its members and its teams. The `owners` and `admins` teams carry no grants of their own. Locked means Core manages the team's name and members. Renaming or deleting a locked team, or changing its members, returns `409 team_locked`. Its grants still change.
+
+Examples, for a brand that registers `vm:create` and `billing:refund`:
+
+- An owner holds all 17 permissions.
+- An admin holds 13 of them: no `billing:read`, `billing:manage`, `billing:refund` or `tenant:transfer`.
+- A billing admin holds `billing:read`, `billing:manage` and `billing:refund`, plus `tenant:read`, `member:read` and `team:read` from the `members` team.
+- A member in a team that grants `vm:create` holds `vm:create`, `tenant:read`, `member:read` and `team:read`.
+
+Nobody gives out more than they hold:
+
+- Changing a member's role, suspending or removing them needs every permission both the current and the new role imply. An admin has no authority over an owner and cannot create a billing admin. Only an owner can make another owner.
+- An invitation needs every permission its role implies. The role is never `owner`.
+- Changing a team, its name, members or grants, needs `team:manage` and every permission the team grants before and after the change. An admin cannot add billing to a team, and cannot manage a team an owner gave billing to.
+- An API key holds a subset of its creator's permissions. See [api-keys.md](api-keys.md).
+
+Scope resolution builds the caller before the handler's transaction starts. A concurrent change can make that caller stale. So every write locks the tenant row first, then reads the caller's membership, role and effective permissions again in the same transaction, and runs every check on what it read. For an API key it also reads the key, which must still be unrevoked and unexpired. Every change to a membership, a team or a grant takes the same lock, so the caller cannot change until the write commits. A caller that is no longer active gets `404 tenant_not_found`. A caller that lost the permission gets `403 permission_denied`.
+
+Example: owners A and B. A demotes B while B promotes member M to owner. If A's change commits first, B's change then reads B as an admin. An admin has no authority over an owner role, so M stays a member. Two owners who demote each other at the same time leave one owner the same way.
+
+## Owners
+
+The last active owner cannot be removed, suspended or demoted: `409 last_owner`. Each such change locks the tenant row first, so two concurrent changes cannot both pass the check. Ownership moves with `POST /v1/tenants/{id}/ownership/transfer`. The caller must be an active owner with `tenant:transfer` and multi-factor authentication within the last 15 minutes. The target must be an active admin. The target becomes an owner and the caller an admin, in one transaction.
+
+Member changes, removal, transfer and API key creation need multi-factor authentication within the last 15 minutes: `403 recent_mfa_required`. Core reads it from `amr` and `auth_time` as described in [brands.md](brands.md#token-verification). An API key never has it.
+
+## What a removal or a suspension takes with it
+
+Removing a member does three more things in the same transaction:
+
+- It revokes every API key the member created, with `revoked_reason` `creator_removed`. Each key is audited as `tenant.api_key.revoked`.
+- It revokes every pending invitation the member sent, audited as `tenant.invitation.revoked` with reason `inviter_removed`.
+- It takes the member out of every team.
+
+Suspending a member revokes its API keys with `creator_suspended`, and its pending invitations with `inviter_suspended`. Reactivating the member brings neither back. A role change revokes the pending invitations the member can no longer send, with `inviter_demoted`. So does an ownership transfer for the old owner.
+
+## Engine mapping
+
+| Core | Keycloak | Kill Bill |
+| --- | --- | --- |
+| Tenant | An Organization in the brand realm. Its alias and its `zs_tenant_id` attribute hold the tenant ID, and `zs_brand_id` holds the brand ID. Its name is the tenant name. Keycloak requires unique names, so a second tenant with the same name gets `<name> (<tenant ID>)`. | An account in the brand's Kill Bill tenant. Its external key is the tenant ID. It takes the tenant name, the billing country and the brand's default currency, the first of `billing.currencies`. |
+| Active membership | A member of the Organization. | Nothing. |
+| Suspension | The Organization is disabled. | A blocking state `ZS_TENANT_SUSPENDED` of service `zs-core-tenant` blocks changes, entitlement and billing. Reactivation adds `ZS_TENANT_ACTIVE`, which blocks nothing. |
+| Closure | The Organization is disabled and loses its members. | The account is closed: subscriptions cancelled, unpaid invoices written off, future notifications removed. |
+
+The tenant slug comes from the name plus the last 8 characters of the tenant ID. Users never set it.
+
+Brand apply enables Organizations in each realm, `identity.organizations_enabled`. Keycloak answers 404 to every Organizations endpoint until it is on. Keycloak groups and realm roles never create a Core membership. Core never reads Organization membership to authorize anything.
+
+## Creating a tenant
+
+Creation runs in steps, because one database transaction cannot cover both engines:
+
+1. Core records the creation in `tenant_provisioning` with a new tenant ID and claims it for two minutes.
+2. It finds the Keycloak Organization by its `zs_tenant_id` attribute, or creates it, and records its ID. It adds the creator as a member.
+3. It finds the Kill Bill account by its external key, or creates it, and records its ID.
+4. In one transaction it inserts the tenant, the system teams and the owner membership, audits `tenant.created`, and marks the creation completed.
+
+Step 3 sends the tenant name as the account name. Kill Bill refuses names over 100 characters, so Core checks that limit first.
+
+When step 2 or 3 fails, no tenant row exists. Core releases the claim, schedules the next attempt, audits `tenant.created` with outcome `failure` and the stage, and answers `503 identity_provider_unavailable` or `503 billing_unavailable`. Each later attempt reuses the upstream objects already recorded, so an engine never gets a second Organization or account for one tenant.
+
+`tenant_provisioning` is also the idempotency record of `POST /v1/tenants`. The key is scoped to the brand and the creator. The same key and payload return the same tenant, also after the sweeper completed it. A different payload is `409 idempotency_key_conflict`. While a request or the sweeper holds the creation, a retry gets `409 idempotency_key_in_progress`. Completed records are kept. A personal tenant uses the same record without a key, unique per identity.
+
+`POST /v1/tenants/personal` never answers `409 idempotency_key_in_progress`. When another request holds the creation, it looks again every 100 milliseconds for up to 5 seconds. It returns the tenant once it exists, or takes over the creation once the claim is released. After 5 seconds it answers a retryable `503 not_ready`. The personal tenant takes the caller's display name, cut to 100 characters on a character boundary, or `Personal`.
+
+## The sweeper
+
+`serve` runs the sweeper every `ZS_TENANT_SWEEP_INTERVAL`, one minute by default, when the Keycloak and Kill Bill admin settings are present. `zs-core tenant sweep` runs one pass by hand. One pass runs at a time across every Core instance, through a database advisory lock. A pass does two things:
+
+- It claims due creations and runs the steps above again. A failed attempt waits 10 seconds, then twice as long each time, up to an hour.
+- It reads every tenant of every applied brand and corrects its Organization towards Core. The name follows the tenant. The Organization is enabled only while the tenant is active. Its members become exactly the identities with an active membership, or none once the tenant is closed.
+
+Each correction is audited as a system action: `tenant.keycloak.organization.updated`, `tenant.keycloak.member.added` and `tenant.keycloak.member.removed`.
+
+## The Organization mirror
+
+The sweeper corrects Organizations once a minute. Changes reach Keycloak sooner through the mirror. Each HTTP write that changes a tenant's name or its members writes a `tenant.mirror` event to the outbox, in the same transaction as the change. That covers tenant updates, member changes, removals and acceptances. No goroutine starts per write.
+
+`serve` runs 4 mirror relays next to the sweeper, when the engines are configured. Each claims up to 10 `tenant.mirror` events at a time and handles them one by one, so at most 4 Organization updates are in flight per Core instance. Each runs `SyncOrganization`, with the same corrections and audit actions as the sweeper. The relays claim only `tenant.mirror` events. A failed update is retried with the outbox backoff and quarantined after 10 attempts. The sweeper corrects whatever the mirror misses. Without the engines, no event is written.
+
+## Invitations
+
+An owner or admin with `member:invite` invites an email address with a non-owner role. The clear token is 32 random bytes in base64url. It is in the creation response only. Core stores its SHA-256 digest and compares digests in constant time. An invitation stays valid for 7 days.
+
+`POST /v1/invitations/accept` needs three things. A customer token of the same brand. A verified email equal to the invited address, compared without case. An authentication within the last 15 minutes, read from `auth_time`. A different address is `403 invitation_email_mismatch`. An old authentication is `403 recent_auth_required`. An expired, revoked, accepted or unknown invitation, or one of another brand, is `404 invitation_not_found`. So is one of a tenant that is no longer active. A database failure while Core locks the tenant is a retryable `503 database_unavailable`, never `404`.
+
+An invitation is only as good as its inviter's authority when it is accepted. Under the tenant lock, Core reads the inviter's membership. It must be active, hold `member:invite`, and hold every permission the invited role implies. Otherwise Core revokes the invitation, audits `tenant.invitation.refused_stale_inviter` and answers `404 invitation_not_found`. The route commits that record before it answers. A library caller gets the error wrapped in `tenant.RefusalRecorded` and commits its transaction to keep it.
+
+Two acceptances of one invitation at the same time add one membership. The second finds the invitation accepted and gets `404 invitation_not_found`.
+
+A removed member who accepts a new invitation gets a new membership with a new ID and the new role. The old membership stays removed, and its API keys stay revoked.
+
+## Activation
+
+Activation is a decision staff make about a tenant: `pending`, `approved` or `rejected`. `POST /v1/staff/tenants/{id}/activation` needs a staff token with an active `activation` grant in the tenant's brand. Anyone else gets `404`. Each decision needs a reason and a `request_id` of 8 to 255 printable characters. The same request ID with the same state and reason returns the stored decision with `200`. With a different state or reason it is `409 idempotency_key_conflict`. Decisions are append-only: a trigger refuses `UPDATE`, `DELETE` and `TRUNCATE` on `tenant_activations`. The current state is copied to the tenant in the same transaction.
+
+`GET /v1/tenants/{id}/activation` returns the state and the latest 50 decisions to a member with `tenant:read`. Core records activation and takes no action on it. Products decide what an unapproved tenant is allowed to do.
+
+## Suspension and closure
+
+No HTTP route suspends, reactivates or closes a tenant in v1. An operator runs:
+
+```bash
+zs-core tenant suspend --brand zs-reference --tenant tnt_... --reason '<why>' --operator <you>
+zs-core tenant reactivate --brand zs-reference --tenant tnt_... --reason '<why>' --operator <you>
+zs-core tenant close --brand zs-reference --tenant tnt_... --reason '<why>' --operator <you>
+```
+
+Each command changes Kill Bill first, then the Keycloak Organization, then Core, and audits `tenant.suspended`, `tenant.reactivated` or `tenant.closed`. When an engine fails, nothing changes in Core and the command can run again. Library callers use `tenant.Suspend`, `tenant.Reactivate` and `tenant.Close`.
+
+Closing is terminal. It revokes every API key of the tenant with `tenant_closed`, in the same transaction. Each command on a closed tenant answers `409 tenant_closed`. Core checks again under the tenant lock before it writes. A reactivation that called the engines while a close committed is refused there with `tenant_closed`, the tenant stays closed, and Core disables the Organization again. If that last call fails, the sweeper disables it.
+
+## Scope resolution
+
+Every `/v1/tenants/{id}/...` route passes through the same step before its handler. The tenant must belong to the caller's brand, and must not be closed. A write needs it active. A customer token needs an active membership of its identity. A staff or service token has none. An API key must belong to the tenant. Anything else is `404 tenant_not_found`, so a tenant's existence is never confirmed to an outsider. A database failure in this step is `503 authentication_unavailable`. The handler then calls `scope.Require(ctx, "resource:action")`, and a missing permission is `403 permission_denied`.
+
+## Audit actions
+
+| Action | When |
+| --- | --- |
+| `tenant.created` | A tenant was created, or a creation attempt failed (outcome `failure`). |
+| `tenant.updated` | Name or billing country changed. |
+| `tenant.member.added`, `tenant.member.updated`, `tenant.member.removed` | Membership changes. |
+| `tenant.ownership.transferred` | An ownership transfer. |
+| `tenant.team.created`, `tenant.team.renamed`, `tenant.team.deleted`, `tenant.team.members.set`, `tenant.team.grants.set` | Team changes. |
+| `tenant.invitation.created`, `tenant.invitation.revoked` | Invitations. Acceptance is `tenant.member.added`. A revocation Core makes itself carries the reason `inviter_removed`, `inviter_suspended` or `inviter_demoted`. |
+| `tenant.invitation.refused_stale_inviter` | An acceptance refused because the inviter lost the authority. The invitation is revoked. |
+| `tenant.activation.decided` | An activation decision, with its reason. |
+| `tenant.suspended`, `tenant.reactivated`, `tenant.closed` | Status changes, with their reason. |
+| `tenant.api_key.created`, `tenant.api_key.revoked` | API keys. A revocation Core makes itself carries the reason `creator_removed`, `creator_suspended` or `tenant_closed`. See [api-keys.md](api-keys.md). |
+| `tenant.keycloak.organization.updated`, `tenant.keycloak.member.added`, `tenant.keycloak.member.removed` | Sweeper and mirror corrections. |
+
+Members with `audit:read` read them with `GET /v1/tenants/{id}/audit/events`. Staff with `operator` read them with `GET /v1/audit/events?tenant_id=...`. See [audit.md](audit.md).
+
+## Known limits
+
+- The sweeper reads every tenant on each pass and calls Keycloak twice per tenant. That suits the v1 scale. A change feed is later work.
+- A creation that keeps failing retries every hour, with no limit. Its last error is in `tenant_provisioning.last_error` and in the audit trail.
+- Closing a tenant does not delete its Keycloak Organization or its Kill Bill account. Core never deletes upstream objects.
+- Keycloak 26.8.1 puts no `auth_time` and no `amr` in password grant tokens. Such a token never passes the recent authentication or recent MFA checks.

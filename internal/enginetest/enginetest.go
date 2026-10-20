@@ -1,9 +1,13 @@
-// Package enginetest is test support for the tenant engines. It serves the
-// Keycloak Organizations and Kill Bill account endpoints Core uses from
-// memory, over HTTP, so the real clients run against it. It also inserts
-// applied brands and identities and signs access tokens for them. It is used
-// by integration tests only; the endpoints it serves are the ones verified
-// against Keycloak 26.8.1 and Kill Bill 0.24.22 on the reference stack.
+// Package enginetest is test support for the engines. It serves the
+// Keycloak Organizations endpoints and the Kill Bill endpoints Core uses
+// (accounts, catalogue, subscriptions, invoices, credits, external charges,
+// payments, refunds, payment methods with the external payment plugin's
+// semantics, overdue and blocking states, push notification callbacks and
+// KPM node commands) from memory, over HTTP, so the real clients run against
+// it. It also inserts applied brands and identities and signs access tokens
+// for them. The endpoints and the behaviours it reproduces are the ones
+// verified against Keycloak 26.8.1 and Kill Bill 0.24.22 on the reference
+// stack.
 package enginetest
 
 import (
@@ -72,6 +76,12 @@ type Fake struct {
 	server        *httptest.Server
 	// rejectedAccounts counts account creations refused for a column limit.
 	rejectedAccounts int
+	// billing is the billing state of each Kill Bill tenant, by API key.
+	billing map[string]*kbTenant
+	// nodes are the Kill Bill nodes and their plugins.
+	nodes []killbill.NodeInfo
+	// requests records the audit headers of every Kill Bill write.
+	requests []KillBillWrite
 }
 
 // RejectedAccounts returns how many account creations the fake refused
@@ -86,7 +96,9 @@ func (f *Fake) RejectedAccounts() int {
 func New(t testing.TB) *Fake {
 	t.Helper()
 	f := &Fake{orgs: map[string]*organization{}, accounts: map[string]map[string]*Account{},
-		tenantSecrets: map[string]string{}, env: map[string]string{}}
+		tenantSecrets: map[string]string{}, env: map[string]string{}, billing: map[string]*kbTenant{},
+		nodes: []killbill.NodeInfo{{NodeName: "fake-node-1", KBVersion: "0.24.22", PluginsInfo: []killbill.PluginInfo{
+			{PluginName: "org.kill-bill.billing.killbill-platform-osgi-bundles-kpm", State: "RUNNING"}}}}}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.server.Close)
 	return f
@@ -305,6 +317,14 @@ func (f *Fake) serveOrganization(w http.ResponseWriter, r *http.Request, o *orga
 }
 
 func (f *Fake) serveKillBill(w http.ResponseWriter, r *http.Request, path string, body []byte) {
+	if r.Method != http.MethodGet {
+		f.requests = append(f.requests, KillBillWrite{Method: r.Method, Path: path, APIKey: r.Header.Get(killbill.HeaderAPIKey),
+			CreatedBy: r.Header.Get(killbill.HeaderCreatedBy), Reason: r.Header.Get(killbill.HeaderReason), Comment: r.Header.Get(killbill.HeaderComment)})
+	}
+	if path == "/1.0/kb/nodesInfo" {
+		f.serveNodes(w, r, body)
+		return
+	}
 	apiKey := r.Header.Get(killbill.HeaderAPIKey)
 	if secret, ok := f.tenantSecrets[apiKey]; !ok || secret != r.Header.Get(killbill.HeaderAPISecret) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -322,6 +342,9 @@ func (f *Fake) serveKillBill(w http.ResponseWriter, r *http.Request, path string
 			}
 		}
 		return nil
+	}
+	if f.serveBilling(w, r, apiKey, path, body) {
+		return
 	}
 	rest, _ := strings.CutPrefix(path, "/1.0/kb/accounts")
 	switch {
@@ -410,12 +433,25 @@ func (f *Fake) InsertBrand(t testing.TB, pool *pgxpool.Pool, slug string, permis
 VALUES ($1, $2, $2, $2, $2, $3, $4, $5, now())`, b.ID, slug, ref, manifest, m.Digest()); err != nil {
 		t.Fatal(err)
 	}
+	f.AddKillBillTenant(slug, "kb-secret-"+slug)
 	f.mu.Lock()
-	f.tenantSecrets[slug] = "kb-secret-" + slug
 	f.env[strings.TrimPrefix(ref, "env://")] = "kb-secret-" + slug
-	f.accounts[slug] = map[string]*Account{}
 	f.mu.Unlock()
 	return b
+}
+
+// AddKillBillTenant adds a Kill Bill tenant with its secret and the default
+// test catalogue, for tests that use the fake without a database.
+func (f *Fake) AddKillBillTenant(apiKey, secret string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tenantSecrets[apiKey] = secret
+	if f.accounts[apiKey] == nil {
+		f.accounts[apiKey] = map[string]*Account{}
+	}
+	if f.billing[apiKey] == nil {
+		f.billing[apiKey] = newKBTenant()
+	}
 }
 
 // Person is a customer of a brand: a Keycloak user, its recorded identity and

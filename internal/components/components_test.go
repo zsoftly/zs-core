@@ -152,3 +152,32 @@ func TestPinnedReference(t *testing.T) {
 		}
 	}
 }
+
+// A plugin with an artifact needs the SHA-256 of its jar, and the pinned
+// plugins of this release carry one.
+func TestPluginArtifactsNeedSha256(t *testing.T) {
+	head := "core_release: 1\ncomponents:\n"
+	for _, name := range []string{Keycloak, KillBill, KAUI, Postgres} {
+		head += "  " + name + ":\n    version: \"1\"\n    image: x/" + name + ":1\n    digest: sha256:" + strings.Repeat("a", 64) + "\n"
+	}
+	plugin := func(extra string) string {
+		return head + "killbill_plugins:\n  repository: https://repo.example.test\n  approved_payment_plugins:\n    - name: stripe\n      version: 8.0.3\n      artifact: g:stripe-plugin\n" + extra
+	}
+	if _, err := Parse([]byte(plugin("      sha256: " + strings.Repeat("c", 64) + "\n"))); err != nil {
+		t.Fatalf("valid sha256 rejected: %v", err)
+	}
+	for name, extra := range map[string]string{"missing": "", "malformed": "      sha256: ABC\n", "prefixed": "      sha256: sha256:" + strings.Repeat("c", 64) + "\n"} {
+		if _, err := Parse([]byte(plugin(extra))); err == nil || !strings.Contains(err.Error(), "stripe.sha256") {
+			t.Errorf("%s sha256: %v", name, err)
+		}
+	}
+	m, err := Load("../../components.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range append(m.KillBillPlugins.ApprovedPaymentPlugins, m.KillBillPlugins.Installable...) {
+		if p.Artifact != "" && len(p.Sha256) != 64 {
+			t.Errorf("%s has no sha256", p.Name)
+		}
+	}
+}

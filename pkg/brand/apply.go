@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/zsoftly/zs-core/internal/components"
 	"github.com/zsoftly/zs-core/internal/keycloak"
 	"github.com/zsoftly/zs-core/internal/killbill"
 	"github.com/zsoftly/zs-core/internal/secrets"
@@ -44,6 +46,20 @@ type Deps struct {
 	// in Files. The HTTP route sets it to the brand slug and Files to
 	// ZS_BRANDS_DIR/<slug>, so one brand cannot read another brand's files.
 	FilesPrefix string
+	// PaymentPlugins are the approved payment plugins of components.yaml.
+	// A manifest that names a payment plugin is refused without them.
+	PaymentPlugins []components.Plugin
+	// PluginRepository is the Maven repository KPM downloads plugins from,
+	// killbill_plugins.repository of components.yaml. It must be https.
+	PluginRepository string
+	// PluginHTTP downloads a plugin jar so its SHA-256 is checked against
+	// components.yaml before KPM installs it. Nil means a default client.
+	PluginHTTP *http.Client
+	// WebhookBaseURL is where Kill Bill reaches Core, and WebhookSecret the
+	// deployment's ZS_KILLBILL_WEBHOOK_SECRET. With both set, apply
+	// registers the brand's push notification callback.
+	WebhookBaseURL string
+	WebhookSecret  []byte
 }
 
 // Options describe who applies and why.
@@ -287,7 +303,7 @@ func makePlan(ctx context.Context, deps Deps, m *Manifest, opts Options) (*plan,
 		return nil, mapUpstream(err)
 	}
 	p.diff.Changes = append(p.diff.Changes, kc...)
-	kb, err := planKillBill(ctx, deps.KillBill, p, m, resolved, files)
+	kb, err := planKillBill(ctx, deps, p, m, resolved, files)
 	if err != nil {
 		return nil, mapUpstream(err)
 	}
@@ -351,7 +367,7 @@ func (p *plan) checkGates(opts Options) error {
 // configuration reference in the manifest, or adds or removes it.
 func paymentPluginChanged(prev, m *Manifest, changes []Change) bool {
 	for _, ch := range changes {
-		if ch.Target == TargetPluginConfig {
+		if ch.Target == TargetPluginConfig || ch.Target == TargetPlugin {
 			return true
 		}
 	}
@@ -366,7 +382,8 @@ func paymentPluginChanged(prev, m *Manifest, changes []Change) bool {
 	case before == nil || next == nil:
 		return true
 	}
-	return before.Name != next.Name || before.ConfigKey != next.ConfigKey || before.ConfigRef != next.ConfigRef
+	return before.Name != next.Name || before.Version != next.Version || before.Mode != next.Mode ||
+		before.ConfigKey != next.ConfigKey || before.ConfigRef != next.ConfigRef
 }
 
 // sensitiveFields lists the fields of the apply that decide how people
@@ -376,7 +393,7 @@ func sensitiveFields(prev, m *Manifest, changes []Change) []string {
 	set := map[string]bool{}
 	for _, ch := range changes {
 		switch ch.Target {
-		case TargetMFAPolicy, TargetFlow, TargetClient, TargetClientScope, TargetIdentityProvider, TargetPluginConfig:
+		case TargetMFAPolicy, TargetFlow, TargetClient, TargetClientScope, TargetIdentityProvider, TargetPluginConfig, TargetPlugin:
 			for _, f := range ch.Fields {
 				set[f.Field] = true
 			}
@@ -628,18 +645,20 @@ func inTx(ctx context.Context, db DB, fn func(pgx.Tx) error) error {
 }
 
 var auditActions = map[string]string{
-	TargetBrand:            "brand",
-	TargetRealm:            "brand.keycloak.realm",
-	TargetFlow:             "brand.keycloak.flow",
-	TargetRequiredAction:   "brand.keycloak.required_action",
-	TargetClient:           "brand.keycloak.client",
-	TargetClientScope:      "brand.keycloak.client_scope",
-	TargetIdentityProvider: "brand.keycloak.identity_provider",
-	TargetMFAPolicy:        "brand.keycloak.mfa_policy",
-	TargetKillBillTenant:   "brand.killbill.tenant",
-	TargetCatalogue:        "brand.killbill.catalogue",
-	TargetOverdue:          "brand.killbill.overdue",
-	TargetPluginConfig:     "brand.killbill.plugin_config",
+	TargetBrand:                "brand",
+	TargetRealm:                "brand.keycloak.realm",
+	TargetFlow:                 "brand.keycloak.flow",
+	TargetRequiredAction:       "brand.keycloak.required_action",
+	TargetClient:               "brand.keycloak.client",
+	TargetClientScope:          "brand.keycloak.client_scope",
+	TargetIdentityProvider:     "brand.keycloak.identity_provider",
+	TargetMFAPolicy:            "brand.keycloak.mfa_policy",
+	TargetKillBillTenant:       "brand.killbill.tenant",
+	TargetCatalogue:            "brand.killbill.catalogue",
+	TargetOverdue:              "brand.killbill.overdue",
+	TargetPluginConfig:         "brand.killbill.plugin_config",
+	TargetPlugin:               "brand.killbill.plugin",
+	TargetNotificationCallback: "brand.killbill.notification_callback",
 }
 
 func actionFor(ch Change) string {

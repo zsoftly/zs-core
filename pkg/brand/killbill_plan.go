@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/zsoftly/zs-core/internal/components"
 	"github.com/zsoftly/zs-core/internal/killbill"
 )
 
@@ -26,9 +27,25 @@ func fileDigest(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func planKillBill(ctx context.Context, kb *killbill.Client, p *plan, m *Manifest, sec resolved, fs files) ([]Change, error) {
+func planKillBill(ctx context.Context, deps Deps, p *plan, m *Manifest, sec resolved, fs files) ([]Change, error) {
+	kb := deps.KillBill
 	creds := killbill.TenantCredentials{APIKey: m.Billing.KillBillTenantKey, APISecret: sec[m.Billing.KillBillAPISecretRef]}
 	var changes []Change
+
+	// The payment plugin is checked before anything else is read, so a
+	// plugin that cannot be used in test mode stops the apply with no side
+	// effects.
+	var pin *components.Plugin
+	if pp := m.Billing.PaymentPlugin; pp != nil {
+		approved, err := approvedPlugin(deps.PaymentPlugins, pp)
+		if err != nil {
+			return nil, err
+		}
+		if err := CheckTestMode(pp.Name, sec[pp.ConfigRef]); err != nil {
+			return nil, err
+		}
+		pin = &approved
+	}
 
 	tenant, err := kb.TenantByAPIKey(ctx, creds.APIKey)
 	exists := true
@@ -117,6 +134,14 @@ func planKillBill(ctx context.Context, kb *killbill.Client, p *plan, m *Manifest
 		})
 	}
 
+	if pin != nil {
+		install, err := planPlugin(ctx, deps, m, *pin)
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, install...)
+	}
+
 	if pp := m.Billing.PaymentPlugin; pp != nil {
 		want := sec[pp.ConfigRef]
 		var have string
@@ -142,5 +167,9 @@ func planKillBill(ctx context.Context, kb *killbill.Client, p *plan, m *Manifest
 			})
 		}
 	}
-	return changes, nil
+	callback, err := planCallback(ctx, deps, creds, p.brandID, exists)
+	if err != nil {
+		return nil, err
+	}
+	return append(changes, callback...), nil
 }

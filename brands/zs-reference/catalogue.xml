@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<!-- The reference catalogue as applied by brands/zs-reference.yaml. It equals
-     deploy/compose/killbill/catalogue.xml with a later effective date, because
-     Kill Bill rejects a second version with the effective date the compose
-     bootstrap already uploaded. -->
+<!-- The reference catalogue as applied by brands/zs-reference.yaml. It is
+     deploy/compose/killbill/catalogue.xml with a second product, core-basic,
+     whose plan core-basic-monthly has a 14-day trial and no usage. Its
+     effective date is later, because Kill Bill rejects a second version with
+     the effective date the compose bootstrap already uploaded. -->
 <catalog xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:noNamespaceSchemaLocation="CatalogSchema.xsd">
 
-    <effectiveDate>2026-10-01T00:00:00+00:00</effectiveDate>
+    <effectiveDate>2026-10-15T00:00:00+00:00</effectiveDate>
     <catalogName>ZsReference</catalogName>
 
     <recurringBillingMode>IN_ADVANCE</recurringBillingMode>
@@ -22,6 +23,9 @@
 
     <products>
         <product name="core-test">
+            <category>BASE</category>
+        </product>
+        <product name="core-basic">
             <category>BASE</category>
         </product>
     </products>
@@ -127,12 +131,54 @@
                 </usages>
             </finalPhase>
         </plan>
+        <plan name="core-basic-monthly">
+            <product>core-basic</product>
+            <initialPhases>
+                <phase type="TRIAL">
+                    <duration>
+                        <unit>DAYS</unit>
+                        <number>14</number>
+                    </duration>
+                    <fixed type="ONE_TIME">
+                        <fixedPrice>
+                            <price>
+                                <currency>CAD</currency>
+                                <value>0.00</value>
+                            </price>
+                            <price>
+                                <currency>USD</currency>
+                                <value>0.00</value>
+                            </price>
+                        </fixedPrice>
+                    </fixed>
+                </phase>
+            </initialPhases>
+            <finalPhase type="EVERGREEN">
+                <duration>
+                    <unit>UNLIMITED</unit>
+                </duration>
+                <recurring>
+                    <billingPeriod>MONTHLY</billingPeriod>
+                    <recurringPrice>
+                        <price>
+                            <currency>CAD</currency>
+                            <value>5.00</value>
+                        </price>
+                        <price>
+                            <currency>USD</currency>
+                            <value>4.00</value>
+                        </price>
+                    </recurringPrice>
+                </recurring>
+            </finalPhase>
+        </plan>
     </plans>
 
     <priceLists>
         <defaultPriceList name="DEFAULT">
             <plans>
                 <plan>core-test-monthly</plan>
+                <plan>core-basic-monthly</plan>
             </plans>
         </defaultPriceList>
     </priceLists>

@@ -1,10 +1,13 @@
 // Package killbill is a small client for the Kill Bill 0.24 REST API.
 //
-// It covers what brand apply and tenants need: tenant lookup and creation
-// with the admin credentials, and, with a tenant's API key and secret,
-// per-tenant plugin configuration, user key-values, catalogue upload, overdue
-// upload, and accounts: creation, lookup by external key, blocking states and
-// closure. Every endpoint was checked against Kill Bill 0.24.22.
+// It covers what brand apply, tenants and billing need: tenant lookup and
+// creation, node information and KPM node commands with the admin
+// credentials, and, with a tenant's API key and secret, per-tenant plugin
+// configuration, user key-values, catalogue upload and read, overdue upload,
+// push notification callbacks, accounts (creation, lookup, balance, blocking
+// states, overdue state and closure), subscriptions, invoices, credits,
+// external charges, payments, refunds and payment methods. Every endpoint
+// was checked against Kill Bill 0.24.22.
 //
 // Every write carries the X-Killbill-CreatedBy, X-Killbill-Reason and
 // X-Killbill-Comment headers from a CallContext, so Kill Bill's own audit log
@@ -193,13 +196,59 @@ func (c *Client) do(ctx context.Context, r request) (upstream.Response, error) {
 		return resp, fmt.Errorf("killbill %s: %w", r.op, ErrNotFound)
 	case resp.Status == http.StatusConflict:
 		return resp, fmt.Errorf("killbill %s: %w", r.op, ErrConflict)
-	case resp.Status >= 500 || upstream.Temporary(resp.Status):
+	case resp.Status >= 500 || upstream.Temporary(resp.Status) || resp.Status == http.StatusRequestTimeout:
 		// A server error says nothing about the request; it is reported as
-		// unavailability, never as a rejection of the manifest.
+		// unavailability, never as a rejection of the manifest. Kill Bill
+		// answers 408 when a call that waits for completion runs out of
+		// time, after it accepted the change.
 		return resp, &Unavailable{Op: r.op, Status: resp.Status, Err: fmt.Errorf("HTTP %d", resp.Status)}
 	default:
 		return resp, &Error{Op: r.op, Status: resp.Status, Code: errorCode(resp.Body)}
 	}
+}
+
+// getJSON reads path with the tenant credentials and decodes the JSON
+// answer into out.
+func (c *Client) getJSON(ctx context.Context, op, path string, creds TenantCredentials, out any) error {
+	resp, err := c.do(ctx, request{op: op, method: http.MethodGet, path: path, tenant: &creds})
+	if err != nil {
+		return err
+	}
+	if err := upstream.DecodeJSON(resp.Body, out); err != nil {
+		return fmt.Errorf("killbill %s: unexpected response", op)
+	}
+	return nil
+}
+
+// sendJSON sends body as JSON with the tenant credentials and the audit
+// headers, and returns the response.
+func (c *Client) sendJSON(ctx context.Context, op, method, path string, creds TenantCredentials, cc CallContext, body any) (upstream.Response, error) {
+	var data []byte
+	if body != nil {
+		var err error
+		if data, err = json.Marshal(body); err != nil {
+			return upstream.Response{}, err
+		}
+	}
+	r := request{op: op, method: method, path: path, tenant: &creds, call: &cc}
+	if data != nil {
+		r.contentType, r.body = "application/json", data
+	}
+	return c.do(ctx, r)
+}
+
+// locationID returns the last path segment of the Location header, the ID
+// of the object Kill Bill created, or "".
+func locationID(resp upstream.Response) string {
+	loc := resp.Header.Get("Location")
+	if loc == "" {
+		return ""
+	}
+	u, err := url.Parse(loc)
+	if err != nil {
+		return ""
+	}
+	return path.Base(strings.TrimRight(u.Path, "/"))
 }
 
 func errorCode(body []byte) int {

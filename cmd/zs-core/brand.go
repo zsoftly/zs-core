@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/zsoftly/zs-core/internal/components"
 	"github.com/zsoftly/zs-core/internal/config"
 	"github.com/zsoftly/zs-core/internal/database"
 	"github.com/zsoftly/zs-core/internal/secrets"
@@ -57,7 +58,8 @@ func runBrand(args, environ []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("brand "+sub, stderr)
 	operator := fs.String("operator", "", "who applies, recorded in audit")
 	reason := fs.String("reason", "", "why, recorded in audit and in Kill Bill")
-	timeout := fs.Duration("timeout", 5*time.Minute, "overall time limit")
+	timeout := fs.Duration("timeout", 15*time.Minute, "overall time limit")
+	componentsFile := fs.String("components", defaultComponentsFile, "path to components.yaml, for the approved payment plugins")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
@@ -93,6 +95,20 @@ func runBrand(args, environ []string, stdout, stderr io.Writer) int {
 	if m.Identity.SSLRequired == "none" {
 		fmt.Fprintln(stderr, "warning: identity.ssl_required is none; Keycloak accepts plain http from any address. Use it only for the loopback reference stack. POST /v1/brands/{id}/apply refuses it.")
 	}
+	var plugins []components.Plugin
+	var repository string
+	if m.Billing.PaymentPlugin != nil {
+		pins, err := components.Load(*componentsFile)
+		if err != nil {
+			fmt.Fprintln(stderr, "brand "+sub+": the manifest names a payment plugin, which needs components.yaml:", err)
+			return 2
+		}
+		if err := brand.CheckPluginRepository(pins.KillBillPlugins.Repository); err != nil {
+			fmt.Fprintln(stderr, "brand "+sub+": "+*componentsFile+":", err)
+			return 2
+		}
+		plugins, repository = pins.KillBillPlugins.ApprovedPaymentPlugins, pins.KillBillPlugins.Repository
+	}
 	root, err := os.OpenRoot(filepath.Dir(file))
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -111,7 +127,9 @@ func runBrand(args, environ []string, stdout, stderr io.Writer) int {
 	}
 	defer pool.Close()
 
-	deps := brand.Deps{DB: pool, Keycloak: kc, KillBill: kb, Secrets: secrets.Default{LookupEnv: envLookup(environ), Dir: cfg.SecretsDir}, Files: root.FS()}
+	deps := brand.Deps{DB: pool, Keycloak: kc, KillBill: kb, Secrets: secrets.Default{LookupEnv: envLookup(environ), Dir: cfg.SecretsDir}, Files: root.FS(),
+		WebhookBaseURL: cfg.KillBillCallbackURL, WebhookSecret: []byte(cfg.KillBillWebhookSecret)}
+	deps.PaymentPlugins, deps.PluginRepository = plugins, repository
 	opts := brand.Options{Actor: operatorActor(*operator), Reason: *reason, CreatedBy: "zs-core-cli:" + *operator}
 	var diff brand.Diff
 	if sub == "apply" {

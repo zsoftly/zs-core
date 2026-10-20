@@ -189,3 +189,37 @@ func TestGrantRevokeUsage(t *testing.T) {
 		t.Fatalf("revoke without a reason: %d %q", code, errOut.String())
 	}
 }
+
+// brand apply refuses a plugin repository that is not https before it
+// opens the database or calls an engine.
+func TestBrandRefusesPluginRepositoryWithoutHTTPS(t *testing.T) {
+	dir := t.TempDir()
+	ref, err := os.ReadFile(filepath.Join("..", "..", "brands", "zs-reference.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := strings.Replace(string(ref), "  currencies: [CAD, USD]\n",
+		"  currencies: [CAD, USD]\n  payment_plugin:\n    name: stripe\n    mode: test\n    config_ref: env://BRAND_ZS_REFERENCE__STRIPE\n", 1)
+	if manifest == string(ref) {
+		t.Fatal("the reference manifest has no currencies line to extend")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "zs-reference.yaml"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pins := testComponents + `killbill_plugins:
+  repository: http://repo1.maven.org/maven2
+  approved_payment_plugins:
+    - {name: stripe, version: 8.0.3, artifact: "org.kill-bill.billing.plugin.java:stripe-plugin", sha256: "` + strings.Repeat("a", 64) + `"}
+`
+	componentsPath := filepath.Join(dir, "components.yaml")
+	if err := os.WriteFile(componentsPath, []byte(pins), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"ZS_DATABASE_URL=postgres://u:pw@127.0.0.1:1/x", "ZS_KEYCLOAK_URL=http://127.0.0.1:1", "ZS_KEYCLOAK_ADMIN_USER=a",
+		"ZS_KEYCLOAK_ADMIN_PASSWORD=b", "ZS_KILLBILL_URL=http://127.0.0.1:1", "ZS_KILLBILL_ADMIN_USER=a", "ZS_KILLBILL_ADMIN_PASSWORD=b"}
+	var out, errOut bytes.Buffer
+	code := run([]string{"brand", "diff", "--components", componentsPath, filepath.Join(dir, "zs-reference.yaml")}, env, &out, &errOut)
+	if code != 2 || !strings.Contains(errOut.String(), "not an https URL") {
+		t.Fatalf("http repository: exit %d %q", code, errOut.String())
+	}
+}

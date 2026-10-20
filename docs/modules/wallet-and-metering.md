@@ -14,12 +14,12 @@ Credit and usage quantities are `int64` micro-units. Money is `int64` minor unit
 
 ## Wallet view
 
-`GET /v1/tenants/{id}/wallet` returns, per currency: `killbill_credit_minor` (the account's credit balance from Kill Bill), `reserved_minor` (sum of Core reservations in `held`), `available_minor` (the difference, floored at the brand's overdraft allowance), `overdue_state` (from Kill Bill), and `low_balance` (available below the brand or tenant threshold). Credits are granted only through Kill Bill. Each credit source works as follows:
+`GET /v1/tenants/{id}/wallet` returns, per currency: `killbill_credit_minor` (the account's credit balance from Kill Bill), `reserved_minor` (sum of Core reservations in `held`), `available_minor` (the difference, floored at the brand's overdraft allowance), `overdue_state` (from Kill Bill), and `low_balance` (available below the brand or tenant threshold). Credits are granted only through Kill Bill. Promo code redemption and staff credits shipped in Phase 4a as `POST /v1/tenants/{id}/credits/redeem` and `POST /v1/staff/tenants/{id}/credits`. See [billing.md](billing.md). The wallet view reads the credits those routes write. Each credit source works as follows:
 
-- Promo codes: a promo or voucher code (`credit_codes` table in Core: brand, code digest, amount, currency, caps, expiry, reason) resolves to one Kill Bill credit with the code as the reason.
-- Staff grants: a staff grant writes a Kill Bill credit with a reason.
+- Promo codes: shipped in Phase 4a, see [billing.md](billing.md). A promo or voucher code (`credit_codes` table in Core: brand, code digest, first four characters, amount, currency, cap, per-tenant limit, expiry, credit validity, reason, status) resolves to one Kill Bill credit with the code as the reason.
+- Staff grants: shipped in Phase 4a, see [billing.md](billing.md). A staff grant writes a Kill Bill credit with a reason.
 - Purchases: a purchase arrives as a Kill Bill payment against a credit invoice through the brand's payment plugin.
-- Expiry: a sweeper writes the negative Kill Bill credit for the unused remainder of Core-issued credits.
+- Expiry: Kill Bill refuses zero and negative credits (code 4009), so a sweeper writes an external charge against the account for the unused remainder of Core-issued credits.
 
 ## Reservations
 
@@ -27,7 +27,7 @@ Table `reservations`: `id` (`rsv_`), `brand_id`, `tenant_id`, `currency`, `exter
 
 - `Reserve(ctx, tx, scope, {ExternalRef, Attempt, Label, AmountMinor, LeaseDuration})` locks the tenant (advisory lock), reads `available_minor` (Kill Bill balance cached with a short TTL and refreshed on a miss, minus held reservations in the same transaction), and refuses with `insufficient_credit` and the shortfall when the request exceeds it, or `wallet_on_hold` when the tenant is suspended or the Kill Bill account is blocked.
 - Reserve replay: a replay with the same ref and attempt returns the hold when the amount is equal or smaller, and grows it when larger. It never shrinks.
-- `Settle(ctx, tx, scope, ExternalRef, Attempt, {Usage: {subscription, unit, quantity_micro, event_id} | CreditMinor})` writes the result to Kill Bill first (a usage record on the subscription, or a negative credit when the brand bills prepaid credit directly), stores the Kill Bill reference, marks the hold `settled`, releases the remainder.
+- `Settle(ctx, tx, scope, ExternalRef, Attempt, {Usage: {subscription, unit, quantity_micro, event_id} | CreditMinor})` writes the result to Kill Bill first (a usage record on the subscription, or an external charge when the brand bills prepaid credit directly, because Kill Bill refuses zero and negative credits with code 4009), stores the Kill Bill reference, marks the hold `settled`, releases the remainder.
 - Settle with Kill Bill down: if Kill Bill is unreachable the settlement is queued in the outbox and the hold stays `held` with `settlement_pending: true`. The relay completes it, and the hold cannot be reserved against again.
 - `Release` returns the hold. `Extend` renews the lease. A sweeper expires holds past their lease and emits `reservation.expired`.
 - Library entry points take `pgx.Tx` so a scheduler reserves inside its own transaction (decision 0001). Over HTTP the same calls are idempotent on `external_ref` and `attempt`.
@@ -54,8 +54,6 @@ Table `quotas`: per brand, `feature`, `plan` (catalogue plan name or `*`), `limi
 | Method and path | Permission |
 | --- | --- |
 | `GET /v1/tenants/{id}/wallet` | `billing:read` |
-| `POST /v1/tenants/{id}/wallet/redeem` `{code}` | `billing:manage` |
-| `POST /v1/staff/tenants/{id}/wallet/credits` | staff `billing` |
 | `GET, POST /v1/tenants/{id}/reservations`; `POST .../reservations/{ref}/settle`, `.../release`, `.../extend` | `wallet:reserve` |
 | `POST /v1/tenants/{id}/usage`, `/usage/batch`; `GET /v1/tenants/{id}/usage/events`, `/usage/summary`, `/usage/billed` | `usage:write`, `usage:read` |
 | `GET /v1/tenants/{id}/entitlements/{feature}`; `POST .../entitlements/{feature}/consume`, `.../release` | `tenant:read`; `quota:consume` |

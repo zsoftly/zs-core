@@ -11,6 +11,8 @@
 //	zs-core grant list     list the staff grants of a brand
 //	zs-core tenant suspend|reactivate|close  change a tenant's status in Core and the engines
 //	zs-core tenant sweep   run one pass of the tenant sweeper
+//	zs-core credit-code add|list|disable  manage the promo and voucher codes of a brand
+//	zs-core credit sweep   run one pass of the credit expiry sweeper
 //
 // Configuration comes from the environment only; see docs/configuration.md.
 package main
@@ -48,6 +50,7 @@ Commands:
   brand apply <file>  converge Keycloak and Kill Bill to the manifest and record the brand
                    --operator <name>      who applies, recorded in audit (required)
                    --reason <text>        why, recorded in audit and in Kill Bill
+                   --components <file>    approved payment plugins (default components.yaml)
   brand diff <file>   print what brand apply would change; changes nothing
   grant add      give a staff principal a scope in one brand
                    --brand <slug> --subject <sub> --scope operator|activation|billing|support
@@ -60,6 +63,15 @@ Commands:
   tenant suspend|reactivate|close  change a tenant's status in Core, Kill Bill and Keycloak
                    --brand <slug> --tenant <tnt_...> --reason <text> --operator <name>
   tenant sweep   complete interrupted tenant creations and correct Keycloak Organizations once
+  credit-code add      add a promo or voucher code to a brand; only its digest is stored
+                   --brand <slug> --code <code> --amount-minor <n> --currency <ISO 4217>
+                   --reason <text> --operator <name> [--max-redemptions <n>] [--per-tenant-limit <n>]
+                   [--expires-at <RFC 3339>] [--credit-valid-days <n>]
+  credit-code list     list the codes of a brand
+                   --brand <slug>
+  credit-code disable  disable a code; credits already redeemed stay
+                   --brand <slug> --id <ccd_...> --reason <text> --operator <name>
+  credit sweep   expire the credits Core issued that are past their expiry, once
 
 Configuration is read from ZS_* environment variables; see docs/configuration.md.
 `
@@ -90,6 +102,10 @@ func run(args, environ []string, stdout, stderr io.Writer) int {
 		return runGrant(args[1:], environ, stdout, stderr)
 	case "tenant":
 		return runTenant(args[1:], environ, stdout, stderr)
+	case "credit-code":
+		return runCreditCode(args[1:], environ, stdout, stderr)
+	case "credit":
+		return runCreditSweep(args[1:], environ, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -162,6 +178,7 @@ func serve(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		return err
 	}
 	startTenantSweeper(ctx, pool, api.Tenants, cfg.TenantSweepInterval, log)
+	startCreditSweeper(ctx, api.Billing, cfg.CreditSweepInterval, log)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,

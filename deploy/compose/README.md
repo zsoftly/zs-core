@@ -107,7 +107,9 @@ KAUI 4.0.31 has an upstream fault. On two cold starts, while the healthcheck pro
 
 ### Core
 
-`Dockerfile` at the repository root is a two-stage build: a Go build stage and a small Alpine runtime that runs `zs-core` as user 10001. The image also carries `components.yaml`, which `zs-core doctor` reads. Core applies its own migrations at start and waits for Postgres to be healthy.
+`Dockerfile` at the repository root is a two-stage build: a Go build stage and a small runtime image that runs `zs-core` as user 10001. The image also carries `components.yaml`, which `zs-core doctor` and brand apply read. Core applies its own migrations at start and waits for Postgres to be healthy.
+
+`.env` supplies `ZS_KILLBILL_WEBHOOK_SECRET`. The compose file sets `ZS_KILLBILL_CALLBACK_URL=http://core:8080`. A brand apply in the `core` container registers callbacks Kill Bill reaches on the compose network. A brand apply whose manifest names a payment plugin also installs and starts that plugin through KPM. See [../../docs/modules/billing.md](../../docs/modules/billing.md).
 
 ## Kill Bill bootstrap and plugins
 

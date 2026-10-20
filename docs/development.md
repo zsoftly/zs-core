@@ -64,7 +64,14 @@ bin/zs-core tenant suspend --brand zs-reference --tenant tnt_... --reason '<why>
 bin/zs-core tenant reactivate --brand zs-reference --tenant tnt_... --reason '<why>' --operator <you>
 bin/zs-core tenant close --brand zs-reference --tenant tnt_... --reason '<why>' --operator <you>
 bin/zs-core tenant sweep        # complete interrupted tenant creations and correct Organizations once
+bin/zs-core credit-code add --brand zs-reference --code WELCOME10 --amount-minor 1000 --currency CAD \
+  --reason '<why>' --operator <you>
+bin/zs-core credit-code list --brand zs-reference
+bin/zs-core credit-code disable --brand zs-reference --id ccd_... --reason '<why>' --operator <you>
+bin/zs-core credit sweep        # reverse the unused part of expired credits once
 ```
+
+`credit-code` needs the database only. `credit sweep` also needs the Kill Bill admin settings and the brands' secret references. See [modules/billing.md](modules/billing.md).
 
 The `tenant` commands need the Keycloak and Kill Bill admin settings and the brand's secret references. See [modules/tenants.md](modules/tenants.md).
 
@@ -92,7 +99,18 @@ Unit tests sit next to the code and need nothing but Go.
 
 Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. Tests in different packages therefore run in parallel against one server without seeing each other's rows.
 
-The tenant and API key integration tests in `pkg/tenant`, `pkg/apikey` and `internal/httpapi` need Postgres only. `internal/enginetest` serves the Keycloak Organizations and Kill Bill account endpoints Core uses from memory, over HTTP, so the real clients run against it. It makes either engine answer 503 on demand. It also inserts applied brands and identities and signs access tokens for them with a test key. The endpoints it serves are the ones the stack tests check against the real servers.
+The tenant, API key and billing integration tests in `pkg/tenant`, `pkg/apikey`, `pkg/billing`, `pkg/brand` and `internal/httpapi` need Postgres only. `internal/enginetest` serves the Keycloak Organizations endpoints and the Kill Bill endpoints Core uses from memory, over HTTP, so the real clients run against it. The Kill Bill endpoints are:
+
+- accounts and catalogue
+- subscriptions and invoices
+- credits and external charges
+- payments and refunds
+- payment methods, with the external payment plugin's rules
+- overdue and blocking states
+- push notification callbacks
+- KPM node commands
+
+It records the audit headers of every Kill Bill write. It makes either engine answer 503 on demand. It also inserts applied brands and identities and signs access tokens for them with a test key. The endpoints it serves are the ones the stack tests check against the real servers.
 
 The harness in `internal/postgrestest` chooses the server like this:
 
@@ -132,6 +150,37 @@ The tenant stack tests cover the Phase 3 gates with a real Keycloak and Kill Bil
 - `TestRequiredForStaffBindsBrokeredStaffLoginsOnTheStack` sets `zs-second` to `mfa: required_for_staff` with an extra identity provider. It creates a second realm that plays the provider and signs in through it as a browser would. The staff client is asked for a one-time password, the customer client gets an authorization code, and with `optional` the staff client gets a code too.
 - `TestStaffClientRefusesSSOWithoutSecondFactorOnTheStack` sets `zs-second` to `mfa: required_for_staff`. It signs in to the customer client with a password only, as a browser would, then asks the staff client for a code in the same browser. Keycloak asks for the password and a one-time password instead of reusing the session. Core answers `403 mfa_required` to a staff token without a second factor. With `mfa: required`, a password login reaches the one-time password after the password form.
 
+`TestBillingOnTheStack` covers the Phase 4a gates with a real Kill Bill. It applies `zs-reference` with the built-in `__EXTERNAL_PAYMENT__` plugin and `zs-second` with the Stripe plugin 8.0.3 and a dummy `sk_test_` key:
+
+- A live Stripe key, `mode: live` and `paypal-express` are refused before anything changes. So are a Stripe configuration without a key, texts with a `\u` escape or a bare carriage return, an Adyen `LIVE` environment in a Stripe configuration, and the `config_key` of another plugin.
+- Stripe 8.0.3 is installed through KPM after Core checks the jar's SHA-256, reaches `RUNNING` on every node and is recorded in `killbill_plugin_installs`. A second apply is empty.
+- Two tenants are created through Core. The catalogue summary shows the usage-free plan `core-basic-monthly` with its trial.
+- A subscription with a trial on that plan produces an invoice. Replaying its key returns it. The entitlement follows the plan. A plan change at the end of the term is accepted.
+- A code is redeemed once per tenant and up to its cap. The credit shows on the Kill Bill account and in the billing summary.
+- A staff credit with an expiry is partly used, and the sweeper reverses exactly the unused part in Kill Bill.
+- A payment method is added on the external payment plugin, a hosted page is asked for, a payment taken outside Core is refunded by staff, and the refund replays. A refund past what is left is refused with `refund_exceeds_payment`.
+- The subscription, plan change, payment method and refund are each audited with the tenant's Kill Bill account ID.
+- Suspension puts billing on hold and reactivation lifts it.
+- The credentials proxy reads the tenant's own account and refuses another tenant's account, by ID and by external key.
+- With `ZS_TEST_CALLBACK_ADDR` set, Kill Bill's push notifications reach Core and become `billing.subscription.changed`, `billing.invoice.created` and `billing.payment.succeeded` events.
+
+Kill Bill reaches the test only from inside its own network. If your build host's firewall drops traffic from containers to the host, run this test in Kill Bill's network namespace, after the full suite:
+
+```bash
+set -a; . deploy/compose/.env; set +a
+docker run --rm --network container:zs-core-killbill-1 -v "$PWD":/src -w /src \
+  -e ZS_TEST_POSTGRES_FORWARD=127.0.0.1:55432=postgres:5432 \
+  -e ZS_TEST_POSTGRES_URL="postgres://postgres:$POSTGRES_PASSWORD@127.0.0.1:55432/zs_core_test?sslmode=disable" \
+  -e ZS_TEST_KEYCLOAK_URL=http://keycloak:8080 -e ZS_TEST_KEYCLOAK_ADMIN_USER="$KEYCLOAK_ADMIN_USER" \
+  -e ZS_TEST_KEYCLOAK_ADMIN_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD" -e ZS_TEST_KILLBILL_URL=http://127.0.0.1:8080 \
+  -e ZS_TEST_KILLBILL_ADMIN_PASSWORD="$KILLBILL_ADMIN_PASSWORD" -e ZS_TEST_CALLBACK_ADDR=127.0.0.1:18080 \
+  -e BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET="$ZS_STAFF_CLIENT_SECRET" \
+  -e BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET="$KILLBILL_TENANT_API_SECRET" \
+  golang:1.26 go test -tags integration -count=1 -run TestBillingOnTheStack ./internal/stacktest/
+```
+
+`ZS_TEST_POSTGRES_FORWARD` makes the test forward a loopback port to the stack's Postgres, because the Postgres harness accepts loopback servers only. The test reads realm issuers from Keycloak discovery, so it accepts Keycloak at `http://keycloak:8080`. Only this test does: run the others on the host network.
+
 Keycloak 26.8.1 puts no `auth_time` and no `amr` in password grant tokens, so those tokens never pass a recent authentication or recent MFA check. The stack tests run the steps that need one, member changes, API key creation and invitation acceptance, through the library as the identities the real tokens recorded.
 
 The tests skip unless `ZS_TEST_KEYCLOAK_URL` is set. They change the stack. Run them only on a build host stack after `make stack-up` and `make stack-bootstrap`. Run `make stack-reset` afterwards.
@@ -144,6 +193,8 @@ The tests skip unless `ZS_TEST_KEYCLOAK_URL` is set. They change the stack. Run 
 | `ZS_TEST_KILLBILL_ADMIN_PASSWORD` | `KILLBILL_ADMIN_PASSWORD` |
 | `BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET` | `ZS_STAFF_CLIENT_SECRET` |
 | `BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET` | `KILLBILL_TENANT_API_SECRET` |
+| `ZS_TEST_CALLBACK_ADDR` | Optional. An address Kill Bill reaches, such as `127.0.0.1:18080` inside Kill Bill's network namespace. The billing test serves Core there. |
+| `ZS_TEST_POSTGRES_FORWARD` | Optional. `<loopback addr>=<host:port>`, a forward the stack tests open to the stack's Postgres. |
 
 ```bash
 set -a; . deploy/compose/.env; set +a

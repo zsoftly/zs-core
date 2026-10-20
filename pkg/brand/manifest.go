@@ -152,19 +152,39 @@ type Seller struct {
 }
 
 // PaymentPlugin names the brand's payment plugin and its configuration.
+// Mode is test, the only mode v1 accepts.
 type PaymentPlugin struct {
 	Name      string `json:"name"`
 	Version   string `json:"version,omitempty"`
+	Mode      string `json:"mode"`
 	ConfigKey string `json:"config_key,omitempty"`
 	ConfigRef string `json:"config_ref"`
 }
 
-// Key is the plugin service name its per-tenant configuration is stored
-// under.
-func (p PaymentPlugin) Key() string {
-	if p.ConfigKey != "" {
-		return p.ConfigKey
+// Payment plugin modes. v1 refuses live: no payment plugin may take real
+// money.
+const (
+	PaymentModeTest = "test"
+	PaymentModeLive = "live"
+)
+
+// ExternalPaymentPlugin is Kill Bill's built-in payment plugin. It records
+// payments made outside Kill Bill and is what a brand without a payment
+// plugin uses.
+const ExternalPaymentPlugin = "__EXTERNAL_PAYMENT__"
+
+// PaymentPluginName is the Kill Bill plugin name of the brand's payment
+// methods: the payment plugin's service name, or ExternalPaymentPlugin.
+func (b Billing) PaymentPluginName() string {
+	if b.PaymentPlugin == nil {
+		return ExternalPaymentPlugin
 	}
+	return b.PaymentPlugin.Key()
+}
+
+// Key is the plugin service name its per-tenant configuration is stored
+// under: killbill-<name>. Validate refuses any other config_key.
+func (p PaymentPlugin) Key() string {
 	return "killbill-" + p.Name
 }
 
@@ -424,6 +444,15 @@ func (m *Manifest) Validate() error {
 		if file != "" && !filepath.IsLocal(filepath.FromSlash(file)) {
 			fail("%s: must be a relative path inside the manifest directory", path)
 		}
+	}
+	if pp := m.Billing.PaymentPlugin; pp != nil && pp.Mode != PaymentModeTest {
+		fail("/billing/payment_plugin/mode: must be test, because v1 refuses live and no payment plugin may take real money")
+	}
+	// Kill Bill hands a plugin the configuration stored under its own
+	// service name. Another key would upload a configuration that another
+	// plugin reads, past that plugin's test-mode rule.
+	if pp := m.Billing.PaymentPlugin; pp != nil && pp.ConfigKey != "" && pp.ConfigKey != "killbill-"+pp.Name {
+		fail("/billing/payment_plugin/config_key: must be empty or killbill-%s, the service name of the plugin", pp.Name)
 	}
 	if id.Realm == "master" || !realmName.MatchString(id.Realm) {
 		fail("/identity/realm: must match %s and must not be master", realmName)

@@ -10,19 +10,23 @@ import (
 )
 
 // Account is a Kill Bill account. Core creates one per tenant with the tenant
-// ID as the external key.
+// ID as the external key. AccountBalance and AccountCBA are set only by
+// AccountWithBalance: the balance owed, negative when the account holds
+// credit, and the account credit, both in the account currency.
 type Account struct {
-	AccountID   string `json:"accountId,omitempty"`
-	ExternalKey string `json:"externalKey"`
-	Name        string `json:"name"`
-	Currency    string `json:"currency"`
-	Country     string `json:"country,omitempty"`
+	AccountID      string      `json:"accountId,omitempty"`
+	ExternalKey    string      `json:"externalKey"`
+	Name           string      `json:"name"`
+	Currency       string      `json:"currency"`
+	Country        string      `json:"country,omitempty"`
+	AccountBalance json.Number `json:"accountBalance,omitempty"`
+	AccountCBA     json.Number `json:"accountCBA,omitempty"`
 }
 
 // CreateAccount creates an account and returns its ID. An external key that
 // is already used in the tenant returns ErrConflict.
 func (c *Client) CreateAccount(ctx context.Context, creds TenantCredentials, cc CallContext, a Account) (string, error) {
-	a.AccountID = ""
+	a.AccountID, a.AccountBalance, a.AccountCBA = "", "", ""
 	body, err := json.Marshal(a)
 	if err != nil {
 		return "", err
@@ -59,7 +63,22 @@ func (c *Client) AccountByExternalKey(ctx context.Context, creds TenantCredentia
 	return a, nil
 }
 
+// AccountWithBalance returns the account with its balance and its account
+// credit. An unknown account is ErrNotFound.
+func (c *Client) AccountWithBalance(ctx context.Context, creds TenantCredentials, accountID string) (Account, error) {
+	q := url.Values{"accountWithBalanceAndCBA": {"true"}}
+	var a Account
+	if err := c.getJSON(ctx, "get account", "/1.0/kb/accounts/"+url.PathEscape(accountID)+"?"+q.Encode(), creds, &a); err != nil {
+		return Account{}, err
+	}
+	if a.AccountID == "" {
+		return Account{}, fmt.Errorf("killbill get account: unexpected response")
+	}
+	return a, nil
+}
+
 // BlockingState is an entitlement blocking state of an account.
+// EffectiveDate is set on the states Kill Bill returns.
 type BlockingState struct {
 	StateName          string `json:"stateName"`
 	Service            string `json:"service"`
@@ -67,6 +86,40 @@ type BlockingState struct {
 	IsBlockEntitlement bool   `json:"isBlockEntitlement"`
 	IsBlockBilling     bool   `json:"isBlockBilling"`
 	Type               string `json:"type"`
+	EffectiveDate      string `json:"effectiveDate,omitempty"`
+}
+
+// AccountBlockingStates returns every account-level blocking state of an
+// account, oldest first. Kill Bill keeps every state; per service, the
+// latest one is in force.
+func (c *Client) AccountBlockingStates(ctx context.Context, creds TenantCredentials, accountID string) ([]BlockingState, error) {
+	q := url.Values{"blockingStateTypes": {"ACCOUNT"}}
+	var out []BlockingState
+	if err := c.getJSON(ctx, "get blocking states", "/1.0/kb/accounts/"+url.PathEscape(accountID)+"/block?"+q.Encode(), creds, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// OverdueState is the overdue state of an account. Name is
+// __KILLBILL__CLEAR__OVERDUE_STATE__ when the account is not overdue.
+type OverdueState struct {
+	Name                                  string `json:"name"`
+	IsClearState                          bool   `json:"isClearState"`
+	IsBlockChanges                        bool   `json:"isBlockChanges"`
+	IsDisableEntitlementAndChangesBlocked bool   `json:"isDisableEntitlementAndChangesBlocked"`
+}
+
+// AccountOverdue returns the overdue state of an account.
+func (c *Client) AccountOverdue(ctx context.Context, creds TenantCredentials, accountID string) (OverdueState, error) {
+	var out OverdueState
+	if err := c.getJSON(ctx, "get overdue state", "/1.0/kb/accounts/"+url.PathEscape(accountID)+"/overdue", creds, &out); err != nil {
+		return OverdueState{}, err
+	}
+	if out.Name == "" {
+		return OverdueState{}, fmt.Errorf("killbill get overdue state: unexpected response")
+	}
+	return out, nil
 }
 
 // SetAccountBlockingState adds an account-level blocking state through the

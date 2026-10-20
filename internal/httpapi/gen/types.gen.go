@@ -184,6 +184,8 @@ func (e BrandChangeAction) Valid() bool {
 // Defines values for BrandChangeTarget.
 const (
 	BrandChangeTargetCoreBrand                    BrandChangeTarget = "core.brand"
+	BrandChangeTargetCoreMeters                   BrandChangeTarget = "core.meters"
+	BrandChangeTargetCoreQuotas                   BrandChangeTarget = "core.quotas"
 	BrandChangeTargetKeycloakAuthenticationFlow   BrandChangeTarget = "keycloak.authentication_flow"
 	BrandChangeTargetKeycloakClient               BrandChangeTarget = "keycloak.client"
 	BrandChangeTargetKeycloakClientScope          BrandChangeTarget = "keycloak.client_scope"
@@ -203,6 +205,10 @@ const (
 func (e BrandChangeTarget) Valid() bool {
 	switch e {
 	case BrandChangeTargetCoreBrand:
+		return true
+	case BrandChangeTargetCoreMeters:
+		return true
+	case BrandChangeTargetCoreQuotas:
 		return true
 	case BrandChangeTargetKeycloakAuthenticationFlow:
 		return true
@@ -260,6 +266,7 @@ const (
 	EntitlementReasonFeatureNotInPlan     EntitlementReason = "feature_not_in_plan"
 	EntitlementReasonIncludedInPlan       EntitlementReason = "included_in_plan"
 	EntitlementReasonNoActiveSubscription EntitlementReason = "no_active_subscription"
+	EntitlementReasonQuotaExceeded        EntitlementReason = "quota_exceeded"
 	EntitlementReasonTenantNotFound       EntitlementReason = "tenant_not_found"
 	EntitlementReasonWalletOnHold         EntitlementReason = "wallet_on_hold"
 )
@@ -276,6 +283,8 @@ func (e EntitlementReason) Valid() bool {
 	case EntitlementReasonIncludedInPlan:
 		return true
 	case EntitlementReasonNoActiveSubscription:
+		return true
+	case EntitlementReasonQuotaExceeded:
 		return true
 	case EntitlementReasonTenantNotFound:
 		return true
@@ -424,6 +433,144 @@ func (e MembershipStatus) Valid() bool {
 	}
 }
 
+// Defines values for MeterStatus.
+const (
+	MeterStatusActive  MeterStatus = "active"
+	MeterStatusRetired MeterStatus = "retired"
+)
+
+// Valid indicates whether the value is a known member of the MeterStatus enum.
+func (e MeterStatus) Valid() bool {
+	switch e {
+	case MeterStatusActive:
+		return true
+	case MeterStatusRetired:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for MeterUnit.
+const (
+	MeterUnitByte    MeterUnit = "byte"
+	MeterUnitCount   MeterUnit = "count"
+	MeterUnitGibHour MeterUnit = "gib_hour"
+	MeterUnitMinute  MeterUnit = "minute"
+	MeterUnitRequest MeterUnit = "request"
+	MeterUnitSecond  MeterUnit = "second"
+	MeterUnitToken   MeterUnit = "token"
+)
+
+// Valid indicates whether the value is a known member of the MeterUnit enum.
+func (e MeterUnit) Valid() bool {
+	switch e {
+	case MeterUnitByte:
+		return true
+	case MeterUnitCount:
+		return true
+	case MeterUnitGibHour:
+		return true
+	case MeterUnitMinute:
+		return true
+	case MeterUnitRequest:
+		return true
+	case MeterUnitSecond:
+		return true
+	case MeterUnitToken:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for QuotaWindow.
+const (
+	QuotaWindowConcurrent QuotaWindow = "concurrent"
+	QuotaWindowDay        QuotaWindow = "day"
+	QuotaWindowMonth      QuotaWindow = "month"
+	QuotaWindowNone       QuotaWindow = "none"
+)
+
+// Valid indicates whether the value is a known member of the QuotaWindow enum.
+func (e QuotaWindow) Valid() bool {
+	switch e {
+	case QuotaWindowConcurrent:
+		return true
+	case QuotaWindowDay:
+		return true
+	case QuotaWindowMonth:
+		return true
+	case QuotaWindowNone:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ReservationKillbillRefType.
+const (
+	ReservationKillbillRefTypeExternalCharge ReservationKillbillRefType = "external_charge"
+	ReservationKillbillRefTypeUsageRecord    ReservationKillbillRefType = "usage_record"
+)
+
+// Valid indicates whether the value is a known member of the ReservationKillbillRefType enum.
+func (e ReservationKillbillRefType) Valid() bool {
+	switch e {
+	case ReservationKillbillRefTypeExternalCharge:
+		return true
+	case ReservationKillbillRefTypeUsageRecord:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ReservationRatedBy.
+const (
+	ReservationRatedByCataloguePrice ReservationRatedBy = "catalogue_price"
+	ReservationRatedByExternalCharge ReservationRatedBy = "external_charge"
+	ReservationRatedByUnrated        ReservationRatedBy = "unrated"
+)
+
+// Valid indicates whether the value is a known member of the ReservationRatedBy enum.
+func (e ReservationRatedBy) Valid() bool {
+	switch e {
+	case ReservationRatedByCataloguePrice:
+		return true
+	case ReservationRatedByExternalCharge:
+		return true
+	case ReservationRatedByUnrated:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ReservationStatus.
+const (
+	ReservationStatusExpired  ReservationStatus = "expired"
+	ReservationStatusHeld     ReservationStatus = "held"
+	ReservationStatusReleased ReservationStatus = "released"
+	ReservationStatusSettled  ReservationStatus = "settled"
+)
+
+// Valid indicates whether the value is a known member of the ReservationStatus enum.
+func (e ReservationStatus) Valid() bool {
+	switch e {
+	case ReservationStatusExpired:
+		return true
+	case ReservationStatusHeld:
+		return true
+	case ReservationStatusReleased:
+		return true
+	case ReservationStatusSettled:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for Role.
 const (
 	RoleAdmin        Role = "admin"
@@ -520,6 +667,96 @@ func (e TenantStatus) Valid() bool {
 	case TenantStatusClosed:
 		return true
 	case TenantStatusSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for UsageRollupRejectReason.
+const (
+	UsageRollupRejectReasonBeforeSubscriptionStart UsageRollupRejectReason = "before_subscription_start"
+	UsageRollupRejectReasonSubscriptionCancelled   UsageRollupRejectReason = "subscription_cancelled"
+)
+
+// Valid indicates whether the value is a known member of the UsageRollupRejectReason enum.
+func (e UsageRollupRejectReason) Valid() bool {
+	switch e {
+	case UsageRollupRejectReasonBeforeSubscriptionStart:
+		return true
+	case UsageRollupRejectReasonSubscriptionCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for UsageRollupStatus.
+const (
+	UsageRollupStatusDiscarded UsageRollupStatus = "discarded"
+	UsageRollupStatusForwarded UsageRollupStatus = "forwarded"
+	UsageRollupStatusPending   UsageRollupStatus = "pending"
+	UsageRollupStatusRejected  UsageRollupStatus = "rejected"
+)
+
+// Valid indicates whether the value is a known member of the UsageRollupStatus enum.
+func (e UsageRollupStatus) Valid() bool {
+	switch e {
+	case UsageRollupStatusDiscarded:
+		return true
+	case UsageRollupStatusForwarded:
+		return true
+	case UsageRollupStatusPending:
+		return true
+	case UsageRollupStatusRejected:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for WalletViewHoldReasons.
+const (
+	WalletViewHoldReasonsAccountBlocked             WalletViewHoldReasons = "account_blocked"
+	WalletViewHoldReasonsOverdueBlocksChanges       WalletViewHoldReasons = "overdue_blocks_changes"
+	WalletViewHoldReasonsOverdueDisablesEntitlement WalletViewHoldReasons = "overdue_disables_entitlement"
+	WalletViewHoldReasonsTenantSuspended            WalletViewHoldReasons = "tenant_suspended"
+)
+
+// Valid indicates whether the value is a known member of the WalletViewHoldReasons enum.
+func (e WalletViewHoldReasons) Valid() bool {
+	switch e {
+	case WalletViewHoldReasonsAccountBlocked:
+		return true
+	case WalletViewHoldReasonsOverdueBlocksChanges:
+		return true
+	case WalletViewHoldReasonsOverdueDisablesEntitlement:
+		return true
+	case WalletViewHoldReasonsTenantSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for ListReservationsParamsStatus.
+const (
+	ListReservationsParamsStatusExpired  ListReservationsParamsStatus = "expired"
+	ListReservationsParamsStatusHeld     ListReservationsParamsStatus = "held"
+	ListReservationsParamsStatusReleased ListReservationsParamsStatus = "released"
+	ListReservationsParamsStatusSettled  ListReservationsParamsStatus = "settled"
+)
+
+// Valid indicates whether the value is a known member of the ListReservationsParamsStatus enum.
+func (e ListReservationsParamsStatus) Valid() bool {
+	switch e {
+	case ListReservationsParamsStatusExpired:
+		return true
+	case ListReservationsParamsStatusHeld:
+		return true
+	case ListReservationsParamsStatusReleased:
+		return true
+	case ListReservationsParamsStatusSettled:
 		return true
 	default:
 		return false
@@ -677,6 +914,27 @@ type AuditEventPage struct {
 
 // AuditOutcome defines model for AuditOutcome.
 type AuditOutcome string
+
+// BilledUnit defines model for BilledUnit.
+type BilledUnit struct {
+	QuantityMicro int64  `json:"quantity_micro"`
+	Unit          string `json:"unit"`
+}
+
+// BilledUsage defines model for BilledUsage.
+type BilledUsage struct {
+	From string `json:"from"`
+
+	// SubscriptionId The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	SubscriptionId KillBillId   `json:"subscription_id"`
+	To             string       `json:"to"`
+	Units          []BilledUnit `json:"units"`
+}
+
+// BilledUsageList defines model for BilledUsageList.
+type BilledUsageList struct {
+	Data []BilledUsage `json:"data"`
+}
 
 // BillingCountry An ISO 3166-1 alpha-2 country code in upper case.
 type BillingCountry = string
@@ -871,6 +1129,9 @@ type CreditRedeem struct {
 // Currency An ISO 4217 currency code.
 type Currency = string
 
+// Dimensions Keys the meter declares, with values of 1 to 200 characters.
+type Dimensions map[string]string
+
 // Entitlement defines model for Entitlement.
 type Entitlement struct {
 	Allowed bool   `json:"allowed"`
@@ -881,6 +1142,7 @@ type Entitlement struct {
 	Reason    EntitlementReason `json:"reason"`
 	Remaining *int64            `json:"remaining"`
 	Used      *int64            `json:"used"`
+	Window    *QuotaWindow      `json:"window,omitempty"`
 }
 
 // EntitlementReason defines model for Entitlement.Reason.
@@ -904,6 +1166,9 @@ type Error struct {
 type ErrorEnvelope struct {
 	Error Error `json:"error"`
 }
+
+// ExternalRef A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+type ExternalRef = string
 
 // HealthStatus defines model for HealthStatus.
 type HealthStatus struct {
@@ -1152,6 +1417,43 @@ type MembershipStatus string
 // MembershipId A membership ID.
 type MembershipId = string
 
+// Meter defines model for Meter.
+type Meter struct {
+	CreatedAt    time.Time   `json:"created_at"`
+	Dimensions   []string    `json:"dimensions"`
+	Id           string      `json:"id"`
+	KillbillUnit string      `json:"killbill_unit"`
+	Slug         string      `json:"slug"`
+	Status       MeterStatus `json:"status"`
+	Unit         MeterUnit   `json:"unit"`
+	UpdatedAt    time.Time   `json:"updated_at"`
+}
+
+// MeterStatus defines model for Meter.Status.
+type MeterStatus string
+
+// MeterList defines model for MeterList.
+type MeterList struct {
+	Data []Meter `json:"data"`
+}
+
+// MeterReplace defines model for MeterReplace.
+type MeterReplace struct {
+	Meters []MeterSpec `json:"meters"`
+	Reason *string     `json:"reason,omitempty"`
+}
+
+// MeterSpec defines model for MeterSpec.
+type MeterSpec struct {
+	Dimensions   *[]string `json:"dimensions,omitempty"`
+	KillbillUnit string    `json:"killbill_unit"`
+	Slug         string    `json:"slug"`
+	Unit         MeterUnit `json:"unit"`
+}
+
+// MeterUnit defines model for MeterUnit.
+type MeterUnit string
+
 // Money defines model for Money.
 type Money struct {
 	// AmountMinor The amount in minor units of the currency, such as cents.
@@ -1278,6 +1580,118 @@ type PluginProperty struct {
 	Value string `json:"value"`
 }
 
+// Quota defines model for Quota.
+type Quota struct {
+	CreatedAt time.Time   `json:"created_at"`
+	Feature   string      `json:"feature"`
+	Id        string      `json:"id"`
+	Limit     int64       `json:"limit"`
+	Meter     *string     `json:"meter,omitempty"`
+	Plan      string      `json:"plan"`
+	UpdatedAt time.Time   `json:"updated_at"`
+	Window    QuotaWindow `json:"window"`
+}
+
+// QuotaConsume defines model for QuotaConsume.
+type QuotaConsume struct {
+	Amount *int64 `json:"amount,omitempty"`
+
+	// LeaseSeconds The lease of a concurrent quota. Defaults to 3600.
+	LeaseSeconds *int `json:"lease_seconds,omitempty"`
+
+	// Ref A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+	Ref ExternalRef `json:"ref"`
+}
+
+// QuotaExtend defines model for QuotaExtend.
+type QuotaExtend struct {
+	LeaseSeconds int `json:"lease_seconds"`
+
+	// Ref A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+	Ref ExternalRef `json:"ref"`
+}
+
+// QuotaLease defines model for QuotaLease.
+type QuotaLease struct {
+	Amount    int64     `json:"amount"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Feature   string    `json:"feature"`
+
+	// Ref A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+	Ref ExternalRef `json:"ref"`
+}
+
+// QuotaList defines model for QuotaList.
+type QuotaList struct {
+	Data []Quota `json:"data"`
+}
+
+// QuotaOverride defines model for QuotaOverride.
+type QuotaOverride struct {
+	CreatedAt time.Time  `json:"created_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	Feature   string     `json:"feature"`
+	Id        string     `json:"id"`
+	Limit     *int64     `json:"limit"`
+	Meter     *string    `json:"meter,omitempty"`
+	Reason    string     `json:"reason"`
+
+	// TenantId A tenant ID.
+	TenantId TenantId     `json:"tenant_id"`
+	Window   *QuotaWindow `json:"window,omitempty"`
+}
+
+// QuotaOverrideCreate defines model for QuotaOverrideCreate.
+type QuotaOverrideCreate struct {
+	// ExpiresAt Within 10 years.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Feature   string     `json:"feature"`
+
+	// Limit The tenant's limit, or null to clear the overrides before it.
+	Limit *int64 `json:"limit"`
+
+	// Meter The meter a day or month override counts.
+	Meter  *string      `json:"meter,omitempty"`
+	Reason string       `json:"reason"`
+	Window *QuotaWindow `json:"window,omitempty"`
+}
+
+// QuotaRelease defines model for QuotaRelease.
+type QuotaRelease struct {
+	// Ref A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+	Ref ExternalRef `json:"ref"`
+}
+
+// QuotaReleased defines model for QuotaReleased.
+type QuotaReleased struct {
+	Entitlement Entitlement `json:"entitlement"`
+
+	// Released What the ref held, 0 when it held nothing.
+	Released int64 `json:"released"`
+}
+
+// QuotaReplace defines model for QuotaReplace.
+type QuotaReplace struct {
+	Quotas []QuotaSpec `json:"quotas"`
+	Reason *string     `json:"reason,omitempty"`
+}
+
+// QuotaSpec defines model for QuotaSpec.
+type QuotaSpec struct {
+	Feature string `json:"feature"`
+	Limit   int64  `json:"limit"`
+
+	// Meter The meter a day or month limit counts.
+	Meter *string `json:"meter,omitempty"`
+
+	// Plan A plan of the catalogue, or * for every plan.
+	Plan   string      `json:"plan"`
+	Window QuotaWindow `json:"window"`
+}
+
+// QuotaWindow defines model for QuotaWindow.
+type QuotaWindow string
+
 // RefundRequest defines model for RefundRequest.
 type RefundRequest struct {
 	AmountMinor int64 `json:"amount_minor"`
@@ -1290,10 +1704,134 @@ type RefundRequest struct {
 	Reason         string         `json:"reason"`
 }
 
+// Reservation defines model for Reservation.
+type Reservation struct {
+	// AmountMinor The amount held.
+	AmountMinor int64     `json:"amount_minor"`
+	Attempt     int       `json:"attempt"`
+	CreatedAt   time.Time `json:"created_at"`
+
+	// Currency An ISO 4217 currency code.
+	Currency  Currency   `json:"currency"`
+	ExpiredAt *time.Time `json:"expired_at"`
+
+	// ExternalRef A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+	ExternalRef ExternalRef `json:"external_ref"`
+
+	// Id A reservation ID.
+	Id ReservationId `json:"id"`
+
+	// KillbillRef The usage record's tracking ID or the external charge's invoice item ID.
+	KillbillRef     *string                     `json:"killbill_ref,omitempty"`
+	KillbillRefType *ReservationKillbillRefType `json:"killbill_ref_type,omitempty"`
+
+	// KillbillSubscriptionId The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	KillbillSubscriptionId *KillBillId         `json:"killbill_subscription_id,omitempty"`
+	Label                  string              `json:"label"`
+	LeaseExpiresAt         time.Time           `json:"lease_expires_at"`
+	RatedBy                *ReservationRatedBy `json:"rated_by,omitempty"`
+	ReleasedAt             *time.Time          `json:"released_at"`
+	SettledAt              *time.Time          `json:"settled_at"`
+
+	// SettledMinor The charge of a credit settlement, or the catalogue estimate of a usage settlement.
+	SettledMinor *int64 `json:"settled_minor"`
+
+	// SettlementPending A settlement waits for Kill Bill. The hold keeps counting.
+	SettlementPending bool              `json:"settlement_pending"`
+	Status            ReservationStatus `json:"status"`
+	UpdatedAt         time.Time         `json:"updated_at"`
+}
+
+// ReservationKillbillRefType defines model for Reservation.KillbillRefType.
+type ReservationKillbillRefType string
+
+// ReservationRatedBy defines model for Reservation.RatedBy.
+type ReservationRatedBy string
+
+// ReservationStatus defines model for Reservation.Status.
+type ReservationStatus string
+
+// ReservationCreate defines model for ReservationCreate.
+type ReservationCreate struct {
+	AmountMinor int64 `json:"amount_minor"`
+	Attempt     *int  `json:"attempt,omitempty"`
+
+	// Currency An ISO 4217 currency code.
+	Currency *Currency `json:"currency,omitempty"`
+
+	// ExternalRef A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+	ExternalRef ExternalRef `json:"external_ref"`
+	Label       *string     `json:"label,omitempty"`
+
+	// LeaseSeconds Defaults to 900.
+	LeaseSeconds *int `json:"lease_seconds,omitempty"`
+}
+
+// ReservationExtend defines model for ReservationExtend.
+type ReservationExtend struct {
+	Attempt      *int `json:"attempt,omitempty"`
+	LeaseSeconds int  `json:"lease_seconds"`
+}
+
+// ReservationId A reservation ID.
+type ReservationId = string
+
+// ReservationPage defines model for ReservationPage.
+type ReservationPage struct {
+	Data []Reservation `json:"data"`
+
+	// NextCursor The cursor for the next page, or null on the last page.
+	NextCursor *NextCursor `json:"next_cursor"`
+}
+
+// ReservationRelease defines model for ReservationRelease.
+type ReservationRelease struct {
+	Attempt *int `json:"attempt,omitempty"`
+}
+
+// ReservationSettle defines model for ReservationSettle.
+type ReservationSettle struct {
+	Attempt     *int   `json:"attempt,omitempty"`
+	CreditMinor *int64 `json:"credit_minor,omitempty"`
+
+	// Reason Recorded in Kill Bill's audit log.
+	Reason *string          `json:"reason,omitempty"`
+	Usage  *UsageSettlement `json:"usage,omitempty"`
+}
+
 // Role `owner` holds every permission. `admin` holds every permission except
 // `billing:*` and `tenant:transfer`. `billing_admin` holds `billing:*`.
 // `member` holds what its teams grant.
 type Role string
+
+// StaffQuotaRelease defines model for StaffQuotaRelease.
+type StaffQuotaRelease struct {
+	Reason string `json:"reason"`
+
+	// Ref A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+	Ref ExternalRef `json:"ref"`
+}
+
+// StaffReservationExtend defines model for StaffReservationExtend.
+type StaffReservationExtend struct {
+	Attempt      *int   `json:"attempt,omitempty"`
+	LeaseSeconds int    `json:"lease_seconds"`
+	Reason       string `json:"reason"`
+}
+
+// StaffReservationRelease defines model for StaffReservationRelease.
+type StaffReservationRelease struct {
+	Attempt *int   `json:"attempt,omitempty"`
+	Reason  string `json:"reason"`
+}
+
+// StaffReservationSettle defines model for StaffReservationSettle.
+type StaffReservationSettle struct {
+	Attempt     *int             `json:"attempt,omitempty"`
+	CreditMinor *int64           `json:"credit_minor,omitempty"`
+	Reason      string           `json:"reason"`
+	Usage       *UsageSettlement `json:"usage,omitempty"`
+}
 
 // Subscription defines model for Subscription.
 type Subscription struct {
@@ -1446,12 +1984,206 @@ type TenantUpdate struct {
 	Name           *string `json:"name,omitempty"`
 }
 
+// UsageBatch defines model for UsageBatch.
+type UsageBatch struct {
+	Events []UsageEventCreate `json:"events"`
+}
+
+// UsageBatchItem defines model for UsageBatchItem.
+type UsageBatchItem struct {
+	// Replayed True when the event was recorded before.
+	Replayed bool       `json:"replayed"`
+	Usage    UsageEvent `json:"usage"`
+}
+
+// UsageBatchResult defines model for UsageBatchResult.
+type UsageBatchResult struct {
+	Data []UsageBatchItem `json:"data"`
+}
+
+// UsageEvent defines model for UsageEvent.
+type UsageEvent struct {
+	// Dimensions Keys the meter declares, with values of 1 to 200 characters.
+	Dimensions Dimensions `json:"dimensions"`
+	EventId    string     `json:"event_id"`
+
+	// ForwardedAt When the forwarder sent the event to Kill Bill.
+	ForwardedAt *time.Time `json:"forwarded_at"`
+
+	// Id A usage event ID.
+	Id                 UsageId   `json:"id"`
+	KillbillTrackingId *string   `json:"killbill_tracking_id,omitempty"`
+	Meter              string    `json:"meter"`
+	OccurredAt         time.Time `json:"occurred_at"`
+	QuantityMicro      int64     `json:"quantity_micro"`
+	ReceivedAt         time.Time `json:"received_at"`
+
+	// ReservationId A reservation ID.
+	ReservationId *ReservationId `json:"reservation_id,omitempty"`
+	ResourceRef   *string        `json:"resource_ref,omitempty"`
+
+	// Subscription The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Subscription *KillBillId `json:"subscription,omitempty"`
+}
+
+// UsageEventCreate defines model for UsageEventCreate.
+type UsageEventCreate struct {
+	// Dimensions Keys the meter declares, with values of 1 to 200 characters.
+	Dimensions *Dimensions `json:"dimensions,omitempty"`
+	EventId    string      `json:"event_id"`
+	Meter      string      `json:"meter"`
+
+	// OccurredAt Defaults to now.
+	OccurredAt *time.Time `json:"occurred_at,omitempty"`
+
+	// QuantityMicro Millionths of the meter's unit.
+	QuantityMicro int64   `json:"quantity_micro"`
+	ResourceRef   *string `json:"resource_ref,omitempty"`
+
+	// Subscription The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Subscription *KillBillId `json:"subscription,omitempty"`
+}
+
+// UsageEventPage defines model for UsageEventPage.
+type UsageEventPage struct {
+	Data []UsageEvent `json:"data"`
+
+	// NextCursor The cursor for the next page, or null on the last page.
+	NextCursor *NextCursor `json:"next_cursor"`
+}
+
+// UsageId A usage event ID.
+type UsageId = string
+
 // UsagePrice defines model for UsagePrice.
 type UsagePrice struct {
 	BlockSize string  `json:"block_size"`
 	Prices    []Money `json:"prices"`
 	Unit      string  `json:"unit"`
 }
+
+// UsageRollup defines model for UsageRollup.
+type UsageRollup struct {
+	Attempts int `json:"attempts"`
+
+	// Day The UTC day of the rollup, YYYY-MM-DD.
+	Day                string     `json:"day"`
+	DiscardedAt        *time.Time `json:"discarded_at"`
+	Events             int        `json:"events"`
+	ForwardedAt        *time.Time `json:"forwarded_at"`
+	Id                 string     `json:"id"`
+	KillbillTrackingId string     `json:"killbill_tracking_id"`
+	KillbillUnit       string     `json:"killbill_unit"`
+	LastError          *string    `json:"last_error,omitempty"`
+
+	// PeriodStart The earliest event of the rollup.
+	PeriodStart   time.Time `json:"period_start"`
+	QuantityMicro int64     `json:"quantity_micro"`
+
+	// RecordAt The latest event of the rollup and the usage record's date.
+	RecordAt     time.Time                `json:"record_at"`
+	RejectReason *UsageRollupRejectReason `json:"reject_reason,omitempty"`
+	RejectedAt   *time.Time               `json:"rejected_at"`
+
+	// RequestedSubscription The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	RequestedSubscription *KillBillId       `json:"requested_subscription,omitempty"`
+	Status                UsageRollupStatus `json:"status"`
+
+	// Subscription The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Subscription *KillBillId `json:"subscription,omitempty"`
+}
+
+// UsageRollupRejectReason defines model for UsageRollup.RejectReason.
+type UsageRollupRejectReason string
+
+// UsageRollupStatus defines model for UsageRollup.Status.
+type UsageRollupStatus string
+
+// UsageRollupDiscard defines model for UsageRollupDiscard.
+type UsageRollupDiscard struct {
+	Reason string `json:"reason"`
+}
+
+// UsageRollupReassign defines model for UsageRollupReassign.
+type UsageRollupReassign struct {
+	Reason string `json:"reason"`
+
+	// Subscription The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Subscription KillBillId `json:"subscription"`
+}
+
+// UsageSettlement defines model for UsageSettlement.
+type UsageSettlement struct {
+	EventId       *string `json:"event_id,omitempty"`
+	QuantityMicro int64   `json:"quantity_micro"`
+
+	// Subscription The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
+	Subscription *KillBillId `json:"subscription,omitempty"`
+
+	// Unit A usage unit of the catalogue.
+	Unit string `json:"unit"`
+}
+
+// UsageSummary defines model for UsageSummary.
+type UsageSummary struct {
+	From   string              `json:"from"`
+	Rows   []UsageSummaryRow   `json:"rows"`
+	To     string              `json:"to"`
+	Totals []UsageSummaryTotal `json:"totals"`
+}
+
+// UsageSummaryRow defines model for UsageSummaryRow.
+type UsageSummaryRow struct {
+	Day string `json:"day"`
+
+	// Dimensions Keys the meter declares, with values of 1 to 200 characters.
+	Dimensions    Dimensions `json:"dimensions"`
+	Events        int64      `json:"events"`
+	Meter         string     `json:"meter"`
+	QuantityMicro int64      `json:"quantity_micro"`
+}
+
+// UsageSummaryTotal defines model for UsageSummaryTotal.
+type UsageSummaryTotal struct {
+	Events        int64  `json:"events"`
+	Meter         string `json:"meter"`
+	QuantityMicro int64  `json:"quantity_micro"`
+	Unit          string `json:"unit"`
+}
+
+// WalletView defines model for WalletView.
+type WalletView struct {
+	// AvailableMinor The credit less the unbilled amount and the holds, never below minus overdraft_minor. Null when unbilled_minor is null.
+	AvailableMinor *int64 `json:"available_minor"`
+
+	// Currency An ISO 4217 currency code.
+	Currency    Currency                `json:"currency"`
+	HoldReasons []WalletViewHoldReasons `json:"hold_reasons"`
+
+	// KillbillCreditMinor The account credit Kill Bill holds, in minor units.
+	KillbillCreditMinor int64 `json:"killbill_credit_minor"`
+	LowBalance          bool  `json:"low_balance"`
+
+	// LowBalanceThresholdMinor The brand's threshold. 0 turns it off.
+	LowBalanceThresholdMinor int64 `json:"low_balance_threshold_minor"`
+	OnHold                   bool  `json:"on_hold"`
+
+	// OverdraftMinor The brand's overdraft allowance.
+	OverdraftMinor int64        `json:"overdraft_minor"`
+	Overdue        OverdueState `json:"overdue"`
+
+	// PendingSettlements Held reservations whose settlement waits for Kill Bill.
+	PendingSettlements int `json:"pending_settlements"`
+
+	// ReservedMinor The sum of the held reservations, pending settlements included.
+	ReservedMinor int64 `json:"reserved_minor"`
+
+	// UnbilledMinor What Kill Bill will invoice by the end of the current period and has not yet: usage recorded so far and recurring charges due by then, from a dry-run invoice. Null when Kill Bill cannot rate it.
+	UnbilledMinor *int64 `json:"unbilled_minor"`
+}
+
+// WalletViewHoldReasons defines model for WalletView.HoldReasons.
+type WalletViewHoldReasons string
 
 // ApiKeyIdPath An API key ID.
 type ApiKeyIdPath = ApiKeyId
@@ -1461,6 +2193,12 @@ type BrandIdPath = BrandId
 
 // Cursor defines model for Cursor.
 type Cursor = string
+
+// FeaturePath defines model for FeaturePath.
+type FeaturePath = string
+
+// FromDay defines model for FromDay.
+type FromDay = string
 
 // InvitationIdPath An invitation ID.
 type InvitationIdPath = InvitationId
@@ -1474,6 +2212,9 @@ type Limit = int
 // MembershipIdPath A membership ID.
 type MembershipIdPath = MembershipId
 
+// MeterQuery defines model for MeterQuery.
+type MeterQuery = string
+
 // PaymentIdPath The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
 type PaymentIdPath = KillBillId
 
@@ -1483,6 +2224,12 @@ type PaymentMethodIdPath = KillBillId
 // ProxyPath defines model for ProxyPath.
 type ProxyPath = string
 
+// ReservationRefPath A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+type ReservationRefPath = ExternalRef
+
+// RollupIdPath defines model for RollupIdPath.
+type RollupIdPath = string
+
 // SubscriptionIdPath The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
 type SubscriptionIdPath = KillBillId
 
@@ -1491,6 +2238,9 @@ type TeamIdPath = TeamId
 
 // TenantIdPath A tenant ID.
 type TenantIdPath = TenantId
+
+// ToDay defines model for ToDay.
+type ToDay = string
 
 // BadRequest The body of every error response.
 type BadRequest = ErrorEnvelope
@@ -1618,6 +2368,21 @@ type ListPaymentsParams struct {
 	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
 }
 
+// ListReservationsParams defines parameters for ListReservations.
+type ListReservationsParams struct {
+	Status      *ListReservationsParamsStatus `form:"status,omitempty" json:"status,omitempty"`
+	ExternalRef *ExternalRef                  `form:"external_ref,omitempty" json:"external_ref,omitempty"`
+
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// ListReservationsParamsStatus defines parameters for ListReservations.
+type ListReservationsParamsStatus string
+
 // CancelSubscriptionParams defines parameters for CancelSubscription.
 type CancelSubscriptionParams struct {
 	Policy *CancelSubscriptionParamsPolicy `form:"policy,omitempty" json:"policy,omitempty"`
@@ -1638,11 +2403,54 @@ type ListTeamsParams struct {
 	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
 }
 
+// GetBilledUsageParams defines parameters for GetBilledUsage.
+type GetBilledUsageParams struct {
+	Subscription *KillBillId `form:"subscription,omitempty" json:"subscription,omitempty"`
+
+	// From The first day, YYYY-MM-DD, UTC.
+	From *FromDay `form:"from,omitempty" json:"from,omitempty"`
+
+	// To The day after the last, YYYY-MM-DD, UTC.
+	To *ToDay `form:"to,omitempty" json:"to,omitempty"`
+}
+
+// ListUsageEventsParams defines parameters for ListUsageEvents.
+type ListUsageEventsParams struct {
+	// Meter A meter slug.
+	Meter *MeterQuery `form:"meter,omitempty" json:"meter,omitempty"`
+	From  *time.Time  `form:"from,omitempty" json:"from,omitempty"`
+	To    *time.Time  `form:"to,omitempty" json:"to,omitempty"`
+
+	// Limit The page size. Defaults to 50.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor The `next_cursor` of the previous page. Opaque; do not build or parse it.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+}
+
+// GetUsageSummaryParams defines parameters for GetUsageSummary.
+type GetUsageSummaryParams struct {
+	// Meter A meter slug.
+	Meter *MeterQuery `form:"meter,omitempty" json:"meter,omitempty"`
+
+	// From The first day, YYYY-MM-DD, UTC.
+	From *FromDay `form:"from,omitempty" json:"from,omitempty"`
+
+	// To The day after the last, YYYY-MM-DD, UTC.
+	To *ToDay `form:"to,omitempty" json:"to,omitempty"`
+}
+
 // ReceiveKillBillNotificationJSONRequestBody defines body for ReceiveKillBillNotification for application/json ContentType.
 type ReceiveKillBillNotificationJSONRequestBody = KillBillNotification
 
 // ApplyBrandJSONRequestBody defines body for ApplyBrand for application/json ContentType.
 type ApplyBrandJSONRequestBody = BrandManifest
+
+// ReplaceMetersJSONRequestBody defines body for ReplaceMeters for application/json ContentType.
+type ReplaceMetersJSONRequestBody = MeterReplace
+
+// ReplaceQuotasJSONRequestBody defines body for ReplaceQuotas for application/json ContentType.
+type ReplaceQuotasJSONRequestBody = QuotaReplace
 
 // AcceptInvitationJSONRequestBody defines body for AcceptInvitation for application/json ContentType.
 type AcceptInvitationJSONRequestBody = InvitationAccept
@@ -1652,6 +2460,27 @@ type DecideTenantActivationJSONRequestBody = ActivationDecisionRequest
 
 // GrantCreditJSONRequestBody defines body for GrantCredit for application/json ContentType.
 type GrantCreditJSONRequestBody = CreditGrant
+
+// StaffReleaseEntitlementJSONRequestBody defines body for StaffReleaseEntitlement for application/json ContentType.
+type StaffReleaseEntitlementJSONRequestBody = StaffQuotaRelease
+
+// SetQuotaOverrideJSONRequestBody defines body for SetQuotaOverride for application/json ContentType.
+type SetQuotaOverrideJSONRequestBody = QuotaOverrideCreate
+
+// StaffExtendReservationJSONRequestBody defines body for StaffExtendReservation for application/json ContentType.
+type StaffExtendReservationJSONRequestBody = StaffReservationExtend
+
+// StaffReleaseReservationJSONRequestBody defines body for StaffReleaseReservation for application/json ContentType.
+type StaffReleaseReservationJSONRequestBody = StaffReservationRelease
+
+// StaffSettleReservationJSONRequestBody defines body for StaffSettleReservation for application/json ContentType.
+type StaffSettleReservationJSONRequestBody = StaffReservationSettle
+
+// DiscardUsageRollupJSONRequestBody defines body for DiscardUsageRollup for application/json ContentType.
+type DiscardUsageRollupJSONRequestBody = UsageRollupDiscard
+
+// ReassignUsageRollupJSONRequestBody defines body for ReassignUsageRollup for application/json ContentType.
+type ReassignUsageRollupJSONRequestBody = UsageRollupReassign
 
 // CreateTenantJSONRequestBody defines body for CreateTenant for application/json ContentType.
 type CreateTenantJSONRequestBody = TenantCreate
@@ -1668,6 +2497,15 @@ type ProxyBillingPostJSONRequestBody = ProxyBillingPostJSONBody
 // RedeemCreditCodeJSONRequestBody defines body for RedeemCreditCode for application/json ContentType.
 type RedeemCreditCodeJSONRequestBody = CreditRedeem
 
+// ConsumeEntitlementJSONRequestBody defines body for ConsumeEntitlement for application/json ContentType.
+type ConsumeEntitlementJSONRequestBody = QuotaConsume
+
+// ExtendEntitlementJSONRequestBody defines body for ExtendEntitlement for application/json ContentType.
+type ExtendEntitlementJSONRequestBody = QuotaExtend
+
+// ReleaseEntitlementJSONRequestBody defines body for ReleaseEntitlement for application/json ContentType.
+type ReleaseEntitlementJSONRequestBody = QuotaRelease
+
 // CreateInvitationJSONRequestBody defines body for CreateInvitation for application/json ContentType.
 type CreateInvitationJSONRequestBody = InvitationCreate
 
@@ -1682,6 +2520,18 @@ type AddPaymentMethodJSONRequestBody = PaymentMethodCreate
 
 // RefundPaymentJSONRequestBody defines body for RefundPayment for application/json ContentType.
 type RefundPaymentJSONRequestBody = RefundRequest
+
+// CreateReservationJSONRequestBody defines body for CreateReservation for application/json ContentType.
+type CreateReservationJSONRequestBody = ReservationCreate
+
+// ExtendReservationJSONRequestBody defines body for ExtendReservation for application/json ContentType.
+type ExtendReservationJSONRequestBody = ReservationExtend
+
+// ReleaseReservationJSONRequestBody defines body for ReleaseReservation for application/json ContentType.
+type ReleaseReservationJSONRequestBody = ReservationRelease
+
+// SettleReservationJSONRequestBody defines body for SettleReservation for application/json ContentType.
+type SettleReservationJSONRequestBody = ReservationSettle
 
 // CreateSubscriptionJSONRequestBody defines body for CreateSubscription for application/json ContentType.
 type CreateSubscriptionJSONRequestBody = SubscriptionCreate
@@ -1700,3 +2550,9 @@ type SetTeamGrantsJSONRequestBody = TeamGrants
 
 // SetTeamMembersJSONRequestBody defines body for SetTeamMembers for application/json ContentType.
 type SetTeamMembersJSONRequestBody = TeamMembers
+
+// RecordUsageJSONRequestBody defines body for RecordUsage for application/json ContentType.
+type RecordUsageJSONRequestBody = UsageEventCreate
+
+// RecordUsageBatchJSONRequestBody defines body for RecordUsageBatch for application/json ContentType.
+type RecordUsageBatchJSONRequestBody = UsageBatch

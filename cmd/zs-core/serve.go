@@ -19,7 +19,11 @@ import (
 	"github.com/zsoftly/zs-core/pkg/billing"
 	"github.com/zsoftly/zs-core/pkg/brand"
 	"github.com/zsoftly/zs-core/pkg/identity"
+	"github.com/zsoftly/zs-core/pkg/metering"
+	"github.com/zsoftly/zs-core/pkg/outbox"
+	"github.com/zsoftly/zs-core/pkg/quota"
 	"github.com/zsoftly/zs-core/pkg/tenant"
+	"github.com/zsoftly/zs-core/pkg/wallet"
 )
 
 // brandRegistryTTL is how long serve caches the applied brands.
@@ -56,6 +60,7 @@ func newAPIOptions(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, l
 		opts.Billing = &billing.Service{DB: pool, KillBill: opts.BrandDeps.KillBill, Secrets: resolver,
 			WebhookSecret: []byte(cfg.KillBillWebhookSecret), Log: log}
 	}
+	opts.Wallet, opts.Metering, opts.Quota = newExtensions(pool, opts.Billing, cfg, log)
 	if cfg.BrandsDir != "" {
 		if err := checkBrandsDir(ctx, cfg.BrandsDir, resolver, pool, log); err != nil {
 			return httpapi.Options{}, err
@@ -152,4 +157,40 @@ func startTenantSweeper(ctx context.Context, pool *pgxpool.Pool, engines tenant.
 	log.Info("tenant sweeper started", "interval", interval.String())
 	go tenant.RunMirror(ctx, pool, engines, log)
 	log.Info("keycloak organization mirror started", "workers", tenant.MirrorWorkers)
+}
+
+// newExtensions builds the wallet, metering and quota services on the
+// billing surface. Without billing, usage is still recorded; the wallet,
+// forwarding and quotas need Kill Bill.
+func newExtensions(pool *pgxpool.Pool, svc *billing.Service, cfg config.Config, log *slog.Logger) (*wallet.Service, *metering.Service, *quota.Service) {
+	m := &metering.Service{DB: pool, Billing: svc, Log: log}
+	if !svc.Ready() {
+		return nil, m, nil
+	}
+	w := &wallet.Service{DB: pool, Billing: svc, Metering: m, CreditTTL: cfg.WalletCreditCacheTTL, Log: log}
+	q := &quota.Service{DB: pool, Billing: svc, Log: log}
+	return w, m, q
+}
+
+// startExtensions runs the usage partition sweeper until ctx ends, and,
+// when billing is configured, the wallet sweeper, the settlement relay, the
+// usage forwarder and the quota lease sweeper. Each relay claims only its
+// own event type.
+func startExtensions(ctx context.Context, pool *pgxpool.Pool, api httpapi.Options, cfg config.Config, log *slog.Logger) {
+	go (&metering.PartitionSweeper{DB: pool, Log: log}).Run(ctx, cfg.UsagePartitionInterval)
+	log.Info("usage partition sweeper started", "interval", cfg.UsagePartitionInterval.String())
+	if !api.Wallet.Ready() {
+		log.Warn("wallet sweeper and usage forwarder not started: they need the Kill Bill admin settings")
+		return
+	}
+	go (&wallet.Sweeper{Service: api.Wallet}).Run(ctx, cfg.WalletSweepInterval)
+	log.Info("wallet sweeper started", "interval", cfg.WalletSweepInterval.String())
+	go api.Wallet.RunRelay(ctx, outbox.NewPostgresReader(pool).WithEventTypes(wallet.EventSettlementRequested), time.Second)
+	log.Info("wallet settlement relay started")
+	go api.Metering.Run(ctx, outbox.NewPostgresReader(pool).WithEventTypes(metering.EventUsageRecorded), cfg.MeteringForwardInterval)
+	log.Info("usage forwarder started", "interval", cfg.MeteringForwardInterval.String())
+	if api.Quota != nil {
+		go (&quota.Sweeper{Service: api.Quota}).Run(ctx, cfg.QuotaSweepInterval)
+		log.Info("quota lease sweeper started", "interval", cfg.QuotaSweepInterval.String())
+	}
 }

@@ -69,9 +69,11 @@ bin/zs-core credit-code add --brand zs-reference --code WELCOME10 --amount-minor
 bin/zs-core credit-code list --brand zs-reference
 bin/zs-core credit-code disable --brand zs-reference --id ccd_... --reason '<why>' --operator <you>
 bin/zs-core credit sweep        # reverse the unused part of expired credits once
+bin/zs-core wallet sweep        # expire reservations past their lease and reconcile every wallet once
+bin/zs-core usage forward       # forward recorded usage to Kill Bill once
 ```
 
-`credit-code` needs the database only. `credit sweep` also needs the Kill Bill admin settings and the brands' secret references. See [modules/billing.md](modules/billing.md).
+`credit-code` needs the database only. `credit sweep`, `wallet sweep` and `usage forward` also need the Kill Bill admin settings and the brands' secret references. See [modules/billing.md](modules/billing.md), [modules/wallet.md](modules/wallet.md) and [modules/metering.md](modules/metering.md).
 
 The `tenant` commands need the Keycloak and Kill Bill admin settings and the brand's secret references. See [modules/tenants.md](modules/tenants.md).
 
@@ -97,20 +99,30 @@ Migrations use unqualified names, so they apply to the first schema on the conne
 
 Unit tests sit next to the code and need nothing but Go.
 
-Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. Tests in different packages therefore run in parallel against one server without seeing each other's rows.
+Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. Tests in different packages therefore run in parallel against one server without seeing each other's rows. Run the suite in parallel, without `-p 1`.
 
-The tenant, API key and billing integration tests in `pkg/tenant`, `pkg/apikey`, `pkg/billing`, `pkg/brand` and `internal/httpapi` need Postgres only. `internal/enginetest` serves the Keycloak Organizations endpoints and the Kill Bill endpoints Core uses from memory, over HTTP, so the real clients run against it. The Kill Bill endpoints are:
+Two rules keep parallel schemas apart on one server:
+
+- Every advisory lock key Core takes names the schema, `current_schema()`, as the migration lock does. Tests reuse brand slugs and fixed keys, so without the schema their locks would collide across schemas. One deployment uses one schema, so its instances still share each lock.
+- Migrating a schema and dropping it lock every table, index and partition in it. Many test binaries doing that at once exhaust Postgres's shared lock table, `out of shared memory`. The harness runs those two steps one at a time across every test process, under a server-wide advisory lock. The tests themselves still run in parallel.
+
+The tenant, API key, billing, wallet, metering and quota integration tests in `pkg/tenant`, `pkg/apikey`, `pkg/billing`, `pkg/wallet`, `pkg/metering`, `pkg/quota`, `pkg/brand` and `internal/httpapi` need Postgres only. `internal/enginetest` serves the Keycloak Organizations endpoints and the Kill Bill endpoints Core uses from memory, over HTTP, so the real clients run against it. The Kill Bill endpoints are:
 
 - accounts and catalogue
 - subscriptions and invoices
 - credits and external charges
+- usage records, with Kill Bill's refusal of a tracking ID the subscription already holds, and rolled-up usage
+- dry-run invoices, with the usage of active subscriptions that no invoice bills yet, priced from the catalogue, and no recurring charges
+- an invoice run that bills an account's usage of a period as `USAGE` items with the period's dates, and lists the tracking IDs on the invoice
+- subscription start dates, which a test can move
+- failure modes on demand: a lost answer, a write that takes effect but answers 503, a write that answers 503 or 400 and takes no effect, and a slow write that waits before the fake serves it while other calls go on. A hook runs after every write.
 - payments and refunds
 - payment methods, with the external payment plugin's rules
 - overdue and blocking states
 - push notification callbacks
 - KPM node commands
 
-It records the audit headers of every Kill Bill write. It makes either engine answer 503 on demand. It also inserts applied brands and identities and signs access tokens for them with a test key. The endpoints it serves are the ones the stack tests check against the real servers.
+Its catalogue has the plan `core-metered-monthly`, which prices `api-call` per call with no trial, like the reference catalogue. It records the audit headers of every Kill Bill write. It makes either engine answer 503 on demand. It also inserts applied brands and identities and signs access tokens for them with a test key. The endpoints it serves are the ones the stack tests check against the real servers.
 
 The harness in `internal/postgrestest` chooses the server like this:
 
@@ -163,6 +175,18 @@ The tenant stack tests cover the Phase 3 gates with a real Keycloak and Kill Bil
 - Suspension puts billing on hold and reactivation lifts it.
 - The credentials proxy reads the tenant's own account and refuses another tenant's account, by ID and by external key.
 - With `ZS_TEST_CALLBACK_ADDR` set, Kill Bill's push notifications reach Core and become `billing.subscription.changed`, `billing.invoice.created` and `billing.payment.succeeded` events.
+
+`TestExtensionsOnTheStack` covers the Phase 4b gates with a real Kill Bill:
+
+- `zs-reference` applies its meter and its two quotas, a second apply is empty, and a meter on a unit outside the catalogue is refused.
+- A tenant created through Core gets a Core credit and a subscription on `core-metered-monthly`.
+- Usage recorded over HTTP is forwarded as one usage record and shows in `GET /1.0/kb/usages/{subscriptionId}`. A forced retry of the rollup meets Kill Bill's refusal of its tracking ID and records nothing more.
+- A reservation settled into usage adds a usage record, and one settled into a charge lowers the Kill Bill credit by the charge.
+- A settlement made while Kill Bill cannot be reached waits, the hold keeps counting in the wallet view, and the relay completes it. The settlement's holder is the owner's membership that made the hold over HTTP.
+- The wallet view equals the Kill Bill credit less the unbilled usage of Kill Bill's dry-run invoice less the holds, and a reservation one minor unit past that is refused. A hold expires with its lease. A credit added in Kill Bill behind Core's back is exactly one reconciliation mismatch.
+- The entitlement of `api-call` shows the month quota and the usage. `GET /v1/tenants/{id}/usage/billed` shows Kill Bill's total.
+- An invoice run past the end of the first period bills the usage as a `USAGE` item that lists both tracking IDs. Kill Bill's test clock cannot move on the stack, so the run names a target date.
+- The client reads those tracking IDs, and the dates of the usage item, from Kill Bill's invoices, and the invoiced usage reconciles with no new finding.
 
 Kill Bill reaches the test only from inside its own network. If your build host's firewall drops traffic from containers to the host, run this test in Kill Bill's network namespace, after the full suite:
 

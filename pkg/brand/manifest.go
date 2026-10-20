@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"gopkg.in/yaml.v3"
@@ -51,7 +52,10 @@ type Manifest struct {
 	Identity      Identity       `json:"identity"`
 	Billing       Billing        `json:"billing"`
 	Notifications *Notifications `json:"notifications,omitempty"`
-	Permissions   []string       `json:"permissions,omitempty"`
+	// Entitlements are the brand's quotas. Nil leaves the quotas to the
+	// HTTP route; a list, even empty, is what apply converges to.
+	Entitlements *[]Entitlement `json:"entitlements,omitempty"`
+	Permissions  []string       `json:"permissions,omitempty"`
 }
 
 // Identity is the Keycloak side of a brand.
@@ -142,6 +146,98 @@ type Billing struct {
 	PaymentPlugin        *PaymentPlugin `json:"payment_plugin,omitempty"`
 	InvoicePlugin        *InvoicePlugin `json:"invoice_plugin,omitempty"`
 	Templates            string         `json:"templates,omitempty"`
+	Wallet               *WalletPolicy  `json:"wallet,omitempty"`
+	UsageWindow          *UsageWindow   `json:"usage_window,omitempty"`
+	// Meters are the brand's meters. Nil leaves the meters to the HTTP
+	// route; a list, even empty, is what apply converges to.
+	Meters *[]Meter `json:"meters,omitempty"`
+}
+
+// WalletPolicy is how the wallet view treats a tenant of the brand. Amounts
+// are minor units of the account currency, the brand's first currency.
+type WalletPolicy struct {
+	OverdraftMinor  int64 `json:"overdraft_minor,omitempty"`
+	LowBalanceMinor int64 `json:"low_balance_minor,omitempty"`
+}
+
+// Overdraft returns how far below zero the available credit may go.
+func (b Billing) Overdraft() int64 {
+	if b.Wallet == nil {
+		return 0
+	}
+	return b.Wallet.OverdraftMinor
+}
+
+// LowBalance returns the low-balance threshold, 0 when it is off.
+func (b Billing) LowBalance() int64 {
+	if b.Wallet == nil {
+		return 0
+	}
+	return b.Wallet.LowBalanceMinor
+}
+
+// UsageWindow bounds the occurred_at of a usage event.
+type UsageWindow struct {
+	BackfillHours int `json:"backfill_hours,omitempty"`
+	FutureSeconds int `json:"future_seconds,omitempty"`
+}
+
+// The default usage window: seven days back, five minutes forward.
+const (
+	DefaultBackfillHours = 7 * 24
+	DefaultFutureSeconds = 300
+)
+
+// Backfill returns how far back a usage event may have occurred.
+func (b Billing) Backfill() time.Duration {
+	if b.UsageWindow == nil || b.UsageWindow.BackfillHours == 0 {
+		return DefaultBackfillHours * time.Hour
+	}
+	return time.Duration(b.UsageWindow.BackfillHours) * time.Hour
+}
+
+// Future returns how far ahead a usage event may be dated. An explicit 0 is
+// not expressible: the schema treats 0 as the default.
+func (b Billing) Future() time.Duration {
+	if b.UsageWindow == nil || b.UsageWindow.FutureSeconds == 0 {
+		return DefaultFutureSeconds * time.Second
+	}
+	return time.Duration(b.UsageWindow.FutureSeconds) * time.Second
+}
+
+// Meter units.
+var MeterUnits = []string{"minute", "second", "byte", "gib_hour", "request", "token", "count"}
+
+// Meter is a meter of the brand. KillBillUnit is the catalogue usage unit
+// its usage is forwarded to. Dimensions are the keys a usage event may
+// carry.
+type Meter struct {
+	Slug         string   `json:"slug"`
+	Unit         string   `json:"unit"`
+	KillBillUnit string   `json:"killbill_unit"`
+	Dimensions   []string `json:"dimensions,omitempty"`
+}
+
+// Quota windows.
+const (
+	WindowNone       = "none"
+	WindowDay        = "day"
+	WindowMonth      = "month"
+	WindowConcurrent = "concurrent"
+)
+
+// AnyPlan is the plan of a quota that applies to every plan.
+const AnyPlan = "*"
+
+// Entitlement is a quota: the limit of a feature for a plan, or for every
+// plan with AnyPlan. Meter names the meter whose usage counts against a day
+// or month limit.
+type Entitlement struct {
+	Feature string `json:"feature"`
+	Plan    string `json:"plan"`
+	Limit   int64  `json:"limit"`
+	Window  string `json:"window"`
+	Meter   string `json:"meter,omitempty"`
 }
 
 // Seller is the legal seller of a brand.
@@ -481,6 +577,7 @@ func (m *Manifest) Validate() error {
 			}
 		}
 	}
+	problems = append(problems, m.extensionProblems()...)
 	if len(problems) > 0 {
 		return invalid(problems)
 	}

@@ -226,6 +226,10 @@ type Invoice struct {
 	CreditAdj     json.Number   `json:"creditAdj"`
 	RefundAdj     json.Number   `json:"refundAdj"`
 	Items         []InvoiceItem `json:"items"`
+	// TrackingIDs are the tracking IDs of the usage records the invoice
+	// bills. Kill Bill 0.24.22 lists them on an invoice read with its
+	// components.
+	TrackingIDs []string `json:"trackingIds,omitempty"`
 }
 
 // AccountInvoices returns the invoices of an account, with their items when

@@ -5,7 +5,11 @@
 # ZS_STAFF_CLIENT_SECRET. BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET holds
 # the value of KILLBILL_TENANT_API_SECRET in deploy/compose/.env. ssl_required
 # is none for the loopback stack only: the command line warns about it and
-# the HTTP route refuses it. See docs/modules/brands.md.
+# the HTTP route refuses it. The meter api-calls forwards usage to the
+# catalogue unit api-call, which core-metered-monthly bills per call. The
+# quotas cap api-call per month on that plan and running jobs on every plan.
+# See docs/modules/brands.md, docs/modules/metering.md and
+# docs/modules/quotas.md.
 schema_version: 1
 slug: zs-reference
 name: ZSoftly reference
@@ -35,6 +39,16 @@ identity:
     redirect_uris: ["http://127.0.0.1/*", "http://localhost/*"]
     web_origins: ["+"]
     service_accounts: true
+entitlements:
+  - feature: api-call
+    plan: core-metered-monthly
+    limit: 100000
+    window: month
+    meter: api-calls
+  - feature: concurrent-jobs
+    plan: "*"
+    limit: 2
+    window: concurrent
 billing:
   killbill_tenant_key: zs-reference
   killbill_api_secret_ref: env://BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET
@@ -43,3 +57,14 @@ billing:
   seller:
     name: ZSoftly Technologies Inc.
     country: CA
+  wallet:
+    overdraft_minor: 0
+    low_balance_minor: 500
+  usage_window:
+    backfill_hours: 168
+    future_seconds: 300
+  meters:
+    - slug: api-calls
+      unit: request
+      killbill_unit: api-call
+      dimensions: [region, method]

@@ -88,7 +88,7 @@ A refund may not exceed what the payment captured or purchased, less what it has
 
 ## Entitlements
 
-`CheckEntitlement(ctx, scope, feature)` is in `pkg/billing`. The route is `GET /v1/tenants/{id}/entitlements/{feature}`. A feature is an active product's name or a usage unit in that product's plans in the catalogue in force. The answer is `{allowed, limit, used, remaining, reason, plan}`. `limit`, `used` and `remaining` are null until the quota extension of [wallet-and-metering.md](wallet-and-metering.md) adds them. The check fails closed. Every failure is `allowed: false` with a reason, never an error:
+`CheckEntitlement(ctx, scope, feature)` is in `pkg/billing`. A feature is an active product's name or a usage unit in that product's plans in the catalogue in force. The answer is `{allowed, limit, used, remaining, reason, plan}`. Since Phase 4b the route `GET /v1/tenants/{id}/entitlements/{feature}` answers with `pkg/quota`. It starts from this check and adds the brand's quotas. When a quota applies, `limit`, `used` and `remaining` are set. See [quotas.md](quotas.md). The check fails closed. Every failure is `allowed: false` with a reason, never an error:
 
 | Reason | When |
 | --- | --- |
@@ -99,6 +99,7 @@ A refund may not exceed what the payment captured or purchased, less what it has
 | `billing_unavailable` | Kill Bill, the database or the billing settings are not reachable. |
 | `tenant_not_found` | The tenant is closed or unknown. |
 | `feature_invalid` | The feature name is malformed. The route answers 400 instead. |
+| `quota_exceeded` | A quota applies and the tenant has used its limit. Set by `pkg/quota`. |
 
 ## Promo and voucher codes
 
@@ -131,9 +132,11 @@ The credit that did not come from Core is the larger of two estimates. One is th
 
 When the amount is zero or less, the sweeper marks the credit expired with nothing reversed and audits `billing.credit.expired_nothing_to_reverse`. Otherwise it writes an external charge for the amount, which Kill Bill pays from the account credit. It records the charge and audits `billing.credit.expired`. It audits only when its own update marked the credit expired.
 
+No reservation covers the expiry charge, so it lowers the credit a wallet relies on. The sweeper writes it under the tenant's wallet lock and moves the tenant's wallet version on before it releases the lock. No `Reserve` of any Core instance reads in between, and none relies on the credit it cached before. A redeemed code and a granted staff credit move the version on too, in the transaction that records them. See [wallet.md](wallet.md#the-credit-cache).
+
 A tenant with a pending credit waits for a later pass, because that credit may already sit in the account credit. A credit whose brand is not active waits too. Neither counts as a failure. A credit whose expiry fails is retried 10 seconds later, then after twice the previous wait, up to once a day. Each failure adds one to `attempts`. A pass reads the due credits in pages, oldest first, and moves past the ones that wait, so they never hold up the others.
 
-A pass holds a database advisory lock on its own connection. It keeps no transaction open while it calls Kill Bill, and records each credit in its own short transaction. Each pass also deletes push notification receipts older than seven days.
+A pass holds a database advisory lock on its own connection. It keeps no transaction open while it calls Kill Bill, apart from the short one that holds the wallet lock across the expiry charge, and records each credit in its own short transaction. Each pass also deletes push notification receipts older than seven days.
 
 ## Payment methods
 

@@ -18,6 +18,9 @@ The foundation is the shared plumbing every module uses. It fixes the error enve
 | `pkg/tenant` | Tenants, memberships, teams, invitations, activation and the sweeper. See [tenants.md](tenants.md). |
 | `pkg/apikey` | Tenant API keys. See [api-keys.md](api-keys.md). |
 | `pkg/billing` | The billing surface on Kill Bill: catalogue, account summary, subscriptions, invoices, payments, payment methods, credit codes, credits and their expiry, entitlements, push notifications and the billing credential proxy. See [billing.md](billing.md). |
+| `pkg/wallet` | The wallet view, reservations, settlement into Kill Bill, the lease sweeper and the reconciliation sweep. See [wallet.md](wallet.md). |
+| `pkg/metering` | Meters, usage events, summaries and the forwarder to Kill Bill usage records. See [metering.md](metering.md). |
+| `pkg/quota` | Quotas, overrides, counters and the entitlement check with limits. See [quotas.md](quotas.md). |
 | `internal/config` | Environment configuration with strict validation. |
 | `internal/database` | Pool and the embedded forward-only migration runner. |
 | `internal/httpapi` | Router, middleware, health probes and the `/v1` routes. |
@@ -90,14 +93,32 @@ Clients branch on `code`. `message` is safe to show. It never carries database, 
 | ZS-1804 | `credit_code_exhausted` | 409 | no |
 | ZS-1805 | `wallet_on_hold` | 409 | no |
 | ZS-1806 | `billing_token_invalid` | 401 | no |
+| ZS-1900 | `insufficient_credit` | 409 | no |
+| ZS-1901 | `reservation_not_found` | 404 | no |
+| ZS-1902 | `reservation_not_held` | 409 | no |
+| ZS-1903 | `reservation_settlement_pending` | 409 | yes |
+| ZS-1904 | `reservation_conflict` | 409 | no |
+| ZS-1905 | `wallet_unavailable` | 503 | yes |
+| ZS-1906 | `settlement_exceeds_hold` | 409 | no |
+| ZS-1907 | `unit_unrated` | 422 | no |
+| ZS-1908 | `reservation_closed` | 409 | no |
+| ZS-1909 | `settlement_conflict` | 409 | no |
+| ZS-1910 | `meter_not_found` | 404 | no |
+| ZS-1911 | `usage_event_conflict` | 409 | no |
+| ZS-1912 | `usage_out_of_window` | 400 | no |
+| ZS-1913 | `usage_overflow` | 422 | no |
+| ZS-1920 | `quota_exceeded` | 409 | no |
+| ZS-1921 | `quota_not_concurrent` | 409 | no |
 
-Codes and names are stable. New codes are added. Existing codes are never reused. The ZS-1600 range covers tenants, memberships, teams and invitations, the ZS-1700 range covers API keys, and the ZS-1800 range covers billing. See [tenants.md](tenants.md), [api-keys.md](api-keys.md) and [billing.md](billing.md).
+Codes and names are stable. New codes are added. Existing codes are never reused. The ZS-1600 range covers tenants, memberships, teams and invitations, the ZS-1700 range covers API keys, the ZS-1800 range covers billing, and the ZS-1900 range covers the wallet, metering and quotas. See [tenants.md](tenants.md), [api-keys.md](api-keys.md), [billing.md](billing.md), [wallet.md](wallet.md), [metering.md](metering.md) and [quotas.md](quotas.md).
+
+`insufficient_credit` names the shortfall in its message. A library caller reads it with `wallet.Shortfall`.
 
 `billing_rejected` carries Kill Bill's numeric error code in its message and never Kill Bill's text. A Kill Bill 5xx or timeout is `billing_unavailable`.
 
 ## Public IDs
 
-Internally every ID is a UUIDv7. On the API it carries a type prefix and the UUID in lowercase Crockford base32, 26 characters: `tnt_01m5bzbkj6en5tr1ekx7m6xdae`. IDs sort by creation time. The prefixes are `brd_` brand, `tnt_` tenant, `mem_` membership, `inv_` invitation, `key_` API key, `grt_` grant, `idn_` identity, `rsv_` reservation, `usg_` usage, `ord_` order, `evt_` event, `aud_` audit event, `ccd_` credit code and `crd_` credit. Objects that live in Kill Bill only, such as subscriptions, invoices and payments, keep their Kill Bill IDs. See [billing.md](billing.md). `idgen.ParseAs` rejects an ID with the wrong prefix before any query runs.
+Internally every ID is a UUIDv7. On the API it carries a type prefix and the UUID in lowercase Crockford base32, 26 characters: `tnt_01m5bzbkj6en5tr1ekx7m6xdae`. IDs sort by creation time. The prefixes are `brd_` brand, `tnt_` tenant, `mem_` membership, `inv_` invitation, `key_` API key, `grt_` grant, `idn_` identity, `rsv_` reservation, `usg_` usage, `ord_` order, `evt_` event, `aud_` audit event, `ccd_` credit code, `crd_` credit, `mtr_` meter, `qta_` quota or quota override and `rol_` usage rollup. Objects that live in Kill Bill only, such as subscriptions, invoices and payments, keep their Kill Bill IDs. See [billing.md](billing.md). `idgen.ParseAs` rejects an ID with the wrong prefix before any query runs.
 
 ## Scope
 
@@ -137,7 +158,15 @@ An event envelope carries these fields:
 
 `outbox.Write` inserts the envelope in the caller's transaction. A `Relay` reads due events oldest first, hands each to a handler and marks it published on success. A failure is retried after 5 seconds, doubling up to 5 minutes, and the event is quarantined after 10 failures by default. A relay claims the events it reads for 5 minutes. If the relay crashes, the events become due again when the claim ends. A relay whose claim expired cannot mark an event published. Delivery is at least once. Consumers deduplicate on the event ID.
 
-A reader made with `WithEventTypes` claims only the listed event types. The first consumer is the Keycloak Organization mirror of tenants, which claims only `tenant.mirror` events. A relay for another consumer must not claim them. See [tenants.md](tenants.md#the-organization-mirror).
+A reader made with `WithEventTypes` claims only the listed event types. Some event types are internal: Core writes them for one of its own workers, and only that worker's reader names them. `outbox.InternalEventTypes` lists them:
+
+| Event type | Its only consumer |
+| --- | --- |
+| `tenant.mirror` | The Keycloak Organization mirror of tenants. See [tenants.md](tenants.md#the-organization-mirror). |
+| `wallet.settlement.requested` | The settlement relay of the wallet. See [wallet.md](wallet.md#settlement). |
+| `metering.usage.recorded` | The usage forwarder's wake-up. See [metering.md](metering.md#forwarding). |
+
+A reader without types, such as a relay that delivers events to products, claims every type except these. So it never takes work away from a Core worker. A new internal type is added to the list in the same change that writes it.
 
 ## HTTP behaviour
 
@@ -159,6 +188,9 @@ Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosni
 | `GET /v1/audit/events` | Audit events of the caller's brand or one of its tenants, staff `operator` only; see [audit.md](audit.md). |
 | `POST /v1/tenants/personal`, `POST /v1/tenants`, `/v1/tenants/{id}/...`, `POST /v1/invitations/accept`, `POST /v1/staff/tenants/{id}/activation` | Tenants, members, teams, invitations, activation, API keys and the tenant audit trail. See [tenants.md](tenants.md), [api-keys.md](api-keys.md) and `api/openapi.yaml`. |
 | `GET /v1/brands/{id}/catalogue`, the billing routes under `/v1/tenants/{id}/...`, `POST /v1/staff/tenants/{id}/credits`, `POST /v1/billing/webhooks/killbill/{brand}/{token}` | The billing surface on Kill Bill. See [billing.md](billing.md). |
+| `GET /v1/tenants/{id}/wallet`, `/v1/tenants/{id}/reservations/...` | The wallet view and reservations. See [wallet.md](wallet.md). |
+| `/v1/tenants/{id}/usage/...`, `GET, PUT /v1/brands/{id}/meters` | Metering. See [metering.md](metering.md). |
+| `/v1/tenants/{id}/entitlements/{feature}/...`, `GET, PUT /v1/brands/{id}/quotas`, `POST /v1/staff/tenants/{id}/quota-overrides` | Quotas and entitlements. See [quotas.md](quotas.md). |
 
 ## Known limits
 

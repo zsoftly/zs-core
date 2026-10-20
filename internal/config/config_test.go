@@ -193,3 +193,29 @@ func TestBillingSettings(t *testing.T) {
 		t.Fatalf("invalid = %v", err)
 	}
 }
+
+func TestWalletAndMeteringSettings(t *testing.T) {
+	cfg, err := Load([]string{dbURL})
+	if err != nil || cfg.WalletSweepInterval != DefaultWalletSweepInterval || cfg.MeteringForwardInterval != DefaultMeteringForward ||
+		cfg.WalletCreditCacheTTL != DefaultWalletCreditCacheTTL || cfg.QuotaSweepInterval != DefaultQuotaSweepInterval ||
+		cfg.UsagePartitionInterval != DefaultUsagePartition {
+		t.Fatalf("defaults = %+v %v", cfg, err)
+	}
+	cfg, err = Load([]string{dbURL, "ZS_QUOTA_SWEEP_INTERVAL=20s", "ZS_USAGE_PARTITION_INTERVAL=6h"})
+	if err != nil || cfg.QuotaSweepInterval != 20*time.Second || cfg.UsagePartitionInterval != 6*time.Hour {
+		t.Fatalf("sweeps = %+v %v", cfg, err)
+	}
+	if _, err := Load([]string{dbURL, "ZS_QUOTA_SWEEP_INTERVAL=0s", "ZS_USAGE_PARTITION_INTERVAL=-1h"}); err == nil ||
+		!strings.Contains(err.Error(), "ZS_QUOTA_SWEEP_INTERVAL") || !strings.Contains(err.Error(), "ZS_USAGE_PARTITION_INTERVAL") {
+		t.Fatalf("invalid sweeps = %v", err)
+	}
+	cfg, err = Load([]string{dbURL, "ZS_WALLET_SWEEP_INTERVAL=30s", "ZS_METERING_FORWARD_INTERVAL=2m", "ZS_WALLET_CREDIT_CACHE_TTL=2s"})
+	if err != nil || cfg.WalletSweepInterval != 30*time.Second || cfg.MeteringForwardInterval != 2*time.Minute || cfg.WalletCreditCacheTTL != 2*time.Second {
+		t.Fatalf("set = %+v %v", cfg, err)
+	}
+	_, err = Load([]string{dbURL, "ZS_WALLET_SWEEP_INTERVAL=0s", "ZS_METERING_FORWARD_INTERVAL=never", "ZS_WALLET_CREDIT_CACHE_TTL=2m"})
+	if err == nil || !strings.Contains(err.Error(), "ZS_WALLET_SWEEP_INTERVAL") || !strings.Contains(err.Error(), "ZS_METERING_FORWARD_INTERVAL") ||
+		!strings.Contains(err.Error(), "ZS_WALLET_CREDIT_CACHE_TTL must be at most 1m0s") {
+		t.Fatalf("invalid = %v", err)
+	}
+}

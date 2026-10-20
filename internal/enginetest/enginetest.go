@@ -1,6 +1,7 @@
 // Package enginetest is test support for the engines. It serves the
 // Keycloak Organizations endpoints and the Kill Bill endpoints Core uses
 // (accounts, catalogue, subscriptions, invoices, credits, external charges,
+// usage records with tracking ID deduplication and rolled-up usage,
 // payments, refunds, payment methods with the external payment plugin's
 // semantics, overdue and blocking states, push notification callbacks and
 // KPM node commands) from memory, over HTTP, so the real clients run against
@@ -82,6 +83,90 @@ type Fake struct {
 	nodes []killbill.NodeInfo
 	// requests records the audit headers of every Kill Bill write.
 	requests []KillBillWrite
+	// lose counts the next writes, by path prefix, that take effect and
+	// then answer 503, as a lost answer looks to Core.
+	lose map[string]int
+	// afterWrite is called after every Kill Bill write the fake took.
+	afterWrite func(method, path string)
+	// dryRunDown makes dry-run invoices answer 500.
+	dryRunDown bool
+	// delays slow the Kill Bill writes whose path starts with a prefix, as
+	// a slow Kill Bill does. The wait happens before the fake is locked,
+	// so other calls go on meanwhile.
+	delays map[string]time.Duration
+	// fail answers the next writes, by path prefix, with a status and
+	// takes no effect.
+	fail map[string]failure
+}
+
+type failure struct {
+	n, status int
+}
+
+// FailWrites makes the next n Kill Bill writes whose path starts with
+// prefix answer status and take no effect: 503 is a Kill Bill that cannot
+// take the write, 400 one that refuses it.
+func (f *Fake) FailWrites(prefix string, n, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail == nil {
+		f.fail = map[string]failure{}
+	}
+	f.fail[prefix] = failure{n: n, status: status}
+}
+
+// SetWriteDelay makes every Kill Bill write whose path starts with prefix
+// wait d before the fake serves it. Zero removes the delay.
+func (f *Fake) SetWriteDelay(prefix string, d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.delays == nil {
+		f.delays = map[string]time.Duration{}
+	}
+	f.delays[prefix] = d
+}
+
+func (f *Fake) delayOf(r *http.Request) time.Duration {
+	if r.Method == http.MethodGet {
+		return 0
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	path := strings.TrimPrefix(r.URL.Path, "/kb")
+	for prefix, d := range f.delays {
+		if strings.HasPrefix(path, prefix) {
+			return d
+		}
+	}
+	return 0
+}
+
+// LoseAnswers makes the next n Kill Bill writes whose path starts with
+// prefix, such as /1.0/kb/usages, take effect and then answer 503, as when
+// the answer is lost on the way back.
+func (f *Fake) LoseAnswers(prefix string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lose == nil {
+		f.lose = map[string]int{}
+	}
+	f.lose[prefix] = n
+}
+
+// AfterWrite calls fn after every Kill Bill write the fake took, with the
+// method and the path, while the fake is locked. fn must not call the fake.
+func (f *Fake) AfterWrite(fn func(method, path string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.afterWrite = fn
+}
+
+// SetDryRunDown makes dry-run invoices answer 500 while the rest of Kill
+// Bill answers.
+func (f *Fake) SetDryRunDown(down bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dryRunDown = down
 }
 
 // RejectedAccounts returns how many account creations the fake refused
@@ -189,6 +274,9 @@ func reply(w http.ResponseWriter, status int, v any) {
 }
 
 func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
+	if d := f.delayOf(r); d > 0 {
+		time.Sleep(d)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	body, _ := io.ReadAll(r.Body)
@@ -204,7 +292,34 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "down", http.StatusServiceUnavailable)
 			return
 		}
-		f.serveKillBill(w, r, strings.TrimPrefix(r.URL.Path, "/kb"), body)
+		path := strings.TrimPrefix(r.URL.Path, "/kb")
+		for prefix, fl := range f.fail {
+			if fl.n > 0 && r.Method != http.MethodGet && strings.HasPrefix(path, prefix) {
+				f.fail[prefix] = failure{n: fl.n - 1, status: fl.status}
+				if fl.status >= 500 {
+					http.Error(w, "unavailable", fl.status)
+				} else {
+					reply(w, fl.status, map[string]any{"code": 2, "message": "refused"})
+				}
+				return
+			}
+		}
+		lost := false
+		for prefix, n := range f.lose {
+			if n > 0 && r.Method != http.MethodGet && strings.HasPrefix(path, prefix) {
+				f.lose[prefix] = n - 1
+				lost = true
+			}
+		}
+		if lost {
+			f.serveKillBill(httptest.NewRecorder(), r, path, body)
+			http.Error(w, "answer lost", http.StatusServiceUnavailable)
+		} else {
+			f.serveKillBill(w, r, path, body)
+		}
+		if r.Method != http.MethodGet && f.afterWrite != nil {
+			f.afterWrite(r.Method, path)
+		}
 	default:
 		http.NotFound(w, r)
 	}

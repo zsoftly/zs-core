@@ -13,6 +13,8 @@
 //	zs-core tenant sweep   run one pass of the tenant sweeper
 //	zs-core credit-code add|list|disable  manage the promo and voucher codes of a brand
 //	zs-core credit sweep   run one pass of the credit expiry sweeper
+//	zs-core wallet sweep   expire reservations past their lease and reconcile wallets once
+//	zs-core usage forward  forward recorded usage to Kill Bill once
 //
 // Configuration comes from the environment only; see docs/configuration.md.
 package main
@@ -72,6 +74,8 @@ Commands:
   credit-code disable  disable a code; credits already redeemed stay
                    --brand <slug> --id <ccd_...> --reason <text> --operator <name>
   credit sweep   expire the credits Core issued that are past their expiry, once
+  wallet sweep   expire reservations past their lease and reconcile every wallet with Kill Bill, once
+  usage forward  forward recorded usage to Kill Bill as usage records, once
 
 Configuration is read from ZS_* environment variables; see docs/configuration.md.
 `
@@ -106,6 +110,10 @@ func run(args, environ []string, stdout, stderr io.Writer) int {
 		return runCreditCode(args[1:], environ, stdout, stderr)
 	case "credit":
 		return runCreditSweep(args[1:], environ, stdout, stderr)
+	case "wallet":
+		return runWalletSweep(args[1:], environ, stdout, stderr)
+	case "usage":
+		return runUsageForward(args[1:], environ, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -179,6 +187,7 @@ func serve(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	}
 	startTenantSweeper(ctx, pool, api.Tenants, cfg.TenantSweepInterval, log)
 	startCreditSweeper(ctx, api.Billing, cfg.CreditSweepInterval, log)
+	startExtensions(ctx, pool, api, cfg, log)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,

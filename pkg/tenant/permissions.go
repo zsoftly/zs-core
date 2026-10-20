@@ -24,6 +24,9 @@ var Builtin = []string{
 	"apikey:create", "apikey:read", "apikey:revoke",
 	"billing:read", "billing:manage",
 	"audit:read",
+	"wallet:reserve",
+	"usage:write", "usage:read",
+	"quota:consume",
 }
 
 // Role is the role of a membership.
@@ -50,6 +53,22 @@ func (r Role) Valid() bool {
 // hold it through their role.
 const TransferPermission = "tenant:transfer"
 
+// WorkloadPermissions hold credit, record usage and take quota for a
+// product's own work. No role but owner implies them: a team grants them,
+// or a service API key carries them. A hold or a quota lease belongs to the
+// membership or API key that made it, so a customer role cannot settle,
+// release or break a product's holds.
+var WorkloadPermissions = []string{"wallet:reserve", "usage:write", "quota:consume"}
+
+func workload(p string) bool {
+	for _, w := range WorkloadPermissions {
+		if w == p {
+			return true
+		}
+	}
+	return false
+}
+
 var permissionPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*$`)
 
 // ValidPermission reports whether p has the resource:action form.
@@ -64,8 +83,9 @@ func resourceOf(p string) string {
 // registered permissions:
 //
 //   - owner: every registered permission.
-//   - admin: every registered permission except billing:* and
-//     tenant:transfer. An admin manages members and teams but not billing.
+//   - admin: every registered permission except billing:*,
+//     tenant:transfer and WorkloadPermissions. An admin manages members and
+//     teams but not billing or a product's holds.
 //   - billing_admin: billing:* only.
 //   - member: none. A member has what its teams grant.
 func RoleImplies(role Role, registered []string) []string {
@@ -76,7 +96,7 @@ func RoleImplies(role Role, registered []string) []string {
 		case RoleOwner:
 			out = append(out, p)
 		case RoleAdmin:
-			if !billing && p != TransferPermission {
+			if !billing && p != TransferPermission && !workload(p) {
 				out = append(out, p)
 			}
 		case RoleBillingAdmin:

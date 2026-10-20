@@ -204,7 +204,7 @@ func Apply(ctx context.Context, deps Deps, m *Manifest, opts Options) (Diff, err
 	}
 	defer func() { _ = lock.Rollback(context.WithoutCancel(ctx)) }()
 	var locked bool
-	if err := lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.brand.apply:' || $1, 0))`, m.Slug).Scan(&locked); err != nil {
+	if err := lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.brand.apply:' || current_schema() || ':' || $1, 0))`, m.Slug).Scan(&locked); err != nil {
 		return Diff{}, zserrors.Wrap(zserrors.CodeDatabaseUnavailable, "", err)
 	}
 	if !locked {
@@ -308,6 +308,11 @@ func makePlan(ctx context.Context, deps Deps, m *Manifest, opts Options) (*plan,
 		return nil, mapUpstream(err)
 	}
 	p.diff.Changes = append(p.diff.Changes, kb...)
+	ext, err := planExtensions(ctx, deps, p, m, resolved, files)
+	if err != nil {
+		return nil, mapUpstream(err)
+	}
+	p.diff.Changes = append(p.diff.Changes, ext...)
 
 	var prev *Manifest
 	if p.record != nil {
@@ -659,6 +664,8 @@ var auditActions = map[string]string{
 	TargetPluginConfig:         "brand.killbill.plugin_config",
 	TargetPlugin:               "brand.killbill.plugin",
 	TargetNotificationCallback: "brand.killbill.notification_callback",
+	TargetMeters:               "brand.meters",
+	TargetQuotas:               "brand.quotas",
 }
 
 func actionFor(ch Change) string {

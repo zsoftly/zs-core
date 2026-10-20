@@ -54,7 +54,14 @@ It dumps the `keycloak` and `killbill` databases and proves the Keycloak dump re
 1. `make doctor` is green: health, version against the pin, and each installed plugin against its pin.
 2. `deploy/compose/rehearsal/check.sh > after.txt` and `diff before.txt after.txt`. Only the server version line differs. The tenant, catalogue plan, account, subscription and row counts must match.
 3. Open KAUI at `http://127.0.0.1:9090` through the SSH forward, choose the `zs-reference` tenant and open the rehearsal account.
-4. Run the Phase 4 gate tests against the stack once they exist.
+4. Run the Phase 4 gate tests against the stack: `TestBillingOnTheStack` and `TestExtensionsOnTheStack` in `internal/stacktest`. See [../development.md](../development.md#tests-against-the-reference-stack).
+5. Check the usage behaviours the extensions rely on. A new version could change them:
+   - Kill Bill refuses a known tracking ID per subscription with HTTP 400 and error code 50000.
+   - Kill Bill leaves usage dated before a subscription's start off the invoice.
+   - `GET /1.0/kb/usages/{subscriptionId}` needs both dates.
+   - A `TARGET_DATE` dry-run invoice a month and a day ahead returns the unbilled usage, and the applied credit as a separate `CBA_ADJ` item.
+
+   The extensions stack test covers the tracking ID refusal, the dry-run amount and the invoice of forwarded usage. Check the other two by hand. See [../modules/metering.md](../modules/metering.md#what-kill-bill-does-with-it).
 
 ## Roll back
 

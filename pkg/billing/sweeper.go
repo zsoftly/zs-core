@@ -109,7 +109,7 @@ type dueCredit struct {
 }
 
 // sweepLockKey is the advisory lock of a pass.
-const sweepLockKey = `hashtextextended('zs-core.credit.sweep', 0)`
+const sweepLockKey = `hashtextextended('zs-core.credit.sweep:' || current_schema(), 0)`
 
 // errSweepDeferred marks a credit left for a later pass without a failure.
 var errSweepDeferred = errors.New("credit expiry deferred")
@@ -305,9 +305,24 @@ func (c *CreditSweeper) expire(ctx context.Context, d dueCredit, correlationID s
 	if err != nil {
 		return 0, err
 	}
-	charge, err := s.KillBill.CreateExternalCharge(ctx, a.creds, call.kb(), killbillItem(a.id(), amount, d.currency, desc))
+	// The charge lowers the Kill Bill credit and no hold covers it. It is
+	// written under the tenant's wallet lock, and the wallet version moves
+	// on before the lock is released, so no Core instance reserves against
+	// the credit it had before.
+	var charge killbill.InvoiceItem
+	err = inTx(ctx, s.DB, func(tx pgx.Tx) error {
+		if err := LockWallet(ctx, tx, sc); err != nil {
+			return err
+		}
+		var err error
+		charge, err = s.KillBill.CreateExternalCharge(ctx, a.creds, call.kb(), killbillItem(a.id(), amount, d.currency, desc))
+		if err != nil {
+			return kbError(err)
+		}
+		return BumpWalletVersion(context.WithoutCancel(ctx), tx, sc)
+	})
 	if err != nil {
-		return 0, kbError(err)
+		return 0, err
 	}
 	return unused, c.record(ctx, sc, d, unused, charge.InvoiceItemID, call)
 }
@@ -393,6 +408,11 @@ func (c *CreditSweeper) record(ctx context.Context, sc scope.Scope, d dueCredit,
 		}
 		if tag.RowsAffected() == 0 {
 			return nil
+		}
+		if reversed > 0 {
+			if err := BumpWalletVersion(ctx, tx, sc); err != nil {
+				return err
+			}
 		}
 		action := "billing.credit.expired"
 		details := map[string]any{"credit_id": idgen.Format(idgen.Credit, d.id), "amount_minor": d.amountMinor,

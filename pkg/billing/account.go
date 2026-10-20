@@ -64,6 +64,21 @@ func (st standing) holdsEntitlement() bool {
 // standing reads the overdue state and the blocking states of the tenant's
 // Kill Bill account, and refreshes the standing cache.
 func (s *Service) standing(ctx context.Context, a account) (standing, error) {
+	st, err := s.readStanding(ctx, a)
+	if err != nil {
+		return standing{}, err
+	}
+	if err := s.saveStanding(ctx, s.DB, a.tenant.Scope(), st.overdue, ""); err != nil {
+		// The cache is a convenience; Kill Bill answered, so the caller
+		// gets the answer.
+		s.log().WarnContext(ctx, "billing standing cache not updated", "error", err.Error())
+	}
+	return st, nil
+}
+
+// readStanding reads the overdue state and the blocking states of the
+// tenant's Kill Bill account and writes nothing.
+func (s *Service) readStanding(ctx context.Context, a account) (standing, error) {
 	od, err := s.KillBill.AccountOverdue(ctx, a.creds, a.id())
 	if err != nil {
 		return standing{}, kbError(err)
@@ -85,11 +100,6 @@ func (s *Service) standing(ctx context.Context, a account) (standing, error) {
 	}
 	if od.IsDisableEntitlementAndChangesBlocked {
 		st.reasons = append(st.reasons, HoldOverdueDisablesEntitlement)
-	}
-	if err := s.saveStanding(ctx, s.DB, a.tenant.Scope(), st.overdue, ""); err != nil {
-		// The cache is a convenience; Kill Bill answered, so the caller
-		// gets the answer.
-		s.log().WarnContext(ctx, "billing standing cache not updated", "error", err.Error())
 	}
 	return st, nil
 }

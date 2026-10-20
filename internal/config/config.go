@@ -49,6 +49,11 @@ const (
 	EnvKillBillWebhookSecret   = "ZS_KILLBILL_WEBHOOK_SECRET"
 	EnvKillBillCallbackURL     = "ZS_KILLBILL_CALLBACK_URL"
 	EnvCreditSweepInterval     = "ZS_CREDIT_SWEEP_INTERVAL"
+	EnvWalletSweepInterval     = "ZS_WALLET_SWEEP_INTERVAL"
+	EnvMeteringForwardInterval = "ZS_METERING_FORWARD_INTERVAL"
+	EnvWalletCreditCacheTTL    = "ZS_WALLET_CREDIT_CACHE_TTL"
+	EnvQuotaSweepInterval      = "ZS_QUOTA_SWEEP_INTERVAL"
+	EnvUsagePartitionInterval  = "ZS_USAGE_PARTITION_INTERVAL"
 	reservedTestVariablePrefix = "ZS_TEST_"
 )
 
@@ -66,7 +71,16 @@ const (
 	DefaultShutdownTimeout       = 15 * time.Second
 	DefaultTenantSweepInterval   = time.Minute
 	DefaultCreditSweepInterval   = time.Hour
-	maxDatabaseMaxConns          = 1000
+	DefaultWalletSweepInterval   = time.Minute
+	DefaultMeteringForward       = time.Minute
+	DefaultWalletCreditCacheTTL  = 5 * time.Second
+	DefaultQuotaSweepInterval    = time.Minute
+	DefaultUsagePartition        = time.Hour
+	// maxWalletCreditCacheTTL caps ZS_WALLET_CREDIT_CACHE_TTL. A longer
+	// cache would let reservations rely on a Kill Bill credit long out of
+	// date.
+	maxWalletCreditCacheTTL = time.Minute
+	maxDatabaseMaxConns     = 1000
 	// minWebhookSecretLength is the shortest ZS_KILLBILL_WEBHOOK_SECRET.
 	minWebhookSecretLength = 32
 )
@@ -81,6 +95,8 @@ var known = map[string]bool{
 	EnvKillBillAdminPassword: true, EnvKAUIURL: true,
 	EnvKeycloakAdminClientID: true, EnvKeycloakAdminSecret: true, EnvBrandsDir: true, EnvSecretsDir: true,
 	EnvTenantSweepInterval: true, EnvKillBillWebhookSecret: true, EnvKillBillCallbackURL: true, EnvCreditSweepInterval: true,
+	EnvWalletSweepInterval: true, EnvMeteringForwardInterval: true, EnvWalletCreditCacheTTL: true,
+	EnvQuotaSweepInterval: true, EnvUsagePartitionInterval: true,
 }
 
 // Config is the validated service configuration.
@@ -139,6 +155,27 @@ type Config struct {
 
 	// CreditSweepInterval is how often serve expires credits Core issued.
 	CreditSweepInterval time.Duration
+
+	// WalletSweepInterval is how often serve expires reservations past
+	// their lease, drives the settlements that wait for Kill Bill and
+	// reconciles the wallet view with Kill Bill.
+	WalletSweepInterval time.Duration
+
+	// QuotaSweepInterval is how often serve releases concurrent quota
+	// leases past their expiry.
+	QuotaSweepInterval time.Duration
+
+	// UsagePartitionInterval is how often serve makes sure the usage event
+	// partitions of the current month and the next three exist.
+	UsagePartitionInterval time.Duration
+
+	// MeteringForwardInterval is how often serve forwards recorded usage
+	// to Kill Bill, besides the forward each recording triggers.
+	MeteringForwardInterval time.Duration
+
+	// WalletCreditCacheTTL is how long a reservation may rely on the Kill
+	// Bill account credit it last read. At most one minute.
+	WalletCreditCacheTTL time.Duration
 }
 
 // Load reads the configuration from environ, a list of KEY=value strings as
@@ -159,17 +196,22 @@ func Load(environ []string) (Config, error) {
 	}
 
 	cfg := Config{
-		DatabaseMaxConns:      DefaultDatabaseMaxConns,
-		ListenAddr:            DefaultListenAddr,
-		LogFormat:             DefaultLogFormat,
-		MigrateOnStart:        DefaultMigrateOnStart,
-		HTTPReadHeaderTimeout: DefaultHTTPReadHeaderTimeout,
-		HTTPReadTimeout:       DefaultHTTPReadTimeout,
-		HTTPWriteTimeout:      DefaultHTTPWriteTimeout,
-		HTTPIdleTimeout:       DefaultHTTPIdleTimeout,
-		ShutdownTimeout:       DefaultShutdownTimeout,
-		TenantSweepInterval:   DefaultTenantSweepInterval,
-		CreditSweepInterval:   DefaultCreditSweepInterval,
+		DatabaseMaxConns:        DefaultDatabaseMaxConns,
+		ListenAddr:              DefaultListenAddr,
+		LogFormat:               DefaultLogFormat,
+		MigrateOnStart:          DefaultMigrateOnStart,
+		HTTPReadHeaderTimeout:   DefaultHTTPReadHeaderTimeout,
+		HTTPReadTimeout:         DefaultHTTPReadTimeout,
+		HTTPWriteTimeout:        DefaultHTTPWriteTimeout,
+		HTTPIdleTimeout:         DefaultHTTPIdleTimeout,
+		ShutdownTimeout:         DefaultShutdownTimeout,
+		TenantSweepInterval:     DefaultTenantSweepInterval,
+		CreditSweepInterval:     DefaultCreditSweepInterval,
+		WalletSweepInterval:     DefaultWalletSweepInterval,
+		MeteringForwardInterval: DefaultMeteringForward,
+		WalletCreditCacheTTL:    DefaultWalletCreditCacheTTL,
+		QuotaSweepInterval:      DefaultQuotaSweepInterval,
+		UsagePartitionInterval:  DefaultUsagePartition,
 	}
 	fail := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 
@@ -259,6 +301,14 @@ func Load(environ []string) (Config, error) {
 	parseDuration(EnvShutdownTimeout, &cfg.ShutdownTimeout)
 	parseDuration(EnvTenantSweepInterval, &cfg.TenantSweepInterval)
 	parseDuration(EnvCreditSweepInterval, &cfg.CreditSweepInterval)
+	parseDuration(EnvWalletSweepInterval, &cfg.WalletSweepInterval)
+	parseDuration(EnvMeteringForwardInterval, &cfg.MeteringForwardInterval)
+	parseDuration(EnvWalletCreditCacheTTL, &cfg.WalletCreditCacheTTL)
+	parseDuration(EnvQuotaSweepInterval, &cfg.QuotaSweepInterval)
+	parseDuration(EnvUsagePartitionInterval, &cfg.UsagePartitionInterval)
+	if cfg.WalletCreditCacheTTL > maxWalletCreditCacheTTL {
+		fail("%s must be at most %s", EnvWalletCreditCacheTTL, maxWalletCreditCacheTTL)
+	}
 
 	parseURL := func(name string, target *string) {
 		v, ok := env[name]

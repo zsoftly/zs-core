@@ -205,29 +205,6 @@ func (s *server) cancelSubscription(w http.ResponseWriter, r *http.Request) {
 	s.writeAs(w, r, http.StatusOK, sub, &gen.Subscription{})
 }
 
-func (s *server) checkEntitlement(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	if err := scope.Require(ctx, "tenant:read"); err != nil {
-		s.writeError(w, r, err)
-		return
-	}
-	feature := r.PathValue("feature")
-	if !billing.ValidFeature(feature) {
-		s.writeError(w, r, zserrors.New(zserrors.CodeValidation, "The feature must be 1 to 100 letters, digits, dots, colons, dashes or underscores."))
-		return
-	}
-	sc, _ := scope.FromContext(ctx)
-	// The check fails closed: without the billing settings it answers
-	// allowed false, never an error.
-	var e billing.Entitlement
-	if s.billing.Ready() {
-		e = s.billing.CheckEntitlement(ctx, sc, feature)
-	} else {
-		e = billing.Entitlement{Reason: billing.ReasonBillingUnavailable}
-	}
-	s.writeAs(w, r, http.StatusOK, e, &gen.Entitlement{})
-}
-
 func (s *server) listInvoices(w http.ResponseWriter, r *http.Request) {
 	svc, sc, _, ok := s.tenantBilling(w, r, "billing:read")
 	if !ok {

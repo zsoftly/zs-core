@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-The audit module records who did what, to which tenant, and with what result. Every write in Core appends one event in the same transaction as the change, so the event exists exactly when the change does. Each event carries the actor, brand, tenant, action, reason, outcome and a correlation ID. The table refuses `UPDATE`, `DELETE` and `TRUNCATE`. A correction is a new event. Queries always name one brand and one tenant, filter by actor, action and time, and page newest first with an opaque cursor. Export is Phase 6.
+The audit module records who did what, to which tenant, and with what result. Every write in Core appends one event in the same transaction as the change, so the event exists exactly when the change does. Each event carries the actor, brand, tenant, action, reason, outcome and a correlation ID. The table refuses `UPDATE`, `DELETE` and `TRUNCATE`. A correction is a new event. Tenant queries always name one brand and one tenant. Brand events, such as a brand apply or a staff grant, belong to one brand and no tenant and are queried separately. Queries filter by actor, action and time, and page newest first with an opaque cursor. Export is Phase 6.
 
 ## Writing events
 
@@ -49,17 +49,21 @@ Results are ordered by `occurred_at` then ID, newest first. The cursor encodes t
 
 ## HTTP
 
-`GET /v1/audit/events` exposes the same query. Query parameters are `limit`, `cursor`, `actor_id`, `action`, `occurred_after` and `occurred_before` (RFC 3339). The response is:
+`GET /v1/audit/events` exposes the same queries to staff with an `operator` grant in the token's brand; Phase 3b adds a route for tenant members. With `tenant_id` it returns that tenant's events inside the caller's brand. Without it, it returns the brand events. The other query parameters are `limit`, `cursor`, `actor_id`, `action`, `occurred_after` and `occurred_before` (RFC 3339). The response is:
 
 ```json
 {"data": [{"id": "aud_...", "brand_id": "brd_...", "tenant_id": "tnt_...",
            "actor": {"type": "user", "id": "..."}, "action": "tenant.member.added",
            "reason": "...", "outcome": "success", "correlation_id": "...",
-           "occurred_at": "2026-10-20T12:00:00.123456Z"}],
+           "occurred_at": "2026-10-20T12:00:00.123456Z", "details": {}}],
  "next_cursor": null}
 ```
 
-In Phase 1 the scope comes from the `X-ZS-Brand` and `X-ZS-Tenant` headers when trusted scope headers are enabled; see [configuration.md](../configuration.md).
+`tenant_id` is null for a brand event. `details` is present when the event carries structured detail.
+
+## Brand events
+
+Some writes belong to a brand and no tenant. These are each change of a brand apply, the recorded manifest, staff grants and new identities. `audit.WriteBrand(ctx, tx, brand, entry)` stores them with a NULL tenant, and `audit.QueryBrand(ctx, db, brand, filter)` reads them. A tenant query never returns them, because it filters on `tenant_id = $2`. `Entry.Details` holds structured detail, such as the diff of a change, up to 64 KiB. It never holds a secret. Brand apply writes redacted fields without values.
 
 ## Isolation
 
@@ -67,4 +71,4 @@ In Phase 1 the scope comes from the `X-ZS-Brand` and `X-ZS-Tenant` headers when 
 
 ## Storage
 
-Table `audit_events`, created by `migrations/000003_audit_events.up.sql`. Indexes cover brand, tenant and time, with variants for actor and action. A trigger rejects every `UPDATE`, `DELETE` and `TRUNCATE`.
+Table `audit_events`, created by `migrations/000003_audit_events.up.sql`. `migrations/000007_brand_audit_events.up.sql` allows a NULL tenant for brand events and adds `details`. Indexes cover brand, tenant and time, with variants for actor and action. A trigger rejects every `UPDATE`, `DELETE` and `TRUNCATE`.

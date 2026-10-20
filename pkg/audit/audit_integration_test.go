@@ -4,6 +4,7 @@ package audit_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/zsoftly/zs-core/pkg/audit"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/events"
+	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/scope"
 )
 
@@ -54,7 +56,7 @@ func TestWriteAndQueryRoundTrip(t *testing.T) {
 		t.Fatalf("page = %+v", page)
 	}
 	got := page.Events[0]
-	if got != written {
+	if !reflect.DeepEqual(got, written) {
 		t.Fatalf("read %+v, wrote %+v", got, written)
 	}
 }
@@ -229,5 +231,41 @@ func TestIsolation(t *testing.T) {
 		if !zserrors.IsCode(err, zserrors.CodeScopeRequired) {
 			t.Errorf("partial scope write %+v: err = %v", partial, err)
 		}
+	}
+}
+
+func TestBrandEventsAreSeparateFromTenantEvents(t *testing.T) {
+	db := postgrestest.New(t)
+	ctx := context.Background()
+	s := postgrestest.NewScope(t)
+	otherBrand := postgrestest.NewScope(t).Brand
+	write := func(fn func(tx pgx.Tx) error) {
+		t.Helper()
+		if err := pgx.BeginFunc(ctx, db.Pool, fn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry := audit.Entry{Actor: events.Actor{Type: events.ActorService, ID: "zs-core-cli:test"}, Action: "brand.keycloak.realm.updated",
+		Outcome: audit.OutcomeSuccess, CorrelationID: "c", Details: map[string]any{"change": map[string]any{"field": "identity.login_theme"}}}
+	write(func(tx pgx.Tx) error { _, err := audit.WriteBrand(ctx, tx, s.Brand, entry); return err })
+	write(func(tx pgx.Tx) error { _, err := audit.WriteBrand(ctx, tx, otherBrand, entry); return err })
+	write(func(tx pgx.Tx) error { _, err := audit.Write(ctx, tx, s, entry); return err })
+
+	page, err := audit.QueryBrand(ctx, db.Pool, s.Brand, audit.Filter{})
+	if err != nil || len(page.Events) != 1 || page.Events[0].TenantID != "" || page.Events[0].BrandID != s.BrandID() {
+		t.Fatalf("brand events = %+v, %v", page.Events, err)
+	}
+	if got := page.Events[0].Details["change"].(map[string]any)["field"]; got != "identity.login_theme" {
+		t.Fatalf("details = %+v", page.Events[0].Details)
+	}
+	page, err = audit.Query(ctx, db.Pool, s, audit.Filter{})
+	if err != nil || len(page.Events) != 1 || page.Events[0].TenantID != s.TenantID() {
+		t.Fatalf("tenant events = %+v, %v", page.Events, err)
+	}
+	if err := pgx.BeginFunc(ctx, db.Pool, func(tx pgx.Tx) error {
+		_, err := audit.WriteBrand(ctx, tx, idgen.Nil, entry)
+		return err
+	}); err == nil {
+		t.Fatal("brand event without a brand was written")
 	}
 }

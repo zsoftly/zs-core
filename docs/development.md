@@ -24,7 +24,7 @@ You need Go 1.26.1 or later and a Postgres server. Postgres 18 is what the stack
 ## Run the service
 
 ```bash
-cp .env.example .env            # then edit ZS_DATABASE_URL
+cp .env.example .env            # then edit ZS_DATABASE_URL and ZS_KEYCLOAK_URL
 set -a; . ./.env; set +a
 make build
 bin/zs-core serve
@@ -37,14 +37,13 @@ curl -i http://127.0.0.1:8080/healthz
 curl -i http://127.0.0.1:8080/readyz
 ```
 
-To try the audit route, start with `ZS_DEV_TRUSTED_SCOPE_HEADERS=true` on a loopback address and send a brand and tenant:
+Every `/v1` route needs a Keycloak access token from the realm of an applied brand, sent as `Authorization: Bearer <token>`:
 
 ```bash
-curl -s http://127.0.0.1:8080/v1/audit/events \
-  -H 'X-ZS-Brand: brd_<id>' -H 'X-ZS-Tenant: tnt_<id>'
+curl -s http://127.0.0.1:8080/v1/me -H "Authorization: Bearer $TOKEN"
 ```
 
-The list is empty until a library caller writes audit events. Phase 1 has no HTTP write route.
+A brand is applied with `zs-core brand apply` (below) before its tokens are accepted. Staff routes also need a staff grant from `zs-core grant add`.
 
 ## Operator commands
 
@@ -54,7 +53,16 @@ bin/zs-core doctor --json       # the same report as JSON
 bin/zs-core doctor --allow-skips   # exit 0 despite SKIP findings (a pin not checked)
 bin/zs-core upgrade check       # newer upstream versions; changes nothing
 bin/zs-core upgrade check --strict   # exit 1 if a release feed cannot be read
+bin/zs-core brand diff brands/zs-reference.yaml      # what apply would change; changes nothing
+bin/zs-core brand apply --operator <you> --reason '<why>' brands/zs-reference.yaml
+bin/zs-core grant add --brand zs-reference --subject <keycloak user id> --scope operator \
+  --reason '<why>' --operator <you>
+bin/zs-core grant revoke --brand zs-reference --subject <keycloak user id> --scope operator \
+  --reason '<why>' --operator <you>
+bin/zs-core grant list --brand zs-reference
 ```
+
+`brand diff` and `brand apply` print the diff as JSON. They need the database with migrations applied and the Keycloak and Kill Bill admin settings. `grant add` and `grant revoke` read the realm issuer from Keycloak discovery unless you pass `--issuer`. They refuse an issuer of another realm. `brand apply` reads the manifest's secrets from `BRAND_<SLUG>__` variables, such as `BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET`. See [modules/brands.md](modules/brands.md).
 
 `doctor` checks the database (reachable, migrations, Postgres major version, clock skew), Keycloak, Kill Bill and KAUI against `components.yaml`. It needs `ZS_DATABASE_URL` and the component settings listed in [configuration.md](configuration.md). `upgrade check` needs no configuration. It reads GitHub releases for Keycloak and Kill Bill and Docker Hub tags for KAUI, prints a warning and exits 0 when a feed fails, and uses `GITHUB_TOKEN` if set to raise the GitHub rate limit. Both read `components.yaml` from the working directory unless `--components` says otherwise.
 
@@ -92,6 +100,32 @@ Testcontainers checks `DOCKER_HOST` first, then other Docker sockets. A wrong `D
 make test-integration
 ZS_TEST_POSTGRES_URL='postgres://zs:zs-test@127.0.0.1:55432/zs_core_test?sslmode=disable' make test-integration
 ```
+
+### Tests against the reference stack
+
+`internal/stacktest` holds the tests that need a running Keycloak and Kill Bill. They apply `brands/zs-reference.yaml` twice and expect an empty second diff. They change the login theme and the MFA policy and expect exactly those two fields in the diff and in audit. They use real tokens from the password grant against `GET /v1/me` and the staff routes. Over HTTP they check that a sensitive change without recent MFA is refused, that another brand's secrets and files are out of reach, and that changing only a payment plugin's `config_ref` is gated. They apply a second brand, `zs-second`, and check that it cannot act in `zs-reference`. They set `zs-second` to `mfa: required` and check in Keycloak that every identity provider runs the `zs-post-broker-mfa` flow, then set it back. The tests skip unless `ZS_TEST_KEYCLOAK_URL` is set. They change the stack. Run them only on a build host stack after `make stack-up` and `make stack-bootstrap`. Run `make stack-reset` afterwards.
+
+| Variable | Value on the reference stack |
+| --- | --- |
+| `ZS_TEST_KEYCLOAK_URL` | `http://127.0.0.1:8180` |
+| `ZS_TEST_KEYCLOAK_ADMIN_USER`, `ZS_TEST_KEYCLOAK_ADMIN_PASSWORD` | `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` from `deploy/compose/.env` |
+| `ZS_TEST_KILLBILL_URL` | `http://127.0.0.1:8081` |
+| `ZS_TEST_KILLBILL_ADMIN_PASSWORD` | `KILLBILL_ADMIN_PASSWORD` |
+| `BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET` | `ZS_STAFF_CLIENT_SECRET` |
+| `BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET` | `KILLBILL_TENANT_API_SECRET` |
+
+```bash
+set -a; . deploy/compose/.env; set +a
+ZS_TEST_POSTGRES_URL="postgres://postgres:$POSTGRES_PASSWORD@127.0.0.1:5432/zs_core_test?sslmode=disable" \
+ZS_TEST_KEYCLOAK_URL=http://127.0.0.1:8180 ZS_TEST_KEYCLOAK_ADMIN_USER="$KEYCLOAK_ADMIN_USER" \
+ZS_TEST_KEYCLOAK_ADMIN_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD" ZS_TEST_KILLBILL_URL=http://127.0.0.1:8081 \
+ZS_TEST_KILLBILL_ADMIN_PASSWORD="$KILLBILL_ADMIN_PASSWORD" \
+BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET="$ZS_STAFF_CLIENT_SECRET" \
+BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET="$KILLBILL_TENANT_API_SECRET" \
+  go test -tags integration -count=1 ./internal/stacktest/
+```
+
+The `zs_core_test` database must exist on the stack's Postgres; the tests create and drop their own schemas in it.
 
 ## OpenAPI and generated types
 

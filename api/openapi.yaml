@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ZSoftly Core API
-  version: 0.1.0
+  version: 0.2.0
   summary: The /v1 HTTP surface of ZSoftly Core.
   description: |
     ZSoftly Core serves tenants, wallets, metering, catalogue, payments,
@@ -14,12 +14,15 @@ info:
     `limit` and `cursor` in and `next_cursor` out. Commands that change state
     carry an `idempotency_key` field in the request body.
 
-    Phase 1 has no authentication. The brand and tenant scope of a `/v1`
-    request come from the `X-ZS-Brand` and `X-ZS-Tenant` headers, and only
-    when the server runs with `ZS_DEV_TRUSTED_SCOPE_HEADERS=true` on a
-    loopback address. Otherwise every `/v1` request returns `401
-    unauthenticated`. Phase 2 replaces the headers with Keycloak tokens and
-    API keys.
+    Every `/v1` request carries a Keycloak access token as `Authorization:
+    Bearer <token>`. The token's issuer (one realm per brand) and its
+    audience and authorized party (clients the brand's manifest declares)
+    choose the brand. A token never acts outside its brand. An unknown realm
+    or client is `401 token_audience_unknown`, any other defect is `401
+    token_invalid`, and when the signing keys or the database cannot be
+    reached the answer is `503 authentication_unavailable`, never 401.
+    Staff routes also need an active staff grant with the named scope in the
+    same brand; without one they answer `404 not_found`.
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -29,6 +32,10 @@ servers:
 tags:
   - name: health
     description: Process and readiness probes.
+  - name: identity
+    description: The caller's identity.
+  - name: brands
+    description: Brands and brand apply. Staff `operator` only.
   - name: audit
     description: The append-only audit trail.
 paths:
@@ -64,18 +71,134 @@ paths:
               schema: {$ref: "#/components/schemas/HealthStatus"}
         "503":
           $ref: "#/components/responses/Unavailable"
+  /v1/me:
+    get:
+      tags: [identity]
+      operationId: getMe
+      summary: Return the caller's identity.
+      description: |
+        Returns the identity the token represents in its brand. The identity
+        is recorded on the first request with a verified email; until then
+        `id` is null. `memberships` lists the caller's tenants and is empty
+        until tenants exist.
+      security: [{bearer: []}]
+      responses:
+        "200":
+          description: The caller.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Me"}
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v1/brands/{id}:
+    get:
+      tags: [brands]
+      operationId: getBrand
+      summary: Return a brand.
+      description: Staff `operator` of the same brand only. Any other caller gets `404`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/BrandIdPath"
+      responses:
+        "200":
+          description: The brand.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Brand"}
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v1/brands/{id}/apply:
+    post:
+      tags: [brands]
+      operationId: applyBrand
+      summary: Converge Keycloak and Kill Bill to a brand manifest.
+      description: |
+        Staff `operator` of the same brand only. The body is the brand
+        manifest, validated against `api/schemas/brand-manifest.json`. Its
+        slug must be this brand's. File references in the manifest must
+        start with `<slug>/` and resolve inside `ZS_BRANDS_DIR/<slug>/`.
+        Secret references must be in the brand's namespace, `BRAND_<SLUG>__`
+        variables or files inside `ZS_SECRETS_DIR/<slug>/`, or the route
+        answers 422 `secret_ref_invalid`. `identity.ssl_required` must be
+        `external` or `all`. Apply is idempotent: applying the same manifest
+        again returns an empty `changes` list. Every change is audited with
+        its diff. Secrets appear only as references, and a changed secret is
+        reported as a redacted field. A change to the MFA settings, a
+        client, an identity provider, `ssl_required` or the payment plugin
+        needs multi-factor authentication within the last 15 minutes (403
+        `recent_mfa_required`) and a `reason` (400 `reason_required`). The
+        route is long-running: the apply runs for up to 10 minutes and
+        continues if the client disconnects. The audit trail then records
+        what changed.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/BrandIdPath"
+        - name: reason
+          in: query
+          description: Why the brand is applied. Recorded in audit and in Kill Bill. Required for a sensitive change.
+          schema: {type: string, minLength: 1, maxLength: 1000}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/BrandManifest"}
+          application/yaml:
+            schema: {$ref: "#/components/schemas/BrandManifest"}
+      responses:
+        "200":
+          description: The applied diff.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BrandDiff"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "415":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /v1/audit/events:
     get:
       tags: [audit]
       operationId: listAuditEvents
-      summary: List audit events for one tenant.
+      summary: List audit events of the caller's brand.
       description: |
-        Returns audit events of the tenant in scope, newest first. Filters
+        Staff `operator` of the brand only; Phase 3b adds a route for tenant
+        members. With `tenant_id`, returns the events of that tenant of the
+        brand; without it, returns the brand's own events, such as brand
+        applies, staff grants and new identities. Newest first. Filters
         combine with AND. `occurred_after` is inclusive and `occurred_before`
         is exclusive.
+      security: [{bearer: []}]
       parameters:
-        - $ref: "#/components/parameters/BrandHeader"
-        - $ref: "#/components/parameters/TenantHeader"
+        - name: tenant_id
+          in: query
+          description: A tenant of the caller's brand.
+          schema: {$ref: "#/components/schemas/TenantId"}
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
         - name: actor_id
@@ -107,9 +230,17 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/Unavailable"
 components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: A Keycloak access token from the brand's realm, signed with RS256.
   headers:
     RequestId:
       description: The request ID. A valid inbound `X-Request-ID` is echoed; otherwise the server assigns one.
@@ -118,23 +249,12 @@ components:
       description: Always `no-store`.
       schema: {type: string, const: no-store}
   parameters:
-    BrandHeader:
-      name: X-ZS-Brand
-      in: header
+    BrandIdPath:
+      name: id
+      in: path
       required: true
-      description: |
-        Phase 1 development only. The brand in scope, as a `brd_` ID. Read
-        only when `ZS_DEV_TRUSTED_SCOPE_HEADERS=true`. Phase 2 derives the
-        brand from the token audience or API key instead.
+      description: A brand ID.
       schema: {$ref: "#/components/schemas/BrandId"}
-    TenantHeader:
-      name: X-ZS-Tenant
-      in: header
-      required: true
-      description: |
-        Phase 1 development only. The tenant in scope, as a `tnt_` ID. Read
-        only when `ZS_DEV_TRUSTED_SCOPE_HEADERS=true`.
-      schema: {$ref: "#/components/schemas/TenantId"}
     Limit:
       name: limit
       in: query
@@ -154,8 +274,40 @@ components:
       content:
         application/json:
           schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+    Forbidden:
+      description: Authenticated but not allowed, such as `recent_mfa_required`.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+    NotFound:
+      description: Not found, or not visible to the caller.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+    Conflict:
+      description: Conflicts with the current state, such as `brand_apply_in_progress`.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+    Unprocessable:
+      description: An engine rejected the request, or a secret reference could not be resolved.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
     Unauthenticated:
-      description: No valid credentials or scope.
+      description: No valid token. `unauthenticated`, `token_invalid` or `token_audience_unknown`.
       headers:
         X-Request-ID: {$ref: "#/components/headers/RequestId"}
         Cache-Control: {$ref: "#/components/headers/CacheControl"}
@@ -255,7 +407,11 @@ components:
       properties:
         id: {$ref: "#/components/schemas/AuditEventId"}
         brand_id: {$ref: "#/components/schemas/BrandId"}
-        tenant_id: {$ref: "#/components/schemas/TenantId"}
+        tenant_id:
+          description: The tenant, or null for a brand event.
+          oneOf:
+            - {$ref: "#/components/schemas/TenantId"}
+            - {type: "null"}
         actor: {$ref: "#/components/schemas/Actor"}
         action: {$ref: "#/components/schemas/Action"}
         reason:
@@ -268,6 +424,10 @@ components:
         occurred_at:
           type: string
           format: date-time
+        details:
+          type: object
+          description: Structured detail, such as the diff of a brand apply. Never holds secrets.
+          additionalProperties: true
     AuditEventPage:
       type: object
       required: [data, next_cursor]
@@ -277,3 +437,105 @@ components:
           type: array
           items: {$ref: "#/components/schemas/AuditEvent"}
         next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    IdentityId:
+      type: string
+      description: An identity ID.
+      pattern: "^idn_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    Identity:
+      type: object
+      required: [id, brand_id, kind, issuer, subject, email, email_verified, display_name, mfa, authenticated_at]
+      additionalProperties: false
+      properties:
+        id:
+          description: The identity, or null until the first request with a verified email.
+          oneOf:
+            - {$ref: "#/components/schemas/IdentityId"}
+            - {type: "null"}
+        brand_id: {$ref: "#/components/schemas/BrandId"}
+        kind:
+          type: string
+          description: Which of the brand's clients issued the token.
+          enum: [user, staff, service]
+        issuer: {type: string}
+        subject: {type: string}
+        email: {type: [string, "null"]}
+        email_verified: {type: boolean}
+        display_name: {type: [string, "null"]}
+        mfa:
+          type: boolean
+          description: True when the token's amr or acr proves a second factor.
+        authenticated_at:
+          type: [string, "null"]
+          format: date-time
+    Membership:
+      type: object
+      description: A membership of the caller in a tenant. Added in Phase 3b.
+      additionalProperties: true
+    Me:
+      type: object
+      required: [identity, memberships]
+      additionalProperties: false
+      properties:
+        identity: {$ref: "#/components/schemas/Identity"}
+        memberships:
+          type: array
+          items: {$ref: "#/components/schemas/Membership"}
+    Brand:
+      type: object
+      required: [id, slug, name, status, keycloak_realm, killbill_tenant_id, killbill_api_key, manifest_digest, applied_at, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/BrandId"}
+        slug: {type: string}
+        name: {type: string}
+        status: {type: string, enum: [active, disabled]}
+        keycloak_realm: {type: string}
+        killbill_tenant_id: {type: [string, "null"]}
+        killbill_api_key: {type: string}
+        manifest_digest: {type: string}
+        applied_at: {type: [string, "null"], format: date-time}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    BrandManifest:
+      type: object
+      description: A brand manifest. The full schema is `api/schemas/brand-manifest.json`; the server validates against it and rejects unknown keys.
+      additionalProperties: true
+    BrandFieldChange:
+      type: object
+      required: [field]
+      additionalProperties: false
+      properties:
+        field: {type: string}
+        before:
+          description: The current value. Absent for a new object or a redacted field.
+        after:
+          description: The desired value. Absent for a redacted field.
+        redacted:
+          type: boolean
+          description: True for secrets; neither value is shown.
+    BrandChange:
+      type: object
+      required: [target, name, action, fields]
+      additionalProperties: false
+      properties:
+        target:
+          type: string
+          enum: [core.brand, keycloak.realm, keycloak.authentication_flow, keycloak.required_action, keycloak.client, keycloak.identity_provider, keycloak.mfa_policy, killbill.tenant, killbill.catalogue, killbill.overdue, killbill.plugin_config]
+        name: {type: string}
+        action: {type: string, enum: [create, update]}
+        fields:
+          type: array
+          items: {$ref: "#/components/schemas/BrandFieldChange"}
+    BrandDiff:
+      type: object
+      required: [slug, manifest_digest, changes, applied]
+      additionalProperties: false
+      properties:
+        brand_id: {$ref: "#/components/schemas/BrandId"}
+        slug: {type: string}
+        manifest_digest_before: {type: string}
+        manifest_digest: {type: string}
+        changes:
+          type: array
+          items: {$ref: "#/components/schemas/BrandChange"}
+        applied: {type: boolean}

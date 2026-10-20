@@ -58,6 +58,87 @@ func (e AuditOutcome) Valid() bool {
 	}
 }
 
+// Defines values for BrandStatus.
+const (
+	BrandStatusActive   BrandStatus = "active"
+	BrandStatusDisabled BrandStatus = "disabled"
+)
+
+// Valid indicates whether the value is a known member of the BrandStatus enum.
+func (e BrandStatus) Valid() bool {
+	switch e {
+	case BrandStatusActive:
+		return true
+	case BrandStatusDisabled:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for BrandChangeAction.
+const (
+	BrandChangeActionCreate BrandChangeAction = "create"
+	BrandChangeActionUpdate BrandChangeAction = "update"
+)
+
+// Valid indicates whether the value is a known member of the BrandChangeAction enum.
+func (e BrandChangeAction) Valid() bool {
+	switch e {
+	case BrandChangeActionCreate:
+		return true
+	case BrandChangeActionUpdate:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for BrandChangeTarget.
+const (
+	BrandChangeTargetCoreBrand                  BrandChangeTarget = "core.brand"
+	BrandChangeTargetKeycloakAuthenticationFlow BrandChangeTarget = "keycloak.authentication_flow"
+	BrandChangeTargetKeycloakClient             BrandChangeTarget = "keycloak.client"
+	BrandChangeTargetKeycloakIdentityProvider   BrandChangeTarget = "keycloak.identity_provider"
+	BrandChangeTargetKeycloakMfaPolicy          BrandChangeTarget = "keycloak.mfa_policy"
+	BrandChangeTargetKeycloakRealm              BrandChangeTarget = "keycloak.realm"
+	BrandChangeTargetKeycloakRequiredAction     BrandChangeTarget = "keycloak.required_action"
+	BrandChangeTargetKillbillCatalogue          BrandChangeTarget = "killbill.catalogue"
+	BrandChangeTargetKillbillOverdue            BrandChangeTarget = "killbill.overdue"
+	BrandChangeTargetKillbillPluginConfig       BrandChangeTarget = "killbill.plugin_config"
+	BrandChangeTargetKillbillTenant             BrandChangeTarget = "killbill.tenant"
+)
+
+// Valid indicates whether the value is a known member of the BrandChangeTarget enum.
+func (e BrandChangeTarget) Valid() bool {
+	switch e {
+	case BrandChangeTargetCoreBrand:
+		return true
+	case BrandChangeTargetKeycloakAuthenticationFlow:
+		return true
+	case BrandChangeTargetKeycloakClient:
+		return true
+	case BrandChangeTargetKeycloakIdentityProvider:
+		return true
+	case BrandChangeTargetKeycloakMfaPolicy:
+		return true
+	case BrandChangeTargetKeycloakRealm:
+		return true
+	case BrandChangeTargetKeycloakRequiredAction:
+		return true
+	case BrandChangeTargetKillbillCatalogue:
+		return true
+	case BrandChangeTargetKillbillOverdue:
+		return true
+	case BrandChangeTargetKillbillPluginConfig:
+		return true
+	case BrandChangeTargetKillbillTenant:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for HealthStatusStatus.
 const (
 	HealthStatusStatusOk    HealthStatusStatus = "ok"
@@ -70,6 +151,27 @@ func (e HealthStatusStatus) Valid() bool {
 	case HealthStatusStatusOk:
 		return true
 	case HealthStatusStatusReady:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for IdentityKind.
+const (
+	IdentityKindService IdentityKind = "service"
+	IdentityKindStaff   IdentityKind = "staff"
+	IdentityKindUser    IdentityKind = "user"
+)
+
+// Valid indicates whether the value is a known member of the IdentityKind enum.
+func (e IdentityKind) Valid() bool {
+	switch e {
+	case IdentityKindService:
+		return true
+	case IdentityKindStaff:
+		return true
+	case IdentityKindUser:
 		return true
 	default:
 		return false
@@ -99,14 +201,17 @@ type AuditEvent struct {
 	BrandId       BrandId `json:"brand_id"`
 	CorrelationId string  `json:"correlation_id"`
 
+	// Details Structured detail, such as the diff of a brand apply. Never holds secrets.
+	Details *map[string]interface{} `json:"details,omitempty"`
+
 	// Id An audit event ID.
 	Id         AuditEventId `json:"id"`
 	OccurredAt time.Time    `json:"occurred_at"`
 	Outcome    AuditOutcome `json:"outcome"`
 	Reason     *string      `json:"reason,omitempty"`
 
-	// TenantId A tenant ID.
-	TenantId TenantId `json:"tenant_id"`
+	// TenantId The tenant, or null for a brand event.
+	TenantId *TenantId `json:"tenant_id"`
 }
 
 // AuditEventId An audit event ID.
@@ -123,8 +228,70 @@ type AuditEventPage struct {
 // AuditOutcome defines model for AuditOutcome.
 type AuditOutcome string
 
+// Brand defines model for Brand.
+type Brand struct {
+	AppliedAt *time.Time `json:"applied_at"`
+	CreatedAt time.Time  `json:"created_at"`
+
+	// Id A brand ID.
+	Id               BrandId     `json:"id"`
+	KeycloakRealm    string      `json:"keycloak_realm"`
+	KillbillApiKey   string      `json:"killbill_api_key"`
+	KillbillTenantId *string     `json:"killbill_tenant_id"`
+	ManifestDigest   string      `json:"manifest_digest"`
+	Name             string      `json:"name"`
+	Slug             string      `json:"slug"`
+	Status           BrandStatus `json:"status"`
+	UpdatedAt        time.Time   `json:"updated_at"`
+}
+
+// BrandStatus defines model for Brand.Status.
+type BrandStatus string
+
+// BrandChange defines model for BrandChange.
+type BrandChange struct {
+	Action BrandChangeAction  `json:"action"`
+	Fields []BrandFieldChange `json:"fields"`
+	Name   string             `json:"name"`
+	Target BrandChangeTarget  `json:"target"`
+}
+
+// BrandChangeAction defines model for BrandChange.Action.
+type BrandChangeAction string
+
+// BrandChangeTarget defines model for BrandChange.Target.
+type BrandChangeTarget string
+
+// BrandDiff defines model for BrandDiff.
+type BrandDiff struct {
+	Applied bool `json:"applied"`
+
+	// BrandId A brand ID.
+	BrandId              *BrandId      `json:"brand_id,omitempty"`
+	Changes              []BrandChange `json:"changes"`
+	ManifestDigest       string        `json:"manifest_digest"`
+	ManifestDigestBefore *string       `json:"manifest_digest_before,omitempty"`
+	Slug                 string        `json:"slug"`
+}
+
+// BrandFieldChange defines model for BrandFieldChange.
+type BrandFieldChange struct {
+	// After The desired value. Absent for a redacted field.
+	After interface{} `json:"after,omitempty"`
+
+	// Before The current value. Absent for a new object or a redacted field.
+	Before interface{} `json:"before,omitempty"`
+	Field  string      `json:"field"`
+
+	// Redacted True for secrets; neither value is shown.
+	Redacted *bool `json:"redacted,omitempty"`
+}
+
 // BrandId A brand ID.
 type BrandId = string
+
+// BrandManifest A brand manifest. The full schema is `api/schemas/brand-manifest.json`; the server validates against it and rejects unknown keys.
+type BrandManifest map[string]interface{}
 
 // Error defines model for Error.
 type Error struct {
@@ -159,14 +326,51 @@ type HealthStatusStatus string
 // idempotency_key_conflict`.
 type IdempotencyKey = string
 
+// Identity defines model for Identity.
+type Identity struct {
+	AuthenticatedAt *time.Time `json:"authenticated_at"`
+
+	// BrandId A brand ID.
+	BrandId       BrandId `json:"brand_id"`
+	DisplayName   *string `json:"display_name"`
+	Email         *string `json:"email"`
+	EmailVerified bool    `json:"email_verified"`
+
+	// Id The identity, or null until the first request with a verified email.
+	Id     *IdentityId `json:"id"`
+	Issuer string      `json:"issuer"`
+
+	// Kind Which of the brand's clients issued the token.
+	Kind IdentityKind `json:"kind"`
+
+	// Mfa True when the token's amr or acr proves a second factor.
+	Mfa     bool   `json:"mfa"`
+	Subject string `json:"subject"`
+}
+
+// IdentityKind Which of the brand's clients issued the token.
+type IdentityKind string
+
+// IdentityId An identity ID.
+type IdentityId = string
+
+// Me defines model for Me.
+type Me struct {
+	Identity    Identity     `json:"identity"`
+	Memberships []Membership `json:"memberships"`
+}
+
+// Membership A membership of the caller in a tenant. Added in Phase 3b.
+type Membership map[string]interface{}
+
 // NextCursor The cursor for the next page, or null on the last page.
 type NextCursor = string
 
 // TenantId A tenant ID.
 type TenantId = string
 
-// BrandHeader A brand ID.
-type BrandHeader = BrandId
+// BrandIdPath A brand ID.
+type BrandIdPath = BrandId
 
 // Cursor defines model for Cursor.
 type Cursor = string
@@ -174,11 +378,17 @@ type Cursor = string
 // Limit defines model for Limit.
 type Limit = int
 
-// TenantHeader A tenant ID.
-type TenantHeader = TenantId
-
 // BadRequest The body of every error response.
 type BadRequest = ErrorEnvelope
+
+// Conflict The body of every error response.
+type Conflict = ErrorEnvelope
+
+// Forbidden The body of every error response.
+type Forbidden = ErrorEnvelope
+
+// NotFound The body of every error response.
+type NotFound = ErrorEnvelope
 
 // Unauthenticated The body of every error response.
 type Unauthenticated = ErrorEnvelope
@@ -186,8 +396,14 @@ type Unauthenticated = ErrorEnvelope
 // Unavailable The body of every error response.
 type Unavailable = ErrorEnvelope
 
+// Unprocessable The body of every error response.
+type Unprocessable = ErrorEnvelope
+
 // ListAuditEventsParams defines parameters for ListAuditEvents.
 type ListAuditEventsParams struct {
+	// TenantId A tenant of the caller's brand.
+	TenantId *TenantId `form:"tenant_id,omitempty" json:"tenant_id,omitempty"`
+
 	// Limit The page size. Defaults to 50.
 	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
 
@@ -205,13 +421,13 @@ type ListAuditEventsParams struct {
 
 	// OccurredBefore Only events before this time (RFC 3339).
 	OccurredBefore *time.Time `form:"occurred_before,omitempty" json:"occurred_before,omitempty"`
-
-	// XZSBrand Phase 1 development only. The brand in scope, as a `brd_` ID. Read
-	// only when `ZS_DEV_TRUSTED_SCOPE_HEADERS=true`. Phase 2 derives the
-	// brand from the token audience or API key instead.
-	XZSBrand BrandHeader `json:"X-ZS-Brand"`
-
-	// XZSTenant Phase 1 development only. The tenant in scope, as a `tnt_` ID. Read
-	// only when `ZS_DEV_TRUSTED_SCOPE_HEADERS=true`.
-	XZSTenant TenantHeader `json:"X-ZS-Tenant"`
 }
+
+// ApplyBrandParams defines parameters for ApplyBrand.
+type ApplyBrandParams struct {
+	// Reason Why the brand is applied. Recorded in audit and in Kill Bill. Required for a sensitive change.
+	Reason *string `form:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// ApplyBrandJSONRequestBody defines body for ApplyBrand for application/json ContentType.
+type ApplyBrandJSONRequestBody = BrandManifest

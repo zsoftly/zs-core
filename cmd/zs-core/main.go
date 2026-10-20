@@ -4,6 +4,11 @@
 //	zs-core migrate        apply pending migrations and exit
 //	zs-core doctor         check a running stack against components.yaml
 //	zs-core upgrade check  list newer upstream versions; changes nothing
+//	zs-core brand apply    converge Keycloak and Kill Bill to a brand manifest
+//	zs-core brand diff     show what brand apply would change
+//	zs-core grant add      give a staff principal a scope in one brand
+//	zs-core grant revoke   take a scope away from a staff principal
+//	zs-core grant list     list the staff grants of a brand
 //
 // Configuration comes from the environment only; see docs/configuration.md.
 package main
@@ -38,6 +43,18 @@ Commands:
   upgrade check  list newer upstream versions of the pinned components; changes nothing
                    --strict               exit 1 when a release feed cannot be read
                    --components <file>    components file (default components.yaml)
+  brand apply <file>  converge Keycloak and Kill Bill to the manifest and record the brand
+                   --operator <name>      who applies, recorded in audit (required)
+                   --reason <text>        why, recorded in audit and in Kill Bill
+  brand diff <file>   print what brand apply would change; changes nothing
+  grant add      give a staff principal a scope in one brand
+                   --brand <slug> --subject <sub> --scope operator|activation|billing|support
+                   --reason <text> --operator <name> [--issuer <url>]
+  grant revoke   revoke a staff principal's active grant of a scope in one brand
+                   --brand <slug> --subject <sub> --scope operator|activation|billing|support
+                   --reason <text> --operator <name> [--issuer <url>]
+  grant list     list the staff grants of a brand
+                   --brand <slug>
 
 Configuration is read from ZS_* environment variables; see docs/configuration.md.
 `
@@ -62,6 +79,10 @@ func run(args, environ []string, stdout, stderr io.Writer) int {
 		return runDoctor(args[1:], environ, stdout, stderr)
 	case "upgrade":
 		return runUpgrade(args[1:], environ, stdout, stderr)
+	case "brand":
+		return runBrand(args[1:], environ, stdout, stderr)
+	case "grant":
+		return runGrant(args[1:], environ, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -129,19 +150,14 @@ func serve(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		}
 		log.Info("migrations applied", "count", len(applied), "versions", applied)
 	}
-	if cfg.DevTrustedScopeHeaders {
-		log.Warn("trusted scope headers are enabled: X-ZS-Brand and X-ZS-Tenant are accepted without authentication; development only",
-			"listen_addr", cfg.ListenAddr)
+	api, err := newAPIOptions(ctx, cfg, pool, log)
+	if err != nil {
+		return err
 	}
 
 	server := &http.Server{
-		Addr: cfg.ListenAddr,
-		Handler: httpapi.New(httpapi.Options{
-			DB:                  pool,
-			Migrations:          migrations.FS,
-			Logger:              log,
-			TrustedScopeHeaders: cfg.DevTrustedScopeHeaders,
-		}),
+		Addr:              cfg.ListenAddr,
+		Handler:           httpapi.New(api),
 		ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 		ReadTimeout:       cfg.HTTPReadTimeout,
 		WriteTimeout:      cfg.HTTPWriteTimeout,

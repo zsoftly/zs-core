@@ -113,7 +113,7 @@ KAUI 4.0.31 has an upstream fault. On two cold starts, while the healthcheck pro
 
 `killbill/bootstrap.sh` is idempotent. It reads `.env`, waits for Kill Bill, then:
 
-1. creates the tenant `zs-reference` (API key `zs-reference`, secret `KILLBILL_TENANT_API_SECRET`) unless it exists;
+1. creates the tenant `zs-reference` (API key `zs-reference`, secret `KILLBILL_TENANT_API_SECRET`) unless it exists. `brands/zs-reference.yaml` references the same secret as `env://BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET`, so export that name with this value before `zs-core brand apply`;
 2. uploads `killbill/catalogue.xml` unless the plan `core-test-monthly` is already there. The catalogue has one product, `core-test`, one monthly plan with a 14-day trial priced in CAD and USD, and one consumable usage unit, `api-call`;
 3. when `STRIPE_TEST_SECRET_KEY` is set, installs the Stripe plugin and uploads its per-tenant configuration. Without the key it does nothing more and Kill Bill keeps its built-in `__EXTERNAL_PAYMENT__` plugin.
 

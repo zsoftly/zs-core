@@ -6,11 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"regexp"
 	"runtime/debug"
-	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -19,13 +17,10 @@ import (
 
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/idgen"
-	"github.com/zsoftly/zs-core/pkg/scope"
 )
 
 const (
 	headerRequestID = "X-Request-ID"
-	headerBrand     = "X-ZS-Brand"
-	headerTenant    = "X-ZS-Tenant"
 	tracerName      = "github.com/zsoftly/zs-core/internal/httpapi"
 )
 
@@ -211,48 +206,6 @@ type headerProbe struct {
 func (p *headerProbe) Header() http.Header         { return p.header }
 func (p *headerProbe) Write(b []byte) (int, error) { return len(b), nil }
 func (p *headerProbe) WriteHeader(status int)      { p.status = status }
-
-type scopeKey struct{}
-
-// scoped resolves the brand and tenant of a /v1 request. Phase 1 reads them
-// from trusted headers when enabled; otherwise every request is
-// unauthenticated.
-func (s *server) scoped(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.trustedScopeHeaders {
-			s.writeError(w, r, zserrors.New(zserrors.CodeUnauthenticated, ""))
-			return
-		}
-		// A loopback listener can still be reached through a browser by DNS
-		// rebinding or by a local proxy; requiring a loopback Host refuses
-		// both.
-		if !loopbackHost(r.Host) {
-			s.writeError(w, r, zserrors.New(zserrors.CodeBadRequest, "Trusted scope headers are accepted only with a loopback Host."))
-			return
-		}
-		sc, err := scope.Parse(r.Header.Get(headerBrand), r.Header.Get(headerTenant))
-		if err != nil {
-			s.writeError(w, r, err)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(scope.WithContext(r.Context(), sc)))
-	})
-}
-
-// loopbackHost reports whether a Host header names 127.0.0.1, localhost or
-// [::1], with or without a port.
-func loopbackHost(host string) bool {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
-		host = host[1 : len(host)-1]
-	}
-	switch strings.ToLower(host) {
-	case "127.0.0.1", "localhost", "::1":
-		return true
-	}
-	return false
-}
 
 // isBodyTooLarge reports whether err came from the body limit.
 func isBodyTooLarge(err error) bool {

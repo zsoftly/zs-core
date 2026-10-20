@@ -127,7 +127,7 @@ ZSoftly Core is under active development. Expect bugs, breaking changes, and gap
 
 ## Development
 
-`make check` gates every change. No hosted CI workflow exists. Start with [docs/development.md](docs/development.md) for building, testing and migrating, and [docs/configuration.md](docs/configuration.md) for every environment variable. Module guides are in [docs/modules](docs/modules), starting with [foundation](docs/modules/foundation.md) and [audit](docs/modules/audit.md). Code that started in other ZSoftly repositories is listed in [PROVENANCE.md](PROVENANCE.md).
+`make check` gates every change. No hosted CI workflow exists. Start with [docs/development.md](docs/development.md) for building, testing and migrating, and [docs/configuration.md](docs/configuration.md) for every environment variable. Module guides are in [docs/modules](docs/modules), starting with [foundation](docs/modules/foundation.md), [audit](docs/modules/audit.md) and [brands](docs/modules/brands.md). Code that started in other ZSoftly repositories is listed in [PROVENANCE.md](PROVENANCE.md).
 
 ## License
 

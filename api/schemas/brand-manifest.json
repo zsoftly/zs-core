@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:zsoftly:zs-core:schema:brand-manifest:1",
+  "title": "ZSoftly Core brand manifest",
+  "description": "One brand: a Keycloak realm, a Kill Bill tenant and their configuration. Secrets are references (env://NAME or file:///path), never values. Unknown keys are rejected everywhere.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "slug", "name", "identity", "billing"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "slug": {"$ref": "#/$defs/slug"},
+    "name": {"$ref": "#/$defs/name"},
+    "identity": {"$ref": "#/$defs/identity"},
+    "billing": {"$ref": "#/$defs/billing"},
+    "notifications": {"$ref": "#/$defs/notifications"},
+    "permissions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]*:[a-z][a-z0-9_]*$", "maxLength": 100}
+    }
+  },
+  "$defs": {
+    "slug": {
+      "description": "Lowercase letters and digits in words joined by single hyphens, 2 to 40 characters. No leading, trailing or double hyphen, so the env:// prefixes of two brands never overlap.",
+      "type": "string", "minLength": 2, "maxLength": 40,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+    },
+    "name": {"type": "string", "minLength": 1, "maxLength": 200},
+    "secretRef": {
+      "type": "string",
+      "description": "env://BRAND_<SLUG>__NAME, where <SLUG> is the slug in upper case with - replaced by _ and followed by a double underscore, or file:///absolute/path inside ZS_SECRETS_DIR/<slug>/. Apply refuses a reference outside the brand's namespace.",
+      "pattern": "^(env://[A-Za-z_][A-Za-z0-9_]{0,127}|file:///[^\\s]+)$",
+      "maxLength": 1024
+    },
+    "relativePath": {
+      "type": "string",
+      "description": "A path relative to the directory of the manifest. It may not leave that directory.",
+      "pattern": "^[A-Za-z0-9._][A-Za-z0-9._/-]*$",
+      "maxLength": 255
+    },
+    "clientId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"},
+    "redirectUri": {
+      "description": "https, or http on 127.0.0.1, localhost or [::1] with any port. No wildcard in the host. At most one wildcard, as a trailing /*, and never after a query. No custom scheme and no fragment.",
+      "type": "string", "minLength": 1, "maxLength": 2000,
+      "pattern": "^(https://[^\\s*/?#@\\\\]+|http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{1,5})?)(/[^\\s*#\\\\]*)?(/\\*)?$",
+      "not": {"pattern": "\\?.*/\\*$"}
+    },
+    "webOrigin": {
+      "description": "+ for the origins of the redirect URIs, or an https origin, or an http origin on 127.0.0.1, localhost or [::1]. A bare * is refused.",
+      "type": "string", "minLength": 1, "maxLength": 2000,
+      "pattern": "^(\\+|https://[^\\s*/?#@\\\\]+|http://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:[0-9]{1,5})?)$"
+    },
+    "locale": {"type": "string", "pattern": "^[a-z]{2}(-[A-Z]{2})?$"},
+    "theme": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"},
+    "httpsUrl": {"type": "string", "pattern": "^https://[^\\s]+$", "maxLength": 2000},
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["realm", "display_name", "locales", "default_locale", "mfa", "customer_client", "staff_client"],
+      "properties": {
+        "realm": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}$", "not": {"const": "master"}},
+        "display_name": {"$ref": "#/$defs/name"},
+        "login_theme": {"$ref": "#/$defs/theme"},
+        "email_theme": {"$ref": "#/$defs/theme"},
+        "locales": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/locale"}},
+        "default_locale": {"$ref": "#/$defs/locale"},
+        "ssl_required": {"enum": ["none", "external", "all"]},
+        "token_lifetimes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "access_token_seconds": {"type": "integer", "minimum": 60, "maximum": 86400},
+            "sso_session_idle_seconds": {"type": "integer", "minimum": 60, "maximum": 2592000},
+            "sso_session_max_seconds": {"type": "integer", "minimum": 60, "maximum": 31536000}
+          }
+        },
+        "mfa": {"enum": ["optional", "required", "required_for_staff"]},
+        "mfa_acr_values": {
+          "description": "acr claim values that prove a second factor, in addition to the amr claim. List only values the realm issues after a second factor. 0 and 1 are refused.",
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "\\S", "not": {"enum": ["0", "1"]}}
+        },
+        "required_actions": {
+          "type": "array", "uniqueItems": true,
+          "items": {"enum": ["verify_email", "update_profile", "configure_totp", "update_password", "terms_and_conditions", "webauthn_register"]}
+        },
+        "customer_client": {"$ref": "#/$defs/customerClient"},
+        "staff_client": {"$ref": "#/$defs/staffClient"},
+        "service_clients": {"type": "array", "items": {"$ref": "#/$defs/serviceClient"}},
+        "identity_providers": {"type": "array", "items": {"$ref": "#/$defs/identityProvider"}}
+      }
+    },
+    "customerClient": {
+      "description": "The public OIDC client customers sign in with. Authorization code with PKCE S256.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_id", "redirect_uris"],
+      "properties": {
+        "client_id": {"$ref": "#/$defs/clientId"},
+        "name": {"$ref": "#/$defs/name"},
+        "redirect_uris": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/redirectUri"}},
+        "web_origins": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/webOrigin"}},
+        "direct_access_grants": {"type": "boolean", "description": "Allow the password grant. For development realms only. Refused when mfa is required, and on the staff client when mfa is required_for_staff."}
+      }
+    },
+    "staffClient": {
+      "description": "The confidential client staff sign in with. Staff tokens are verified against this client.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_id", "secret_ref", "redirect_uris"],
+      "properties": {
+        "client_id": {"$ref": "#/$defs/clientId"},
+        "name": {"$ref": "#/$defs/name"},
+        "secret_ref": {"$ref": "#/$defs/secretRef"},
+        "redirect_uris": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/redirectUri"}},
+        "web_origins": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/webOrigin"}},
+        "direct_access_grants": {"type": "boolean", "description": "Allow the password grant. For development realms only. Refused when mfa is required, and on the staff client when mfa is required_for_staff."},
+        "service_accounts": {"type": "boolean"}
+      }
+    },
+    "serviceClient": {
+      "description": "A confidential client with a service account and no browser flow.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_id", "secret_ref"],
+      "properties": {
+        "client_id": {"$ref": "#/$defs/clientId"},
+        "name": {"$ref": "#/$defs/name"},
+        "secret_ref": {"$ref": "#/$defs/secretRef"}
+      }
+    },
+    "identityProvider": {
+      "oneOf": [
+        {"$ref": "#/$defs/socialProvider"},
+        {"$ref": "#/$defs/oidcProvider"},
+        {"$ref": "#/$defs/samlProvider"}
+      ]
+    },
+    "providerAlias": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"},
+    "socialProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "type", "client_id", "client_secret_ref"],
+      "properties": {
+        "alias": {"$ref": "#/$defs/providerAlias"},
+        "type": {"enum": ["google", "microsoft", "github"]},
+        "display_name": {"$ref": "#/$defs/name"},
+        "enabled": {"type": "boolean"},
+        "client_id": {"type": "string", "minLength": 1, "maxLength": 500},
+        "client_secret_ref": {"$ref": "#/$defs/secretRef"},
+        "default_scopes": {"type": "string", "maxLength": 500}
+      }
+    },
+    "oidcProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "type", "client_id", "client_secret_ref", "issuer", "authorization_url", "token_url", "jwks_url"],
+      "properties": {
+        "alias": {"$ref": "#/$defs/providerAlias"},
+        "type": {"const": "oidc"},
+        "display_name": {"$ref": "#/$defs/name"},
+        "enabled": {"type": "boolean"},
+        "client_id": {"type": "string", "minLength": 1, "maxLength": 500},
+        "client_secret_ref": {"$ref": "#/$defs/secretRef"},
+        "issuer": {"$ref": "#/$defs/httpsUrl"},
+        "authorization_url": {"$ref": "#/$defs/httpsUrl"},
+        "token_url": {"$ref": "#/$defs/httpsUrl"},
+        "jwks_url": {"$ref": "#/$defs/httpsUrl"},
+        "default_scopes": {"type": "string", "maxLength": 500}
+      }
+    },
+    "samlProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias", "type", "idp_entity_id", "sso_url"],
+      "properties": {
+        "alias": {"$ref": "#/$defs/providerAlias"},
+        "type": {"const": "saml"},
+        "display_name": {"$ref": "#/$defs/name"},
+        "enabled": {"type": "boolean"},
+        "idp_entity_id": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "sso_url": {"$ref": "#/$defs/httpsUrl"},
+        "sp_entity_id": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "name_id_format": {"enum": ["email", "persistent", "unspecified", "transient"]},
+        "signing_certificate": {"type": "string", "pattern": "^[A-Za-z0-9+/=\\s]+$", "maxLength": 16000}
+      }
+    },
+    "billing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["killbill_tenant_key", "killbill_api_secret_ref", "currencies", "seller"],
+      "properties": {
+        "killbill_tenant_key": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "killbill_api_secret_ref": {"$ref": "#/$defs/secretRef"},
+        "catalogue": {"$ref": "#/$defs/relativePath"},
+        "overdue": {"$ref": "#/$defs/relativePath"},
+        "currencies": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Z]{3}$"}},
+        "seller": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "country"],
+          "properties": {
+            "name": {"$ref": "#/$defs/name"},
+            "country": {"type": "string", "pattern": "^[A-Z]{2}$"},
+            "address": {"type": "string", "minLength": 1, "maxLength": 1000}
+          }
+        },
+        "payment_plugin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "config_ref"],
+          "properties": {
+            "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+            "version": {"type": "string", "pattern": "^[0-9A-Za-z.+-]{1,50}$"},
+            "config_key": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "description": "The plugin service name Kill Bill stores the configuration under. Defaults to killbill-<name>."},
+            "config_ref": {"$ref": "#/$defs/secretRef"}
+          }
+        },
+        "invoice_plugin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+            "version": {"type": "string", "pattern": "^[0-9A-Za-z.+-]{1,50}$"}
+          }
+        },
+        "templates": {"$ref": "#/$defs/relativePath"}
+      }
+    },
+    "notifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sender": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["email"],
+          "properties": {
+            "email": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$", "maxLength": 320},
+            "name": {"$ref": "#/$defs/name"}
+          }
+        },
+        "reply_to": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$", "maxLength": 320},
+        "webhooks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["url", "secret_ref"],
+            "properties": {
+              "url": {"$ref": "#/$defs/httpsUrl"},
+              "secret_ref": {"$ref": "#/$defs/secretRef"},
+              "events": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)+$"}}
+            }
+          }
+        }
+      }
+    }
+  }
+}

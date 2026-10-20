@@ -16,7 +16,7 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.ListenAddr != DefaultListenAddr || cfg.DatabaseMaxConns != DefaultDatabaseMaxConns ||
 		cfg.LogLevel != slog.LevelInfo || cfg.LogFormat != "json" || !cfg.MigrateOnStart ||
-		cfg.DevTrustedScopeHeaders || cfg.ShutdownTimeout != DefaultShutdownTimeout ||
+		cfg.BrandsDir != "" || cfg.SecretsDir != "" || cfg.ShutdownTimeout != DefaultShutdownTimeout ||
 		cfg.HTTPReadHeaderTimeout != DefaultHTTPReadHeaderTimeout {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
@@ -35,14 +35,16 @@ func TestOverrides(t *testing.T) {
 		"ZS_HTTP_WRITE_TIMEOUT=11s",
 		"ZS_HTTP_IDLE_TIMEOUT=1m",
 		"ZS_SHUTDOWN_TIMEOUT=3s",
-		"ZS_DEV_TRUSTED_SCOPE_HEADERS=true",
+		"ZS_BRANDS_DIR=/etc/zs-core/brands",
+		"ZS_SECRETS_DIR=/run/zs-core/secrets/",
 		"ZS_TEST_POSTGRES_URL=postgres://ignored",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.DatabaseMaxConns != 25 || cfg.ListenAddr != "[::1]:9090" || cfg.LogLevel != slog.LevelDebug ||
-		cfg.LogFormat != "text" || cfg.MigrateOnStart || !cfg.DevTrustedScopeHeaders ||
+		cfg.LogFormat != "text" || cfg.MigrateOnStart || cfg.BrandsDir != "/etc/zs-core/brands" ||
+		cfg.SecretsDir != "/run/zs-core/secrets" ||
 		cfg.HTTPReadHeaderTimeout != 2*time.Second || cfg.HTTPReadTimeout != 10*time.Second ||
 		cfg.HTTPWriteTimeout != 11*time.Second || cfg.HTTPIdleTimeout != time.Minute || cfg.ShutdownTimeout != 3*time.Second {
 		t.Fatalf("overrides not applied: %+v", cfg)
@@ -59,6 +61,7 @@ func TestStrictValidationReportsEveryProblemWithoutValues(t *testing.T) {
 		"ZS_MIGRATE_ON_START=yes",
 		"ZS_SHUTDOWN_TIMEOUT=-1s",
 		"ZS_LISTEN_ADRR=127.0.0.1:1",
+		"ZS_SECRETS_DIR=relative/secrets",
 	})
 	if err == nil {
 		t.Fatal("Load succeeded")
@@ -67,6 +70,7 @@ func TestStrictValidationReportsEveryProblemWithoutValues(t *testing.T) {
 	for _, want := range []string{
 		"ZS_DATABASE_URL", "ZS_DATABASE_MAX_CONNS", "ZS_LISTEN_ADDR must be host:port", "ZS_LOG_LEVEL",
 		"ZS_LOG_FORMAT", "ZS_MIGRATE_ON_START", "ZS_SHUTDOWN_TIMEOUT", "ZS_LISTEN_ADRR is not a known variable",
+		"ZS_SECRETS_DIR must be an absolute directory path",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error lacks %q: %s", want, msg)
@@ -83,20 +87,22 @@ func TestDatabaseURLRequired(t *testing.T) {
 	}
 }
 
-func TestTrustedScopeHeadersRequireLoopback(t *testing.T) {
-	for _, addr := range []string{":8080", "0.0.0.0:8080", "10.0.0.5:8080", "[::]:8080", "example.com:8080"} {
-		_, err := Load([]string{dbURL, "ZS_DEV_TRUSTED_SCOPE_HEADERS=true", "ZS_LISTEN_ADDR=" + addr})
-		if err == nil || !strings.Contains(err.Error(), "loopback") {
-			t.Errorf("addr %q: err = %v", addr, err)
-		}
+func TestTrustedScopeHeadersAreGone(t *testing.T) {
+	_, err := Load([]string{dbURL, "ZS_DEV_TRUSTED_SCOPE_HEADERS=true", "ZS_LISTEN_ADDR=127.0.0.1:8080"})
+	if err == nil || !strings.Contains(err.Error(), "ZS_DEV_TRUSTED_SCOPE_HEADERS is not a known variable") {
+		t.Fatalf("the Phase 1 trusted-header flag must be refused: %v", err)
 	}
-	for _, addr := range []string{"127.0.0.1:8080", "127.0.0.2:8080", "localhost:8080", "[::1]:8080"} {
-		if _, err := Load([]string{dbURL, "ZS_DEV_TRUSTED_SCOPE_HEADERS=true", "ZS_LISTEN_ADDR=" + addr}); err != nil {
-			t.Errorf("addr %q: %v", addr, err)
-		}
+}
+
+func TestKeycloakAdminClientCredentials(t *testing.T) {
+	cfg, err := Load([]string{dbURL, "ZS_KEYCLOAK_ADMIN_CLIENT_ID=zs-core-admin", "ZS_KEYCLOAK_ADMIN_CLIENT_SECRET=pw-client"})
+	if err != nil || cfg.KeycloakAdminClientID != "zs-core-admin" || cfg.KeycloakAdminClientSecret != "pw-client" {
+		t.Fatalf("client credentials: %+v %v", cfg, err)
 	}
-	if _, err := Load([]string{dbURL, "ZS_LISTEN_ADDR=0.0.0.0:8080"}); err != nil {
-		t.Fatalf("public listen address without the flag rejected: %v", err)
+	_, err = Load([]string{dbURL, "ZS_KEYCLOAK_ADMIN_CLIENT_SECRET=pw-client"})
+	if err == nil || !strings.Contains(err.Error(), "ZS_KEYCLOAK_ADMIN_CLIENT_ID and ZS_KEYCLOAK_ADMIN_CLIENT_SECRET must be set together") ||
+		strings.Contains(err.Error(), "pw-client") {
+		t.Fatalf("half-set client credentials: %v", err)
 	}
 }
 

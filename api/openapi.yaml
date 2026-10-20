@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ZSoftly Core API
-  version: 0.4.0
+  version: 0.5.0
   summary: The /v1 HTTP surface of ZSoftly Core.
   description: |
     ZSoftly Core serves tenants, wallets, metering, catalogue, payments,
@@ -57,6 +57,12 @@ tags:
     description: The append-only audit trail.
   - name: billing
     description: The billing surface on Kill Bill. Kill Bill holds every balance, invoice and payment; Core stores none of them.
+  - name: wallet
+    description: The wallet view and reservations before work. The wallet is Kill Bill's account credit minus Core's holds.
+  - name: metering
+    description: Usage events with caller event IDs, forwarded to Kill Bill as usage records.
+  - name: quotas
+    description: Quotas and entitlements per plan and feature, with staff overrides and counters.
 paths:
   /healthz:
     get:
@@ -1139,11 +1145,15 @@ paths:
       operationId: checkEntitlement
       summary: Check whether the tenant may use a feature now.
       description: |
-        Needs `tenant:read`. A feature is a catalogue product name or a usage
-        unit of the plan of an active subscription. The check fails closed:
-        no active subscription, billing on hold, or Kill Bill unreachable
-        all give `allowed: false` with a reason, never an error. `limit`,
-        `used` and `remaining` are null until quotas ship.
+        Needs `tenant:read`. A feature is granted by a catalogue product name
+        or a usage unit of the plan of an active subscription, or by a quota
+        of the brand for an active plan or for every plan. The check fails
+        closed: no active subscription, billing on hold, or Kill Bill
+        unreachable all give `allowed: false` with a reason, never an error.
+        A quota, or a staff override in force, caps the feature: `limit`,
+        `used` and `remaining` are set, and `allowed` is false with
+        `quota_exceeded` once `used` reaches `limit`. Without a quota they
+        are null.
       security: [{bearer: []}]
       parameters:
         - $ref: "#/components/parameters/TenantIdPath"
@@ -1619,6 +1629,858 @@ paths:
         "400": {$ref: "#/components/responses/BadRequest"}
         "404": {$ref: "#/components/responses/NotFound"}
         "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/wallet:
+    get:
+      tags: [wallet]
+      operationId: getWallet
+      summary: The tenant's wallet view.
+      description: |
+        Needs `billing:read`. The wallet is a view: the Kill Bill account
+        credit, read from Kill Bill on every call, minus what Kill Bill will
+        invoice at the end of the period and has not yet, from a dry-run
+        invoice read first, minus the reservations Core holds, plus the
+        brand's overdraft allowance. `available_minor` is negative when the
+        tenant is overspent. When the dry run fails, `unbilled_minor` and
+        `available_minor` are null. Core stores none of these amounts. Below
+        the brand's low-balance threshold, `low_balance` is true and
+        `wallet.low_balance` is emitted at most once a day.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      responses:
+        "200":
+          description: The wallet.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WalletView"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/reservations:
+    get:
+      tags: [wallet]
+      operationId: listReservations
+      summary: List the tenant's reservations.
+      description: Needs `wallet:reserve`. Newest first.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - name: status
+          in: query
+          schema: {type: string, enum: [held, settled, released, expired]}
+        - name: external_ref
+          in: query
+          schema: {$ref: "#/components/schemas/ExternalRef"}
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of reservations.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ReservationPage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    post:
+      tags: [wallet]
+      operationId: createReservation
+      summary: Hold credit before work.
+      description: |
+        Needs `wallet:reserve`, which no role but owner implies. Holds
+        `amount_minor` of the tenant's Kill Bill credit until the lease
+        ends. The hold belongs to the membership or API key that made it.
+        Available is the Kill Bill credit, minus the held reservations, less
+        the unbilled amount of a Kill Bill dry-run invoice, plus the brand's
+        overdraft allowance. The credit and the unbilled amount are cached
+        for `ZS_WALLET_CREDIT_CACHE_TTL` only while the tenant's wallet
+        version is unchanged. More than that is `409 insufficient_credit`,
+        and the message names the shortfall. When Kill Bill cannot rate the
+        unbilled amount it is `503 wallet_unavailable`. A suspended tenant or
+        a blocked Kill Bill account is `409 wallet_on_hold`. Idempotent on
+        `external_ref` and `attempt`: an equal or smaller amount returns a
+        held reservation with `200`, a larger one grows it, and a hold never
+        shrinks. A reservation that was settled, released or expired is `409
+        reservation_closed`. Another holder's reservation is `404
+        reservation_not_found`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReservationCreate"}
+      responses:
+        "200":
+          description: The existing hold, unchanged or grown.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "201":
+          description: The new hold.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/reservations/{ref}/settle:
+    post:
+      tags: [wallet]
+      operationId: settleReservation
+      summary: Settle a reservation in Kill Bill.
+      description: |
+        Needs `wallet:reserve`. Only the holder that made the reservation
+        settles it. Anyone else gets `404 reservation_not_found`. A
+        suspended tenant may settle. The settlement's catalogue value, or
+        its `credit_minor`, may not exceed the hold: `409
+        settlement_exceeds_hold`. A unit the subscription's phase does not
+        price is `422 unit_unrated`. Core writes the settlement's intent,
+        then writes to Kill Bill: usage on a subscription with a tracking ID
+        derived from `external_ref` and `attempt`, or an external charge of
+        `credit_minor` that Kill Bill pays from the account credit. Then the
+        reservation is settled and the rest of the hold released. Kill Bill
+        is never called under the tenant lock. The same settlement again
+        returns it. Another one is `409 reservation_conflict`. Kill Bill
+        holding another amount under the same key is `409
+        settlement_conflict`. When Kill Bill cannot be reached, the answer
+        is `202` with `settlement_pending: true`. The hold keeps counting
+        and never expires until the sweeper completes the settlement.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ReservationRefPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReservationSettle"}
+      responses:
+        "200":
+          description: The settled reservation.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "202":
+          description: The settlement is queued until Kill Bill can be reached.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/reservations/{ref}/release:
+    post:
+      tags: [wallet]
+      operationId: releaseReservation
+      summary: Release a held reservation.
+      description: |
+        Needs `wallet:reserve`. Only the holder that made the reservation
+        releases it. Anyone else gets `404 reservation_not_found`. A
+        suspended tenant may release. Releasing a released reservation
+        returns it. A settled or expired one is `409 reservation_not_held`,
+        and one whose settlement waits for Kill Bill is `409
+        reservation_settlement_pending`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ReservationRefPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReservationRelease"}
+      responses:
+        "200":
+          description: The released reservation.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/reservations/{ref}/extend:
+    post:
+      tags: [wallet]
+      operationId: extendReservation
+      summary: Renew a reservation's lease.
+      description: Needs `wallet:reserve`. Only the holder that made the reservation extends it. Anyone else gets `404 reservation_not_found`. A suspended tenant may extend. The lease runs `lease_seconds` from now. A reservation that is not held is `409 reservation_not_held`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ReservationRefPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReservationExtend"}
+      responses:
+        "200":
+          description: The reservation with its new lease.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/usage:
+    post:
+      tags: [metering]
+      operationId: recordUsage
+      summary: Record one usage event.
+      description: |
+        Needs `usage:write`. Idempotent on the tenant, the meter and
+        `event_id`: the same payload again returns the event with `200`,
+        another payload is `409 usage_event_conflict`. An unknown or retired
+        meter is `404 meter_not_found`. A dimension key the meter does not
+        declare is `400 validation_failed`. An `occurred_at` outside the
+        brand's backfill window, seven days back and five minutes ahead by
+        default, is `400 usage_out_of_window`. The forwarder sends the
+        usage to Kill Bill.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UsageEventCreate"}
+      responses:
+        "200":
+          description: The event recorded earlier with this event_id.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageEvent"}
+        "201":
+          description: The recorded event.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageEvent"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/usage/batch:
+    post:
+      tags: [metering]
+      operationId: recordUsageBatch
+      summary: Record up to 1000 usage events, all or nothing.
+      description: |
+        Needs `usage:write`. Each event follows the rules of `POST
+        /v1/tenants/{id}/usage`. The first refused event refuses the whole
+        batch and records nothing.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UsageBatch"}
+      responses:
+        "200":
+          description: The events, in the order of the batch.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageBatchResult"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/usage/events:
+    get:
+      tags: [metering]
+      operationId: listUsageEvents
+      summary: List the tenant's usage events.
+      description: Needs `usage:read`. Newest first. `from` is inclusive and `to` exclusive.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/MeterQuery"
+        - name: from
+          in: query
+          schema: {type: string, format: date-time}
+        - name: to
+          in: query
+          schema: {type: string, format: date-time}
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: One page of usage events.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageEventPage"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/usage/summary:
+    get:
+      tags: [metering]
+      operationId: getUsageSummary
+      summary: The tenant's usage per meter, day and dimension set.
+      description: Needs `usage:read`. Reads Core's summaries. Days are UTC, `from` inclusive and `to` exclusive, at most 366 days. Without them, the current month.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/MeterQuery"
+        - $ref: "#/components/parameters/FromDay"
+        - $ref: "#/components/parameters/ToDay"
+      responses:
+        "200":
+          description: The summary.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageSummary"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/usage/billed:
+    get:
+      tags: [metering]
+      operationId: getBilledUsage
+      summary: The usage Kill Bill holds for the tenant's subscriptions.
+      description: |
+        Needs `usage:read`. Reads Kill Bill's rolled-up usage per
+        subscription and unit, for one subscription of the tenant or every
+        one. Days are UTC, `from` inclusive and `to` exclusive. Without
+        them, the current month.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - name: subscription
+          in: query
+          schema: {$ref: "#/components/schemas/KillBillId"}
+        - $ref: "#/components/parameters/FromDay"
+        - $ref: "#/components/parameters/ToDay"
+      responses:
+        "200":
+          description: Kill Bill's usage.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BilledUsageList"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/entitlements/{feature}/consume:
+    post:
+      tags: [quotas]
+      operationId: consumeEntitlement
+      summary: Take part of a feature's quota.
+      description: |
+        Needs `quota:consume`, which no role but owner implies. Takes
+        `amount`, 1 by default, for `ref`, such as a job ID, and answers the
+        entitlement after. A concurrent quota takes it as a lease of
+        `lease_seconds`, one hour by default, that the lease sweeper
+        releases unless it is extended or released first. A day or month
+        quota counts it against the window's counter. The same `ref` again,
+        from the same holder and in the same window, takes nothing more.
+        Another holder's `ref` is `404 not_found`. A feature whose quota has
+        no window is `409 quota_not_concurrent`. Past the limit is `409
+        quota_exceeded`. It fails closed as the check does.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/FeaturePath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/QuotaConsume"}
+      responses:
+        "200":
+          description: The entitlement after the consumption.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Entitlement"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/entitlements/{feature}/release:
+    post:
+      tags: [quotas]
+      operationId: releaseEntitlement
+      summary: Return what a ref consumed of a feature.
+      description: Needs `quota:consume`. Only the holder that consumed releases. Anyone else gets `404 not_found`. A suspended tenant may release. Releasing a ref that holds nothing returns 0, and so does a day or month consumption, which is never given back. Release never calls Kill Bill.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/FeaturePath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/QuotaRelease"}
+      responses:
+        "200":
+          description: What was returned, and the entitlement after.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QuotaReleased"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/entitlements/{feature}/extend:
+    post:
+      tags: [quotas]
+      operationId: extendEntitlement
+      summary: Renew a concurrent lease.
+      description: Needs `quota:consume`. The lease of `ref` runs `lease_seconds` from now. A ref that holds no concurrent lease, or another holder's, is `404 not_found`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/FeaturePath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/QuotaExtend"}
+      responses:
+        "200":
+          description: The lease.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QuotaLease"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/brands/{id}/meters:
+    get:
+      tags: [metering]
+      operationId: listMeters
+      summary: The brand's meters.
+      description: Staff `operator` of the brand only; anyone else gets `404`. Retired meters included.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/BrandIdPath"
+      responses:
+        "200":
+          description: The meters.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MeterList"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    put:
+      tags: [metering]
+      operationId: replaceMeters
+      summary: Replace the brand's meters.
+      description: |
+        Staff `operator` of the brand only. The brand's meters become
+        exactly this list. A meter left out is retired, never deleted. Each
+        `killbill_unit` must be a usage unit of the brand's catalogue in Kill
+        Bill. A brand whose manifest declares `billing.meters` is `409
+        conflict`: change the manifest instead. Audited as
+        `brand.meters.updated`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/BrandIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/MeterReplace"}
+      responses:
+        "200":
+          description: The meters.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MeterList"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/brands/{id}/quotas:
+    get:
+      tags: [quotas]
+      operationId: listQuotas
+      summary: The brand's quotas.
+      description: Staff `operator` of the brand only; anyone else gets `404`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/BrandIdPath"
+      responses:
+        "200":
+          description: The quotas.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QuotaList"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+    put:
+      tags: [quotas]
+      operationId: replaceQuotas
+      summary: Replace the brand's quotas.
+      description: |
+        Staff `operator` of the brand only. The brand's quotas become
+        exactly this list. Each plan must be a plan of the brand's catalogue
+        in Kill Bill or `*`, and each meter an active meter of the brand. A
+        brand whose manifest declares `entitlements` is `409 conflict`.
+        Audited as `brand.quotas.updated`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/BrandIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/QuotaReplace"}
+      responses:
+        "200":
+          description: The quotas.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QuotaList"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/quota-overrides:
+    post:
+      tags: [quotas]
+      operationId: setQuotaOverride
+      summary: Set a tenant's limit of a feature.
+      description: |
+        Staff with the `support` grant in the tenant's brand only; anyone
+        else gets `404`. The latest override in force replaces the plan's
+        limit until it expires. An override without `window` takes the
+        window of the plan's quota, and needs a quota of the brand for the
+        feature. One with `window` applies only while the plan's quota has
+        that window, or while no quota covers the feature. A `null` limit
+        clears the overrides before it for good, even once it expires.
+        Needs a reason. Audited as `quota.override.set`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/QuotaOverrideCreate"}
+      responses:
+        "201":
+          description: The override.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QuotaOverride"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/reservations/{ref}/settle:
+    post:
+      tags: [wallet]
+      operationId: staffSettleReservation
+      summary: Settle another holder's reservation, as staff.
+      description: |
+        Staff with the `support` grant in the tenant's brand only; anyone
+        else gets `404`. Needs a reason. Settles as the holder's route does,
+        and is audited as `wallet.reservation.staff_override`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ReservationRefPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StaffReservationSettle"}
+      responses:
+        "200":
+          description: The settled reservation.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "202":
+          description: The settlement waits until Kill Bill can be reached.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/reservations/{ref}/release:
+    post:
+      tags: [wallet]
+      operationId: staffReleaseReservation
+      summary: Release another holder's reservation, as staff.
+      description: |
+        Staff with the `support` grant in the tenant's brand only; anyone
+        else gets `404`. Needs a reason. Releases as the holder's route
+        does, and is audited as `wallet.reservation.staff_override`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ReservationRefPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StaffReservationRelease"}
+      responses:
+        "200":
+          description: The released reservation.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/reservations/{ref}/extend:
+    post:
+      tags: [wallet]
+      operationId: staffExtendReservation
+      summary: Extend another holder's reservation, as staff.
+      description: |
+        Staff with the `support` grant in the tenant's brand only; anyone
+        else gets `404`. Needs a reason. Extends as the holder's route does,
+        and is audited as `wallet.reservation.staff_override`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/ReservationRefPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StaffReservationExtend"}
+      responses:
+        "200":
+          description: The reservation with its new lease.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Reservation"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/entitlements/{feature}/release:
+    post:
+      tags: [quotas]
+      operationId: staffReleaseEntitlement
+      summary: Release another holder's quota lease, as staff.
+      description: |
+        Staff with the `support` grant in the tenant's brand only; anyone
+        else gets `404`. Needs a reason. Releases as the holder's route
+        does, and is audited as `quota.lease.staff_override`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/FeaturePath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StaffQuotaRelease"}
+      responses:
+        "200":
+          description: What was returned, and the entitlement after.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QuotaReleased"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/usage/rollups/{rollup}/reassign:
+    post:
+      tags: [metering]
+      operationId: reassignUsageRollup
+      summary: Send a rejected usage rollup to another subscription.
+      description: |
+        Staff with the `support` grant in the tenant's brand only; anyone
+        else gets `404`. Needs a reason. The rollup must be rejected, and
+        the subscription an active subscription of the tenant that prices
+        the rollup's unit and started by the start of the rollup's period.
+        The forwarder sends it on its next pass. Audited as
+        `metering.rollup_reassigned`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/RollupIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UsageRollupReassign"}
+      responses:
+        "200":
+          description: The rollup, pending again.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageRollup"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/usage/rollups/{rollup}/discard:
+    post:
+      tags: [metering]
+      operationId: discardUsageRollup
+      summary: Give up a rejected usage rollup.
+      description: |
+        Staff with the `support` grant in the tenant's brand only; anyone
+        else gets `404`. Needs a reason. The rollup must be rejected. It is
+        never sent and its usage is not billed. Audited as
+        `metering.rollup_discarded`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/RollupIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UsageRollupDiscard"}
+      responses:
+        "200":
+          description: The discarded rollup.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageRollup"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
 components:
   securitySchemes:
     bearer:
@@ -1703,6 +2565,38 @@ components:
       required: true
       description: A Kill Bill path such as `1.0/kb/accounts/<account_id>`. It may hold slashes.
       schema: {type: string}
+    ReservationRefPath:
+      name: ref
+      in: path
+      required: true
+      description: The reservation's external reference.
+      schema: {$ref: "#/components/schemas/ExternalRef"}
+    RollupIdPath:
+      name: rollup
+      in: path
+      required: true
+      description: A usage rollup ID.
+      schema: {type: string, pattern: "^rol_[0-7][0-9a-hjkmnp-tv-z]{25}$"}
+    FeaturePath:
+      name: feature
+      in: path
+      required: true
+      schema: {type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$"}
+    MeterQuery:
+      name: meter
+      in: query
+      description: A meter slug.
+      schema: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$"}
+    FromDay:
+      name: from
+      in: query
+      description: The first day, YYYY-MM-DD, UTC.
+      schema: {type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+    ToDay:
+      name: to
+      in: query
+      description: The day after the last, YYYY-MM-DD, UTC.
+      schema: {type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
     Limit:
       name: limit
       in: query
@@ -1974,7 +2868,7 @@ components:
       properties:
         target:
           type: string
-          enum: [core.brand, keycloak.realm, keycloak.authentication_flow, keycloak.required_action, keycloak.client, keycloak.client_scope, keycloak.identity_provider, keycloak.mfa_policy, killbill.tenant, killbill.catalogue, killbill.overdue, killbill.plugin_config, killbill.plugin, killbill.notification_callback]
+          enum: [core.brand, keycloak.realm, keycloak.authentication_flow, keycloak.required_action, keycloak.client, keycloak.client_scope, keycloak.identity_provider, keycloak.mfa_policy, killbill.tenant, killbill.catalogue, killbill.overdue, killbill.plugin_config, killbill.plugin, killbill.notification_callback, core.meters, core.quotas]
         name: {type: string}
         action: {type: string, enum: [create, update]}
         fields:
@@ -2475,8 +3369,9 @@ components:
         remaining: {type: [integer, "null"], format: int64}
         reason:
           type: string
-          enum: [included_in_plan, no_active_subscription, feature_not_in_plan, wallet_on_hold, billing_unavailable, tenant_not_found, feature_invalid]
+          enum: [included_in_plan, no_active_subscription, feature_not_in_plan, wallet_on_hold, billing_unavailable, tenant_not_found, feature_invalid, quota_exceeded]
         plan: {type: string, description: "The plan that grants the feature, when allowed."}
+        window: {$ref: "#/components/schemas/QuotaWindow"}
     Invoice:
       type: object
       required: [id, number, date, target_date, status, currency, amount_minor, balance_minor, credit_adj_minor, refund_adj_minor]
@@ -2682,3 +3577,455 @@ components:
         objectType: {type: string}
         objectId: {type: string}
         metaData: {type: [string, "null"]}
+    ExternalRef:
+      type: string
+      description: A caller's key, such as a job ID. Letters, digits, dots, colons, dashes and underscores.
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
+    ReservationId:
+      type: string
+      description: A reservation ID.
+      pattern: "^rsv_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    WalletView:
+      type: object
+      required: [currency, killbill_credit_minor, unbilled_minor, reserved_minor, available_minor, overdraft_minor, pending_settlements, overdue, on_hold, hold_reasons, low_balance, low_balance_threshold_minor]
+      additionalProperties: false
+      properties:
+        currency: {$ref: "#/components/schemas/Currency"}
+        killbill_credit_minor: {type: integer, format: int64, description: "The account credit Kill Bill holds, in minor units."}
+        unbilled_minor: {type: [integer, "null"], format: int64, description: "What Kill Bill will invoice by the end of the current period and has not yet: usage recorded so far and recurring charges due by then, from a dry-run invoice. Null when Kill Bill cannot rate it."}
+        reserved_minor: {type: integer, format: int64, description: "The sum of the held reservations, pending settlements included."}
+        available_minor: {type: [integer, "null"], format: int64, description: "The credit less the unbilled amount and the holds, never below minus overdraft_minor. Null when unbilled_minor is null."}
+        overdraft_minor: {type: integer, format: int64, description: The brand's overdraft allowance.}
+        pending_settlements: {type: integer, description: Held reservations whose settlement waits for Kill Bill.}
+        overdue: {$ref: "#/components/schemas/OverdueState"}
+        on_hold: {type: boolean}
+        hold_reasons:
+          type: array
+          items:
+            type: string
+            enum: [tenant_suspended, account_blocked, overdue_blocks_changes, overdue_disables_entitlement]
+        low_balance: {type: boolean}
+        low_balance_threshold_minor: {type: integer, format: int64, description: "The brand's threshold. 0 turns it off."}
+    Reservation:
+      type: object
+      required: [id, external_ref, attempt, label, currency, amount_minor, status, lease_expires_at, settlement_pending, settled_minor, created_at, updated_at, settled_at, released_at, expired_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/ReservationId"}
+        external_ref: {$ref: "#/components/schemas/ExternalRef"}
+        attempt: {type: integer}
+        label: {type: string}
+        currency: {$ref: "#/components/schemas/Currency"}
+        amount_minor: {type: integer, format: int64, description: The amount held.}
+        status: {type: string, enum: [held, settled, released, expired]}
+        lease_expires_at: {type: string, format: date-time}
+        settlement_pending: {type: boolean, description: "A settlement waits for Kill Bill. The hold keeps counting."}
+        settled_minor: {type: [integer, "null"], format: int64, description: "The charge of a credit settlement, or the catalogue estimate of a usage settlement."}
+        rated_by: {type: string, enum: [external_charge, catalogue_price, unrated]}
+        killbill_ref_type: {type: string, enum: [usage_record, external_charge]}
+        killbill_ref: {type: string, description: "The usage record's tracking ID or the external charge's invoice item ID."}
+        killbill_subscription_id: {$ref: "#/components/schemas/KillBillId"}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        settled_at: {type: [string, "null"], format: date-time}
+        released_at: {type: [string, "null"], format: date-time}
+        expired_at: {type: [string, "null"], format: date-time}
+    ReservationPage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Reservation"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    ReservationCreate:
+      type: object
+      required: [external_ref, amount_minor]
+      additionalProperties: false
+      properties:
+        external_ref: {$ref: "#/components/schemas/ExternalRef"}
+        attempt: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+        label: {type: string, maxLength: 200}
+        amount_minor: {type: integer, format: int64, minimum: 1, maximum: 10000000000}
+        currency: {$ref: "#/components/schemas/Currency"}
+        lease_seconds: {type: integer, minimum: 10, maximum: 86400, description: "Defaults to 900."}
+    UsageSettlement:
+      type: object
+      required: [unit, quantity_micro]
+      additionalProperties: false
+      properties:
+        subscription: {$ref: "#/components/schemas/KillBillId"}
+        unit: {type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$", description: A usage unit of the catalogue.}
+        quantity_micro: {type: integer, format: int64, minimum: 1, maximum: 1000000000000000}
+        event_id: {type: string, pattern: "^[\\x21-\\x7E]{1,255}$"}
+    ReservationSettle:
+      type: object
+      additionalProperties: false
+      properties:
+        attempt: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+        usage: {$ref: "#/components/schemas/UsageSettlement"}
+        credit_minor: {type: integer, format: int64, minimum: 1, maximum: 10000000000}
+        reason: {type: string, maxLength: 1000, description: Recorded in Kill Bill's audit log.}
+    ReservationRelease:
+      type: object
+      additionalProperties: false
+      properties:
+        attempt: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+    StaffReservationSettle:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        attempt: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+        usage: {$ref: "#/components/schemas/UsageSettlement"}
+        credit_minor: {type: integer, format: int64, minimum: 1, maximum: 10000000000}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+    StaffReservationRelease:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        attempt: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+    StaffReservationExtend:
+      type: object
+      required: [lease_seconds, reason]
+      additionalProperties: false
+      properties:
+        attempt: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+        lease_seconds: {type: integer, minimum: 10, maximum: 86400}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+    ReservationExtend:
+      type: object
+      required: [lease_seconds]
+      additionalProperties: false
+      properties:
+        attempt: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+        lease_seconds: {type: integer, minimum: 10, maximum: 86400}
+    UsageId:
+      type: string
+      description: A usage event ID.
+      pattern: "^usg_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    Dimensions:
+      type: object
+      description: Keys the meter declares, with values of 1 to 200 characters.
+      additionalProperties: {type: string, minLength: 1, maxLength: 200}
+    UsageEventCreate:
+      type: object
+      required: [meter, event_id, quantity_micro]
+      additionalProperties: false
+      properties:
+        meter: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$"}
+        event_id: {type: string, pattern: "^[\\x21-\\x7E]{1,255}$"}
+        quantity_micro: {type: integer, format: int64, minimum: 1, maximum: 1000000000000000, description: Millionths of the meter's unit.}
+        occurred_at: {type: string, format: date-time, description: Defaults to now.}
+        dimensions: {$ref: "#/components/schemas/Dimensions"}
+        resource_ref: {type: string, maxLength: 255}
+        subscription: {$ref: "#/components/schemas/KillBillId"}
+    UsageEvent:
+      type: object
+      required: [id, meter, event_id, quantity_micro, dimensions, occurred_at, received_at, forwarded_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/UsageId"}
+        meter: {type: string}
+        event_id: {type: string}
+        quantity_micro: {type: integer, format: int64}
+        dimensions: {$ref: "#/components/schemas/Dimensions"}
+        resource_ref: {type: string}
+        subscription: {$ref: "#/components/schemas/KillBillId"}
+        reservation_id: {$ref: "#/components/schemas/ReservationId"}
+        occurred_at: {type: string, format: date-time}
+        received_at: {type: string, format: date-time}
+        forwarded_at: {type: [string, "null"], format: date-time, description: When the forwarder sent the event to Kill Bill.}
+        killbill_tracking_id: {type: string}
+    UsageBatch:
+      type: object
+      required: [events]
+      additionalProperties: false
+      properties:
+        events:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items: {$ref: "#/components/schemas/UsageEventCreate"}
+    UsageBatchItem:
+      type: object
+      required: [usage, replayed]
+      additionalProperties: false
+      properties:
+        usage: {$ref: "#/components/schemas/UsageEvent"}
+        replayed: {type: boolean, description: True when the event was recorded before.}
+    UsageBatchResult:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/UsageBatchItem"}
+    UsageEventPage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/UsageEvent"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}
+    UsageSummaryTotal:
+      type: object
+      required: [meter, unit, quantity_micro, events]
+      additionalProperties: false
+      properties:
+        meter: {type: string}
+        unit: {type: string}
+        quantity_micro: {type: integer, format: int64}
+        events: {type: integer, format: int64}
+    UsageSummaryRow:
+      type: object
+      required: [meter, day, dimensions, quantity_micro, events]
+      additionalProperties: false
+      properties:
+        meter: {type: string}
+        day: {type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+        dimensions: {$ref: "#/components/schemas/Dimensions"}
+        quantity_micro: {type: integer, format: int64}
+        events: {type: integer, format: int64}
+    UsageSummary:
+      type: object
+      required: [from, to, totals, rows]
+      additionalProperties: false
+      properties:
+        from: {type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+        to: {type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+        totals:
+          type: array
+          items: {$ref: "#/components/schemas/UsageSummaryTotal"}
+        rows:
+          type: array
+          items: {$ref: "#/components/schemas/UsageSummaryRow"}
+    BilledUnit:
+      type: object
+      required: [unit, quantity_micro]
+      additionalProperties: false
+      properties:
+        unit: {type: string}
+        quantity_micro: {type: integer, format: int64}
+    BilledUsage:
+      type: object
+      required: [subscription_id, from, to, units]
+      additionalProperties: false
+      properties:
+        subscription_id: {$ref: "#/components/schemas/KillBillId"}
+        from: {type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+        to: {type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+        units:
+          type: array
+          items: {$ref: "#/components/schemas/BilledUnit"}
+    BilledUsageList:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/BilledUsage"}
+    QuotaConsume:
+      type: object
+      required: [ref]
+      additionalProperties: false
+      properties:
+        ref: {$ref: "#/components/schemas/ExternalRef"}
+        amount: {type: integer, format: int64, minimum: 1, maximum: 1000000, default: 1}
+        lease_seconds: {type: integer, minimum: 10, maximum: 86400, description: "The lease of a concurrent quota. Defaults to 3600."}
+    QuotaRelease:
+      type: object
+      required: [ref]
+      additionalProperties: false
+      properties:
+        ref: {$ref: "#/components/schemas/ExternalRef"}
+    StaffQuotaRelease:
+      type: object
+      required: [ref, reason]
+      additionalProperties: false
+      properties:
+        ref: {$ref: "#/components/schemas/ExternalRef"}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+    QuotaExtend:
+      type: object
+      required: [ref, lease_seconds]
+      additionalProperties: false
+      properties:
+        ref: {$ref: "#/components/schemas/ExternalRef"}
+        lease_seconds: {type: integer, minimum: 10, maximum: 86400}
+    QuotaLease:
+      type: object
+      required: [feature, ref, amount, expires_at]
+      additionalProperties: false
+      properties:
+        feature: {type: string}
+        ref: {$ref: "#/components/schemas/ExternalRef"}
+        amount: {type: integer, format: int64}
+        expires_at: {type: string, format: date-time}
+    UsageRollupReassign:
+      type: object
+      required: [subscription, reason]
+      additionalProperties: false
+      properties:
+        subscription: {$ref: "#/components/schemas/KillBillId"}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+    UsageRollupDiscard:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason: {type: string, minLength: 1, maxLength: 1000}
+    UsageRollup:
+      type: object
+      required: [id, killbill_unit, day, period_start, record_at, quantity_micro, events, killbill_tracking_id, status, attempts, forwarded_at, rejected_at, discarded_at]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: "^rol_[0-7][0-9a-hjkmnp-tv-z]{25}$"}
+        killbill_unit: {type: string}
+        requested_subscription: {$ref: "#/components/schemas/KillBillId"}
+        subscription: {$ref: "#/components/schemas/KillBillId"}
+        day: {type: string, pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$", description: "The UTC day of the rollup, YYYY-MM-DD."}
+        period_start: {type: string, format: date-time, description: The earliest event of the rollup.}
+        record_at: {type: string, format: date-time, description: The latest event of the rollup and the usage record's date.}
+        quantity_micro: {type: integer, format: int64}
+        events: {type: integer}
+        killbill_tracking_id: {type: string}
+        status: {type: string, enum: [pending, forwarded, rejected, discarded]}
+        reject_reason: {type: string, enum: [before_subscription_start, subscription_cancelled]}
+        attempts: {type: integer}
+        last_error: {type: string}
+        forwarded_at: {type: [string, "null"], format: date-time}
+        rejected_at: {type: [string, "null"], format: date-time}
+        discarded_at: {type: [string, "null"], format: date-time}
+    QuotaReleased:
+      type: object
+      required: [released, entitlement]
+      additionalProperties: false
+      properties:
+        released: {type: integer, format: int64, description: "What the ref held, 0 when it held nothing."}
+        entitlement: {$ref: "#/components/schemas/Entitlement"}
+    MeterUnit:
+      type: string
+      enum: [minute, second, byte, gib_hour, request, token, count]
+    MeterSpec:
+      type: object
+      required: [slug, unit, killbill_unit]
+      additionalProperties: false
+      properties:
+        slug: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$"}
+        unit: {$ref: "#/components/schemas/MeterUnit"}
+        killbill_unit: {type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"}
+        dimensions:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items: {type: string, pattern: "^[a-z][a-z0-9_]{0,39}$"}
+    Meter:
+      type: object
+      required: [id, slug, unit, killbill_unit, dimensions, status, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: "^mtr_[0-7][0-9a-hjkmnp-tv-z]{25}$"}
+        slug: {type: string}
+        unit: {$ref: "#/components/schemas/MeterUnit"}
+        killbill_unit: {type: string}
+        dimensions:
+          type: array
+          items: {type: string}
+        status: {type: string, enum: [active, retired]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    MeterList:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Meter"}
+    MeterReplace:
+      type: object
+      required: [meters]
+      additionalProperties: false
+      properties:
+        meters:
+          type: array
+          maxItems: 200
+          items: {$ref: "#/components/schemas/MeterSpec"}
+        reason: {type: string, maxLength: 1000}
+    QuotaWindow:
+      type: string
+      enum: [none, day, month, concurrent]
+    QuotaSpec:
+      type: object
+      required: [feature, plan, limit, window]
+      additionalProperties: false
+      properties:
+        feature: {type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$"}
+        plan: {type: string, minLength: 1, maxLength: 255, description: "A plan of the catalogue, or * for every plan."}
+        limit: {type: integer, format: int64, minimum: 0, maximum: 1000000000000000}
+        window: {$ref: "#/components/schemas/QuotaWindow"}
+        meter: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$", description: The meter a day or month limit counts.}
+    Quota:
+      type: object
+      required: [id, feature, plan, limit, window, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: "^qta_[0-7][0-9a-hjkmnp-tv-z]{25}$"}
+        feature: {type: string}
+        plan: {type: string}
+        limit: {type: integer, format: int64}
+        window: {$ref: "#/components/schemas/QuotaWindow"}
+        meter: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    QuotaList:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Quota"}
+    QuotaReplace:
+      type: object
+      required: [quotas]
+      additionalProperties: false
+      properties:
+        quotas:
+          type: array
+          maxItems: 500
+          items: {$ref: "#/components/schemas/QuotaSpec"}
+        reason: {type: string, maxLength: 1000}
+    QuotaOverrideCreate:
+      type: object
+      required: [feature, limit, reason]
+      additionalProperties: false
+      properties:
+        feature: {type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$"}
+        limit: {type: [integer, "null"], format: int64, minimum: 0, maximum: 1000000000000000, description: "The tenant's limit, or null to clear the overrides before it."}
+        window: {$ref: "#/components/schemas/QuotaWindow"}
+        meter: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$", description: The meter a day or month override counts.}
+        reason: {type: string, minLength: 1, maxLength: 1000}
+        expires_at: {type: string, format: date-time, description: Within 10 years.}
+    QuotaOverride:
+      type: object
+      required: [id, tenant_id, feature, limit, reason, expires_at, created_at]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: "^qta_[0-7][0-9a-hjkmnp-tv-z]{25}$"}
+        tenant_id: {$ref: "#/components/schemas/TenantId"}
+        feature: {type: string}
+        limit: {type: [integer, "null"], format: int64}
+        window: {$ref: "#/components/schemas/QuotaWindow"}
+        meter: {type: string}
+        reason: {type: string}
+        expires_at: {type: [string, "null"], format: date-time}
+        created_at: {type: string, format: date-time}

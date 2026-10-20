@@ -118,8 +118,8 @@ ZSoftly Core is under active development. Expect bugs, breaking changes, and gap
 
 | Path | Contents |
 | --- | --- |
-| `cmd/zs-core` | The service binary, with `serve`, `migrate` and the operator commands `doctor`, `upgrade`, `brand`, `grant` and `tenant`. |
-| `pkg/` | Importable packages: `errors`, `idgen`, `scope`, `idempotency`, `events`, `outbox`, `audit`, `brand`, `identity`, `tenant` and `apikey`. Writers take a `pgx.Tx`, so a product can use them inside its own transaction. |
+| `cmd/zs-core` | The service binary, with `serve`, `migrate` and the operator commands `doctor`, `upgrade`, `brand`, `grant`, `tenant`, `credit-code`, `credit`, `wallet` and `usage`. |
+| `pkg/` | Importable packages: `errors`, `idgen`, `scope`, `idempotency`, `events`, `outbox`, `audit`, `brand`, `identity`, `tenant`, `apikey`, `billing`, `wallet`, `metering` and `quota`. Writers take a `pgx.Tx`, so a product can use them inside its own transaction. |
 | `internal/` | Service-only code: configuration, database and migration runner, the HTTP API, the Keycloak and Kill Bill clients, and the test harnesses for Postgres, the engines and the reference stack. |
 | `migrations/` | Forward-only SQL migrations, embedded in the binary. |
 | `api/openapi.yaml` | The OpenAPI 3.1 contract. Go types in `internal/httpapi/gen` are generated from it. |
@@ -127,7 +127,7 @@ ZSoftly Core is under active development. Expect bugs, breaking changes, and gap
 
 ## Development
 
-`make check` gates every change. No hosted CI workflow exists. Start with [docs/development.md](docs/development.md) for building, testing and migrating, and [docs/configuration.md](docs/configuration.md) for every environment variable. Module guides are in [docs/modules](docs/modules), starting with [foundation](docs/modules/foundation.md), [audit](docs/modules/audit.md), [brands](docs/modules/brands.md), [tenants](docs/modules/tenants.md) and [API keys](docs/modules/api-keys.md). Code that started in other ZSoftly repositories is listed in [PROVENANCE.md](PROVENANCE.md).
+`make check` gates every change. No hosted CI workflow exists. Start with [docs/development.md](docs/development.md) for building, testing and migrating, and [docs/configuration.md](docs/configuration.md) for every environment variable. Module guides are in [docs/modules](docs/modules), starting with [foundation](docs/modules/foundation.md), [audit](docs/modules/audit.md), [brands](docs/modules/brands.md), [tenants](docs/modules/tenants.md), [API keys](docs/modules/api-keys.md), [billing](docs/modules/billing.md), [wallet](docs/modules/wallet.md), [metering](docs/modules/metering.md) and [quotas](docs/modules/quotas.md). Code that started in other ZSoftly repositories is listed in [PROVENANCE.md](PROVENANCE.md).
 
 ## License
 

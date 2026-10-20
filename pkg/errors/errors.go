@@ -37,6 +37,7 @@ type Definition struct {
 //	ZS-1600..1699 tenants, memberships, teams and invitations
 //	ZS-1700..1799 API keys
 //	ZS-1800..1899 billing
+//	ZS-1900..1999 wallet, metering and quotas
 const (
 	CodeInternal             Code = "ZS-1000"
 	CodeValidation           Code = "ZS-1001"
@@ -101,6 +102,23 @@ const (
 	CodeCreditCodeExhausted   Code = "ZS-1804"
 	CodeWalletOnHold          Code = "ZS-1805"
 	CodeBillingTokenInvalid   Code = "ZS-1806"
+
+	CodeInsufficientCredit           Code = "ZS-1900"
+	CodeReservationNotFound          Code = "ZS-1901"
+	CodeReservationNotHeld           Code = "ZS-1902"
+	CodeReservationSettlementPending Code = "ZS-1903"
+	CodeReservationConflict          Code = "ZS-1904"
+	CodeWalletUnavailable            Code = "ZS-1905"
+	CodeSettlementExceedsHold        Code = "ZS-1906"
+	CodeUnitUnrated                  Code = "ZS-1907"
+	CodeReservationClosed            Code = "ZS-1908"
+	CodeSettlementConflict           Code = "ZS-1909"
+	CodeMeterNotFound                Code = "ZS-1910"
+	CodeUsageEventConflict           Code = "ZS-1911"
+	CodeUsageOutOfWindow             Code = "ZS-1912"
+	CodeUsageOverflow                Code = "ZS-1913"
+	CodeQuotaExceeded                Code = "ZS-1920"
+	CodeQuotaNotConcurrent           Code = "ZS-1921"
 )
 
 var definitions = []Definition{
@@ -159,6 +177,22 @@ var definitions = []Definition{
 	{CodeCreditCodeExhausted, "credit_code_exhausted", http.StatusConflict, false, "The code has no redemptions left."},
 	{CodeWalletOnHold, "wallet_on_hold", http.StatusConflict, false, "Billing changes are on hold for this tenant."},
 	{CodeBillingTokenInvalid, "billing_token_invalid", http.StatusUnauthorized, false, "The billing credential is invalid or expired."},
+	{CodeInsufficientCredit, "insufficient_credit", http.StatusConflict, false, "The tenant does not have enough available credit."},
+	{CodeReservationNotFound, "reservation_not_found", http.StatusNotFound, false, "The reservation was not found."},
+	{CodeReservationNotHeld, "reservation_not_held", http.StatusConflict, false, "The reservation is no longer held."},
+	{CodeReservationSettlementPending, "reservation_settlement_pending", http.StatusConflict, true, "The reservation's settlement is waiting for the billing engine."},
+	{CodeReservationConflict, "reservation_conflict", http.StatusConflict, false, "The reservation was already settled differently."},
+	{CodeWalletUnavailable, "wallet_unavailable", http.StatusServiceUnavailable, true, "The wallet cannot tell what the tenant has used and not yet been invoiced."},
+	{CodeSettlementExceedsHold, "settlement_exceeds_hold", http.StatusConflict, false, "The settlement is worth more than the reservation holds."},
+	{CodeUnitUnrated, "unit_unrated", http.StatusUnprocessableEntity, false, "The catalogue has no price for this unit on the subscription's current phase."},
+	{CodeReservationClosed, "reservation_closed", http.StatusConflict, false, "The reservation was settled, released or expired."},
+	{CodeSettlementConflict, "settlement_conflict", http.StatusConflict, false, "The billing engine already holds a different settlement under this reservation's key."},
+	{CodeMeterNotFound, "meter_not_found", http.StatusNotFound, false, "The meter is unknown or retired."},
+	{CodeUsageEventConflict, "usage_event_conflict", http.StatusConflict, false, "A usage event with this event_id was recorded with a different payload."},
+	{CodeUsageOutOfWindow, "usage_out_of_window", http.StatusBadRequest, false, "The usage event is outside the brand's backfill window."},
+	{CodeUsageOverflow, "usage_overflow", http.StatusUnprocessableEntity, false, "The usage quantity would overflow."},
+	{CodeQuotaExceeded, "quota_exceeded", http.StatusConflict, false, "The tenant has reached the limit of this feature."},
+	{CodeQuotaNotConcurrent, "quota_not_concurrent", http.StatusConflict, false, "A feature whose quota has no window cannot be consumed."},
 }
 
 var byCode = func() map[Code]Definition {

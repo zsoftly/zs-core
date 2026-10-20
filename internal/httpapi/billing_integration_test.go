@@ -72,7 +72,7 @@ func TestBillingRoutesEndToEnd(t *testing.T) {
 	base := "/v1/tenants/" + id
 	brandID := idgen.Format(idgen.Brand, b.ID)
 
-	if r := a.call(http.MethodGet, "/v1/brands/"+brandID+"/catalogue", memberTok, nil); r.status != http.StatusOK || len(r.body["products"].([]any)) != 2 {
+	if r := a.call(http.MethodGet, "/v1/brands/"+brandID+"/catalogue", memberTok, nil); r.status != http.StatusOK || len(r.body["products"].([]any)) != 3 {
 		t.Fatalf("catalogue = %d %v", r.status, r.body)
 	}
 	if r := a.call(http.MethodGet, "/v1/brands/"+brandID+"/catalogue", a.token(outsider, enginetest.TokenOptions{}), nil); r.status != http.StatusNotFound {

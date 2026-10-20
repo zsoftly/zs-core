@@ -45,7 +45,9 @@ Examples, for a key created by an admin with `member:read`, `team:manage` and `v
 - The admin is removed or suspended. Core revokes the key in the same transaction. Every request with it is `401 api_key_invalid`.
 - The admin is removed and later invited back. The admin gets a new membership with a new ID. The key still belongs to the old, removed membership and stays revoked: `401 api_key_invalid`.
 
-Library callers use `apikey.Verify(ctx, tx, secret)` inside their own transaction. It returns the key, the brand slug, the tenant status, the creating membership and the effective permissions. Scope resolution refuses writes to a suspended tenant and everything on a closed one.
+Library callers use `apikey.Verify(ctx, tx, secret)` inside their own transaction. It returns the key, the brand slug, the tenant status, the creating membership and the effective permissions. Scope resolution refuses writes to a suspended tenant and everything on a closed one. A suspended tenant's key still settles, releases and extends its reservations and releases its quota leases.
+
+A service key that carries `wallet:reserve` or `quota:consume` owns the holds and quota leases it makes. Neither the membership that created it nor any other caller of the tenant can settle, release or extend them. See [wallet.md](wallet.md#holders).
 
 ## Listing and revoking
 

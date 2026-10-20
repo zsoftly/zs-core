@@ -473,6 +473,9 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 RETURNING `+redemptionColumns
 			return unavailable(err)
 		}
 		row = completed
+		if err := BumpWalletVersion(ctx, tx, sc); err != nil {
+			return err
+		}
 		_, err = audit.Write(ctx, tx, sc, audit.Entry{
 			Actor: call.Actor, Action: "billing.credit.redeemed", Outcome: audit.OutcomeSuccess, CorrelationID: call.CorrelationID,
 			Details: map[string]any{"credit_id": idgen.Format(idgen.Credit, row.id), "credit_code_id": idgen.Format(idgen.CreditCode, row.codeID),
@@ -645,6 +648,9 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 RETURNING `+staffCreditColumn
 			return unavailable(err)
 		}
 		row = completed
+		if err := BumpWalletVersion(ctx, tx, sc); err != nil {
+			return err
+		}
 		details := map[string]any{"credit_id": idgen.Format(idgen.Credit, row.id), "amount_minor": row.amountMinor,
 			"currency": row.currency, "killbill_credit_id": item.InvoiceItemID}
 		if row.expiresAt != nil {

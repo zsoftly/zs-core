@@ -13,6 +13,12 @@
     "identity": {"$ref": "#/$defs/identity"},
     "billing": {"$ref": "#/$defs/billing"},
     "notifications": {"$ref": "#/$defs/notifications"},
+    "entitlements": {
+      "description": "Quotas per feature and plan. Present, even empty, brand apply makes the brand's quotas exactly this list. Absent, apply leaves them to PUT /v1/brands/{id}/quotas.",
+      "type": "array",
+      "maxItems": 500,
+      "items": {"$ref": "#/$defs/entitlement"}
+    },
     "permissions": {
       "type": "array",
       "uniqueItems": true,
@@ -226,7 +232,52 @@
             "version": {"type": "string", "pattern": "^[0-9A-Za-z.+-]{1,50}$"}
           }
         },
-        "templates": {"$ref": "#/$defs/relativePath"}
+        "templates": {"$ref": "#/$defs/relativePath"},
+        "wallet": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "overdraft_minor": {"type": "integer", "minimum": 0, "maximum": 10000000000, "description": "How far below zero the available credit may go, in minor units of the account currency."},
+            "low_balance_minor": {"type": "integer", "minimum": 0, "maximum": 10000000000, "description": "The available credit below which the wallet is low and wallet.low_balance is emitted. 0 turns it off."}
+          }
+        },
+        "usage_window": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "backfill_hours": {"type": "integer", "minimum": 1, "maximum": 744, "description": "How far back occurred_at may be. Defaults to 168, seven days."},
+            "future_seconds": {"type": "integer", "minimum": 0, "maximum": 3600, "description": "How far ahead occurred_at may be. Defaults to 300."}
+          }
+        },
+        "meters": {
+          "description": "Present, even empty, brand apply makes the brand's meters exactly this list and retires the others. Absent, apply leaves them to PUT /v1/brands/{id}/meters.",
+          "type": "array",
+          "maxItems": 200,
+          "items": {"$ref": "#/$defs/meter"}
+        }
+      }
+    },
+    "meter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slug", "unit", "killbill_unit"],
+      "properties": {
+        "slug": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"},
+        "unit": {"enum": ["minute", "second", "byte", "gib_hour", "request", "token", "count"]},
+        "killbill_unit": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$", "description": "A usage unit of the brand's catalogue."},
+        "dimensions": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,39}$"}}
+      }
+    },
+    "entitlement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["feature", "plan", "limit", "window"],
+      "properties": {
+        "feature": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$"},
+        "plan": {"type": "string", "minLength": 1, "maxLength": 255, "description": "A plan of the catalogue, or * for every plan."},
+        "limit": {"type": "integer", "minimum": 0, "maximum": 1000000000000000},
+        "window": {"enum": ["none", "day", "month", "concurrent"]},
+        "meter": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$", "description": "The meter whose usage counts against a day or month limit."}
       }
     },
     "notifications": {

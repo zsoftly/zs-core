@@ -117,7 +117,7 @@ func TestForeignApplyDoesNotTakeTheBrandLock(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var locked bool
-	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.brand.apply:' || $1, 0))`, theirs.Slug).Scan(&locked); err != nil || !locked {
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.brand.apply:' || current_schema() || ':' || $1, 0))`, theirs.Slug).Scan(&locked); err != nil || !locked {
 		t.Fatalf("lock: %v %v", locked, err)
 	}
 
@@ -145,7 +145,7 @@ func TestForeignApplyDoesNotTakeTheBrandLock(t *testing.T) {
 	// The foreign attempt left no lock behind: zs-second's lock is free.
 	var free bool
 	if err := pgx.BeginFunc(ctx, db.Pool, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.brand.apply:' || $1, 0))`, theirs.Slug).Scan(&free)
+		return tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.brand.apply:' || current_schema() || ':' || $1, 0))`, theirs.Slug).Scan(&free)
 	}); err != nil || !free {
 		t.Fatalf("lock after the foreign attempt: %v %v", free, err)
 	}

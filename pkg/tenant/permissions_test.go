@@ -17,9 +17,17 @@ func TestRoleImplications(t *testing.T) {
 	}
 	admin := RoleImplies(RoleAdmin, registered)
 	for _, p := range admin {
-		if strings.HasPrefix(p, "billing:") || p == TransferPermission {
+		if strings.HasPrefix(p, "billing:") || p == TransferPermission || slices.Contains(WorkloadPermissions, p) {
 			t.Fatalf("admin holds %s", p)
 		}
+	}
+	for _, p := range WorkloadPermissions {
+		if !slices.Contains(owner, p) {
+			t.Fatalf("owner lacks %s", p)
+		}
+	}
+	if !slices.Contains(admin, "usage:read") {
+		t.Fatalf("admin lacks usage:read: %v", admin)
 	}
 	for _, want := range []string{"member:update", "member:remove", "team:manage", "apikey:create", "vm:create", "audit:read"} {
 		if !slices.Contains(admin, want) {

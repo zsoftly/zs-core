@@ -14,11 +14,15 @@ A tenant is a personal or organization account inside one brand. The contract is
 | Role | Implies |
 | --- | --- |
 | `owner` | Every registered permission. |
-| `admin` | Every registered permission except `billing:*` and `tenant:transfer`. |
+| `admin` | Every registered permission except `billing:*`, `tenant:transfer`, `wallet:reserve`, `usage:write` and `quota:consume`. |
 | `billing_admin` | `billing:*` only. |
 | `member` | Nothing. A member has what its teams grant. |
 
 A tenant is `active`, `suspended` or `closed`. A membership is `active`, `suspended` or `removed`. Only an active membership in an active tenant writes. A suspended tenant keeps its reads. Closed is terminal.
+
+A suspended tenant still makes the writes that only give back what it holds. It may settle, release and extend its reservations, and release its quota leases, so the work it already runs can finish and pay. It never reserves, grows a reservation, consumes a quota or records usage over HTTP. See [wallet.md](wallet.md#reservations) and [quotas.md](quotas.md#leases).
+
+`wallet:reserve`, `usage:write` and `quota:consume` are workload permissions. No role but `owner` implies them. A team grants them, or a service API key carries them. A hold or a quota lease belongs to the membership or API key that made it, so a customer role cannot settle, release or break a product's holds.
 
 A tenant name is 1 to 100 characters. Kill Bill stores the account name, which is the tenant name, in a varchar(100), and refuses a longer one. A longer name is `400 validation_failed` before Core calls an engine.
 
@@ -39,8 +43,9 @@ Every tenant has three system teams: `owners`, `admins` and `members`. They are 
 
 Examples, for a brand that registers `vm:create` and `billing:refund`:
 
-- An owner holds all 17 permissions.
-- An admin holds 13 of them: no `billing:read`, `billing:manage`, `billing:refund` or `tenant:transfer`.
+- An owner holds all 21 permissions.
+- An admin holds 14 of them: no `billing:read`, `billing:manage`, `billing:refund`, `tenant:transfer`, `wallet:reserve`, `usage:write` or `quota:consume`.
+- A service API key the owner creates with `wallet:reserve` and `quota:consume` holds those two, and owns the holds and leases it makes.
 - A billing admin holds `billing:read`, `billing:manage` and `billing:refund`, plus `tenant:read`, `member:read` and `team:read` from the `members` team.
 - A member in a team that grants `vm:create` holds `vm:create`, `tenant:read`, `member:read` and `team:read`.
 

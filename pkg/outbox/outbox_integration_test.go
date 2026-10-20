@@ -353,3 +353,32 @@ func TestReaderWithEventTypesClaimsOnlyThoseTypes(t *testing.T) {
 		t.Fatalf("unfiltered claim after the filtered one = %+v", claim.Events)
 	}
 }
+
+// A reader without event types, such as a relay to products, never claims
+// the internal types: each has one consumer, which names it.
+func TestGenericReaderSkipsInternalTypes(t *testing.T) {
+	db := postgrestest.New(t)
+	ctx := context.Background()
+	for _, typ := range append([]string{"test.public"}, outbox.InternalEventTypes...) {
+		ev := newEvent(t, typ)
+		if err := pgx.BeginFunc(ctx, db.Pool, func(tx pgx.Tx) error { return outbox.Write(ctx, tx, ev) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claim, err := outbox.NewPostgresReader(db.Pool).Claim(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claim.Events) != 1 || claim.Events[0].Type != "test.public" {
+		t.Fatalf("generic claim = %+v", claim.Events)
+	}
+	for _, typ := range outbox.InternalEventTypes {
+		if !outbox.IsInternal(typ) {
+			t.Fatalf("%s is not internal", typ)
+		}
+		claim, err := outbox.NewPostgresReader(db.Pool).WithEventTypes(typ).Claim(ctx, 100)
+		if err != nil || len(claim.Events) != 1 || claim.Events[0].Type != typ {
+			t.Fatalf("claim of %s = %+v %v", typ, claim.Events, err)
+		}
+	}
+}

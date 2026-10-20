@@ -86,7 +86,7 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (SweepReport, error) {
 	}
 	defer func() { _ = lock.Rollback(context.WithoutCancel(ctx)) }()
 	var locked bool
-	if err := lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.tenant.sweep', 0))`).Scan(&locked); err != nil {
+	if err := lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.tenant.sweep:' || current_schema(), 0))`).Scan(&locked); err != nil {
 		return report, unavailable(err)
 	}
 	if !locked {

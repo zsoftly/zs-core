@@ -21,13 +21,16 @@ const ExternalPlugin = "__EXTERNAL_PAYMENT__"
 const HostedPlugin = "killbill-hosted-test"
 
 // The test catalogue: a BASE product core-test with a monthly plan that has
-// a 14-day trial and the usage unit api-call, and a BASE product core-basic
-// with a monthly plan without usage.
+// a 14-day trial and the usage unit api-call, a BASE product core-basic
+// with a monthly plan without usage, and a BASE product core-metered whose
+// monthly plan has no trial and prices api-call per unit.
 const (
-	PlanUsage   = "core-test-monthly"
-	PlanBasic   = "core-basic-monthly"
-	ProductTest = "core-test"
-	UnitAPICall = "api-call"
+	PlanUsage    = "core-test-monthly"
+	PlanBasic    = "core-basic-monthly"
+	PlanMetered  = "core-metered-monthly"
+	ProductTest  = "core-test"
+	ProductMeter = "core-metered"
+	UnitAPICall  = "api-call"
 )
 
 // KillBillWrite is the audit headers of one Kill Bill write the fake
@@ -45,6 +48,7 @@ func (f *Fake) Writes() []KillBillWrite {
 
 type kbItem struct {
 	id, invoiceID, typ, description, subscriptionID, plan string
+	start, end                                            string
 	amount                                                int64
 }
 
@@ -52,6 +56,7 @@ type kbInvoice struct {
 	id, accountID, currency string
 	number                  int
 	items                   []*kbItem
+	trackingIDs             []string
 }
 
 func (in *kbInvoice) amount() int64 {
@@ -76,7 +81,7 @@ func (in *kbInvoice) balance() int64 {
 }
 
 type kbSub struct {
-	id, bundleID, accountID, externalKey, plan, product, state, phase, cancelled string
+	id, bundleID, accountID, externalKey, plan, product, state, phase, cancelled, start string
 }
 
 type kbTxn struct {
@@ -105,7 +110,16 @@ type kbPM struct {
 	isDefault, deleted                 bool
 }
 
+// kbUsage is one usage record the fake holds. AmountMicro is the amount in
+// millionths of the unit.
+type kbUsage struct {
+	subscriptionID, trackingID, unit, date string
+	amountMicro                            int64
+	invoiced                               bool
+}
+
 type kbTenant struct {
+	usages     []kbUsage
 	catalog    []killbill.Catalog
 	subs       []*kbSub
 	invoices   []*kbInvoice
@@ -135,6 +149,8 @@ func TestCatalog() killbill.Catalog {
 	usage := killbill.CatalogPhase{Type: "EVERGREEN", Prices: cad("10.00"), FixedPrices: []killbill.Price{}, Duration: killbill.Duration{Unit: "UNLIMITED", Number: -1},
 		Usages: []killbill.CatalogUsage{{BillingPeriod: "MONTHLY", Tiers: []killbill.CatalogTier{{Blocks: []killbill.TieredBlock{{Unit: UnitAPICall, Size: "1000", Max: "1000000", Prices: cad("1.00")}}}}}}}
 	basic := killbill.CatalogPhase{Type: "EVERGREEN", Prices: cad("5.00"), FixedPrices: []killbill.Price{}, Duration: killbill.Duration{Unit: "UNLIMITED", Number: -1}}
+	metered := killbill.CatalogPhase{Type: "EVERGREEN", Prices: []killbill.Price{}, FixedPrices: []killbill.Price{}, Duration: killbill.Duration{Unit: "UNLIMITED", Number: -1},
+		Usages: []killbill.CatalogUsage{{BillingPeriod: "MONTHLY", Tiers: []killbill.CatalogTier{{Blocks: []killbill.TieredBlock{{Unit: UnitAPICall, Size: "1", Max: "100000000", Prices: cad("0.01")}}}}}}}
 	return killbill.Catalog{Name: "ZsReference", EffectiveDate: "2026-10-01T00:00:00.000+00:00", Currencies: []string{"CAD", "USD"},
 		Units: []killbill.CatalogUnit{{Name: UnitAPICall, PrettyName: UnitAPICall}},
 		Products: []killbill.CatalogProduct{
@@ -142,6 +158,8 @@ func TestCatalog() killbill.Catalog {
 				Plans: []killbill.CatalogPlan{{Name: PlanUsage, PrettyName: PlanUsage, BillingPeriod: "MONTHLY", Phases: []killbill.CatalogPhase{trial, usage}}}},
 			{Type: "BASE", Name: "core-basic", PrettyName: "core-basic", Included: []string{}, Available: []string{},
 				Plans: []killbill.CatalogPlan{{Name: PlanBasic, PrettyName: PlanBasic, BillingPeriod: "MONTHLY", Phases: []killbill.CatalogPhase{trial, basic}}}},
+			{Type: "BASE", Name: ProductMeter, PrettyName: ProductMeter, Included: []string{}, Available: []string{},
+				Plans: []killbill.CatalogPlan{{Name: PlanMetered, PrettyName: PlanMetered, BillingPeriod: "NO_BILLING_PERIOD", Phases: []killbill.CatalogPhase{metered}}}},
 		}}
 }
 
@@ -305,7 +323,7 @@ func (t *kbTenant) plan(name string) (killbill.CatalogProduct, killbill.CatalogP
 
 func (s *kbSub) json() killbill.Subscription {
 	return killbill.Subscription{AccountID: s.accountID, BundleID: s.bundleID, SubscriptionID: s.id, ExternalKey: s.externalKey,
-		StartDate: "2026-10-20T00:00:00.000Z", ProductName: s.product, ProductCategory: "BASE", BillingPeriod: "MONTHLY",
+		StartDate: s.start, ProductName: s.product, ProductCategory: "BASE", BillingPeriod: "MONTHLY",
 		PhaseType: s.phase, PriceList: "DEFAULT", PlanName: s.plan, State: s.state, CancelledDate: s.cancelled}
 }
 
@@ -317,13 +335,15 @@ func (in *kbInvoice) json(withItems bool) killbill.Invoice {
 		for _, it := range in.items {
 			out.Items = append(out.Items, it.json(in))
 		}
+		out.TrackingIDs = append([]string(nil), in.trackingIDs...)
 	}
 	return out
 }
 
 func (it *kbItem) json(in *kbInvoice) killbill.InvoiceItem {
 	return killbill.InvoiceItem{InvoiceItemID: it.id, InvoiceID: in.id, AccountID: in.accountID, ItemType: it.typ,
-		Description: it.description, SubscriptionID: it.subscriptionID, PlanName: it.plan, Amount: money(it.amount), Currency: in.currency}
+		Description: it.description, SubscriptionID: it.subscriptionID, PlanName: it.plan, Amount: money(it.amount), Currency: in.currency,
+		StartDate: it.start, EndDate: it.end}
 }
 
 func (p *kbPayment) json() killbill.Payment {
@@ -354,6 +374,12 @@ func (f *Fake) serveBilling(w http.ResponseWriter, r *http.Request, apiKey, path
 	switch {
 	case path == "/1.0/kb/catalog" && r.Method == http.MethodGet:
 		reply(w, http.StatusOK, t.catalog)
+	case path == "/1.0/kb/invoices/dryRun" && r.Method == http.MethodPost:
+		f.dryRun(w, t, q.Get("accountId"))
+	case path == "/1.0/kb/usages" && r.Method == http.MethodPost:
+		f.recordUsage(w, t, body)
+	case len(parts) == 2 && parts[0] == "usages" && r.Method == http.MethodGet:
+		f.rolledUpUsage(w, t, parts[1], q)
 	case path == "/1.0/kb/tenants/registerNotificationCallback" && r.Method == http.MethodGet:
 		reply(w, http.StatusOK, map[string]any{"key": "PUSH_NOTIFICATION_CB", "values": t.callbacks})
 	case path == "/1.0/kb/tenants/registerNotificationCallback" && r.Method == http.MethodPost:
@@ -539,7 +565,7 @@ func (f *Fake) serveBilling(w http.ResponseWriter, r *http.Request, apiKey, path
 			return true
 		}
 		s := &kbSub{id: idgen.MustNewV7().String(), bundleID: idgen.MustNewV7().String(), accountID: a.ID, externalKey: in.ExternalKey,
-			plan: plan.Name, product: prod.Name, state: "ACTIVE", phase: plan.Phases[0].Type}
+			plan: plan.Name, product: prod.Name, state: "ACTIVE", phase: plan.Phases[0].Type, start: DefaultSubscriptionStart}
 		t.subs = append(t.subs, s)
 		t.addInvoice(a.ID, a.Currency, []*kbItem{{typ: "FIXED", amount: 0, description: plan.Name + "-trial", subscriptionID: s.id, plan: plan.Name}})
 		w.Header().Set("Location", "http://fake/1.0/kb/subscriptions/"+s.id)
@@ -749,4 +775,316 @@ func (f *Fake) serveNodes(w http.ResponseWriter, r *http.Request, body []byte) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// recordUsage records usage as Kill Bill 0.24.22 does: an unknown
+// subscription is 404, a tracking ID the subscription already has is 400
+// with error code 50000 and records nothing, and the unit, the amount and
+// the subscription's state are not checked. f.mu is held.
+func (f *Fake) recordUsage(w http.ResponseWriter, t *kbTenant, body []byte) {
+	var in killbill.SubscriptionUsageRecord
+	if err := json.Unmarshal(body, &in); err != nil {
+		kbError(w, http.StatusBadRequest, 2)
+		return
+	}
+	found := false
+	for _, s := range t.subs {
+		found = found || s.id == in.SubscriptionID
+	}
+	if !found {
+		reply(w, http.StatusNotFound, map[string]any{"code": nil, "message": "Object doesn't exist"})
+		return
+	}
+	if in.TrackingID != "" {
+		for _, u := range t.usages {
+			if u.subscriptionID == in.SubscriptionID && u.trackingID == in.TrackingID {
+				kbError(w, http.StatusBadRequest, 50000)
+				return
+			}
+		}
+	}
+	var add []kbUsage
+	for _, unit := range in.UnitUsageRecords {
+		for _, rec := range unit.UsageRecords {
+			micro, ok := parseMicro(rec.Amount)
+			if !ok {
+				kbError(w, http.StatusBadRequest, 2)
+				return
+			}
+			add = append(add, kbUsage{subscriptionID: in.SubscriptionID, trackingID: in.TrackingID, unit: unit.UnitType,
+				date: rec.RecordDate, amountMicro: micro})
+		}
+	}
+	t.usages = append(t.usages, add...)
+	w.WriteHeader(http.StatusCreated)
+}
+
+// rolledUpUsage sums the usage of a subscription per unit from startDate,
+// inclusive, to endDate, exclusive. f.mu is held.
+func (f *Fake) rolledUpUsage(w http.ResponseWriter, t *kbTenant, subscriptionID string, q url.Values) {
+	start, end := q.Get("startDate"), q.Get("endDate")
+	if start == "" || end == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	found := false
+	for _, s := range t.subs {
+		found = found || s.id == subscriptionID
+	}
+	if !found {
+		reply(w, http.StatusNotFound, map[string]any{"code": nil, "message": "Object doesn't exist"})
+		return
+	}
+	totals := map[string]int64{}
+	var order []string
+	for _, u := range t.usages {
+		day := u.date
+		if len(day) > 10 {
+			day = day[:10]
+		}
+		if u.subscriptionID != subscriptionID || day < start || day >= end {
+			continue
+		}
+		if _, ok := totals[u.unit]; !ok {
+			order = append(order, u.unit)
+		}
+		totals[u.unit] += u.amountMicro
+	}
+	out := killbill.RolledUpUsage{SubscriptionID: subscriptionID, StartDate: start + "T00:00:00.000Z", EndDate: end + "T00:00:00.000Z",
+		RolledUpUnits: []killbill.RolledUpUnit{}}
+	for _, unit := range order {
+		v := totals[unit]
+		out.RolledUpUnits = append(out.RolledUpUnits, killbill.RolledUpUnit{UnitType: unit, Amount: json.Number(fmt.Sprintf("%d.%06d000", v/1_000_000, v%1_000_000))})
+	}
+	reply(w, http.StatusOK, out)
+}
+
+// parseMicro reads a non-negative decimal with at most six digits after
+// the point as millionths. Negative amounts are kept, as Kill Bill keeps
+// them.
+func parseMicro(v json.Number) (int64, bool) {
+	s := string(v)
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	whole, frac, _ := strings.Cut(s, ".")
+	frac = strings.TrimRight(frac, "0")
+	if len(frac) > 6 {
+		return 0, false
+	}
+	frac += strings.Repeat("0", 6-len(frac))
+	w, err1 := strconv.ParseInt(whole, 10, 64)
+	f, err2 := strconv.ParseInt(frac, 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, false
+	}
+	m := w*1_000_000 + f
+	if neg {
+		m = -m
+	}
+	return m, true
+}
+
+// FakeUsage is a usage record the fake holds.
+type FakeUsage struct {
+	SubscriptionID, TrackingID, Unit, Date string
+	AmountMicro                            int64
+}
+
+// UsageRecords returns the usage records of a Kill Bill tenant, oldest
+// first.
+func (f *Fake) UsageRecords(apiKey string) []FakeUsage {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []FakeUsage
+	for _, u := range f.billing[apiKey].usages {
+		out = append(out, FakeUsage{SubscriptionID: u.subscriptionID, TrackingID: u.trackingID, Unit: u.unit, Date: u.date, AmountMicro: u.amountMicro})
+	}
+	return out
+}
+
+// AddExternalCharge writes an external charge to an account behind Core's
+// back, paid from the account credit first.
+func (f *Fake) AddExternalCharge(apiKey, accountID string, amountMinor int64, description string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t := f.billing[apiKey]
+	used := min(amountMinor, t.cba[accountID])
+	list := []*kbItem{{typ: "EXTERNAL_CHARGE", amount: amountMinor, description: description}}
+	if used > 0 {
+		list = append(list, &kbItem{typ: "CBA_ADJ", amount: -used})
+	}
+	t.addInvoice(accountID, "CAD", list)
+	t.cba[accountID] -= used
+}
+
+// AccountBlock adds an account blocking state behind Core's back.
+func (f *Fake) AccountBlock(apiKey, accountID string, s killbill.BlockingState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if a := f.account(apiKey, accountID); a != nil {
+		a.Blocking = append(a.Blocking, s)
+	}
+}
+
+// dryRun answers a dry-run invoice with the usage of the account's active
+// subscriptions priced from the catalogue, the first tier of the phase,
+// one block price per started block. The fake never invoices usage, so all
+// of it is unbilled. Recurring charges are left out. Nothing to invoice is
+// 204, as Kill Bill 0.24.22 answers. f.mu is held.
+func (f *Fake) dryRun(w http.ResponseWriter, t *kbTenant, accountID string) {
+	if f.dryRunDown {
+		reply(w, http.StatusInternalServerError, map[string]any{"code": nil, "message": "dry run failed"})
+		return
+	}
+	var total int64
+	var items []*kbItem
+	for _, s := range t.subs {
+		if s.accountID != accountID || s.state != "ACTIVE" {
+			continue
+		}
+		_, plan, ok := t.plan(s.plan)
+		if !ok {
+			continue
+		}
+		sums := map[string]int64{}
+		for _, u := range t.usages {
+			if u.subscriptionID == s.id && !u.invoiced {
+				sums[u.unit] += u.amountMicro
+			}
+		}
+		for _, ph := range plan.Phases {
+			if ph.Type != s.phase {
+				continue
+			}
+			for _, us := range ph.Usages {
+				for _, tier := range us.Tiers {
+					for _, b := range tier.Blocks {
+						q := sums[b.Unit]
+						size, ok1 := parseMicro(json.Number(b.Size))
+						price, ok2 := parseMoney(b.Prices[0].Value)
+						if q <= 0 || !ok1 || !ok2 || size <= 0 {
+							continue
+						}
+						amount := (q + size - 1) / size * price
+						total += amount
+						items = append(items, &kbItem{typ: "USAGE", amount: amount, subscriptionID: s.id, plan: s.plan})
+					}
+				}
+			}
+		}
+	}
+	if total == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	in := &kbInvoice{id: idgen.MustNewV7().String(), accountID: accountID, currency: "CAD"}
+	for _, it := range items {
+		it.id, it.invoiceID = idgen.MustNewV7().String(), in.id
+		in.items = append(in.items, it)
+	}
+	reply(w, http.StatusOK, in.json(true))
+}
+
+// Charges counts the account's external charges whose description starts
+// with prefix.
+func (f *Fake) Charges(apiKey, accountID, prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, in := range f.billing[apiKey].invoices {
+		for _, it := range in.items {
+			if in.accountID == accountID && it.typ == "EXTERNAL_CHARGE" && strings.HasPrefix(it.description, prefix) {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// DefaultSubscriptionStart is the start date the fake gives a new
+// subscription.
+const DefaultSubscriptionStart = "2026-01-01T00:00:00.000Z"
+
+// SetSubscriptionStart moves the start of a subscription, as a
+// subscription created with a future start date has.
+func (f *Fake) SetSubscriptionStart(apiKey, subscriptionID string, start time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.billing[apiKey].subs {
+		if s.id == subscriptionID {
+			s.start = start.UTC().Format("2006-01-02T15:04:05.000Z")
+		}
+	}
+}
+
+// InvoiceUsage bills the usage records of an account's subscriptions dated
+// from from, inclusive, to to, exclusive, that no invoice bills yet, as
+// Kill Bill's invoice run at the end of a usage period does: one USAGE item
+// per subscription and unit, priced from the first tier of the catalogue,
+// with the period as its start and end dates, and the tracking IDs of the
+// records on the invoice. It returns the invoice ID, or "" when there was
+// nothing to bill.
+func (f *Fake) InvoiceUsage(apiKey, accountID string, from, to time.Time) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t := f.billing[apiKey]
+	var items []*kbItem
+	var tracking []string
+	seen := map[string]bool{}
+	for _, s := range t.subs {
+		if s.accountID != accountID {
+			continue
+		}
+		_, plan, ok := t.plan(s.plan)
+		if !ok {
+			continue
+		}
+		sums := map[string]int64{}
+		for i := range t.usages {
+			u := &t.usages[i]
+			day := u.date
+			if len(day) > 10 {
+				day = day[:10]
+			}
+			if u.subscriptionID != s.id || u.invoiced || day < from.Format(time.DateOnly) || day >= to.Format(time.DateOnly) {
+				continue
+			}
+			u.invoiced = true
+			sums[u.unit] += u.amountMicro
+			if u.trackingID != "" && !seen[u.trackingID] {
+				seen[u.trackingID] = true
+				tracking = append(tracking, u.trackingID)
+			}
+		}
+		for _, ph := range plan.Phases {
+			if ph.Type != s.phase {
+				continue
+			}
+			for _, us := range ph.Usages {
+				for _, tier := range us.Tiers {
+					for _, b := range tier.Blocks {
+						q, ok := sums[b.Unit]
+						if !ok {
+							continue
+						}
+						size, _ := parseMicro(json.Number(b.Size))
+						price, _ := parseMoney(b.Prices[0].Value)
+						var amount int64
+						if size > 0 {
+							amount = (q + size - 1) / size * price
+						}
+						items = append(items, &kbItem{typ: "USAGE", amount: amount, subscriptionID: s.id, plan: s.plan,
+							start: from.Format(time.DateOnly), end: to.Format(time.DateOnly)})
+						delete(sums, b.Unit)
+					}
+				}
+			}
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	in := t.addInvoice(accountID, "CAD", items)
+	in.trackingIDs = tracking
+	return in.id
 }

@@ -168,8 +168,20 @@ func (s *server) authenticateAPIKey(w http.ResponseWriter, r *http.Request, raw 
 // else is 404 tenant_not_found, so a tenant's existence is never confirmed
 // to outsiders. The handler then calls scope.Require for its permission.
 func (s *server) member(next http.HandlerFunc) http.Handler {
+	return s.memberOf(next, false)
+}
+
+// memberReducing is member for a write that only reduces what a tenant
+// holds: settling, releasing or extending a reservation, and releasing a
+// quota lease. A suspended tenant may make it, so its running work can
+// finish and give back what it holds.
+func (s *server) memberReducing(next http.HandlerFunc) http.Handler {
+	return s.memberOf(next, true)
+}
+
+func (s *server) memberOf(next http.HandlerFunc, reducing bool) http.Handler {
 	return s.authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		caller, sc, err := s.resolveTenant(r)
+		caller, sc, err := s.resolveTenant(r, reducing)
 		if err != nil {
 			s.writeError(w, r, err)
 			return
@@ -181,7 +193,16 @@ func (s *server) member(next http.HandlerFunc) http.Handler {
 	}))
 }
 
-func (s *server) resolveTenant(r *http.Request) (tenant.Caller, scope.Scope, error) {
+// callerHolder names who owns the holds and leases a tenant caller makes:
+// the API key, or the membership.
+func callerHolder(c tenant.Caller) string {
+	if !c.APIKeyID.IsNil() {
+		return "apikey:" + idgen.Format(idgen.APIKey, c.APIKeyID)
+	}
+	return "membership:" + c.Membership.PublicID()
+}
+
+func (s *server) resolveTenant(r *http.Request, reducing bool) (tenant.Caller, scope.Scope, error) {
 	ctx := r.Context()
 	notFound := tenant.ErrNotFound
 	brandID, err := scope.BrandFromContext(ctx)
@@ -193,7 +214,7 @@ func (s *server) resolveTenant(r *http.Request) (tenant.Caller, scope.Scope, err
 		return tenant.Caller{}, scope.Scope{}, notFound
 	}
 	sc := scope.Scope{Brand: brandID, Tenant: tenantID}
-	write := r.Method != http.MethodGet && r.Method != http.MethodHead
+	write := r.Method != http.MethodGet && r.Method != http.MethodHead && !reducing
 	usable := func(status tenant.Status) bool {
 		return status == tenant.StatusActive || (status == tenant.StatusSuspended && !write)
 	}

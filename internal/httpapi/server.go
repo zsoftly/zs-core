@@ -25,7 +25,10 @@ import (
 	"github.com/zsoftly/zs-core/pkg/billing"
 	"github.com/zsoftly/zs-core/pkg/brand"
 	"github.com/zsoftly/zs-core/pkg/identity"
+	"github.com/zsoftly/zs-core/pkg/metering"
+	"github.com/zsoftly/zs-core/pkg/quota"
 	"github.com/zsoftly/zs-core/pkg/tenant"
+	"github.com/zsoftly/zs-core/pkg/wallet"
 )
 
 // MaxBodyBytes is the request body limit, 1 MiB.
@@ -64,6 +67,16 @@ type Options struct {
 	// routes answer 503 not_ready, and entitlement checks answer allowed
 	// false.
 	Billing *billing.Service
+	// Wallet is the wallet view and the reservations. Without it those
+	// routes answer 503 not_ready.
+	Wallet *wallet.Service
+	// Metering records and reads usage. Without it, usage is still
+	// recorded, and Kill Bill's billed usage answers 503 not_ready.
+	Metering *metering.Service
+	// Quota applies quotas to entitlement checks. Without it the check is
+	// the billing one, and consume, release and overrides answer 503
+	// not_ready.
+	Quota *quota.Service
 	// Now defaults to time.Now.
 	Now func() time.Time
 }
@@ -78,6 +91,9 @@ type server struct {
 	brandsDir  string
 	tenants    tenant.Engines
 	billing    *billing.Service
+	wallet     *wallet.Service
+	metering   *metering.Service
+	quota      *quota.Service
 	now        func() time.Time
 }
 
@@ -97,6 +113,9 @@ func New(opts Options) http.Handler {
 		brandsDir:  opts.BrandsDir,
 		tenants:    opts.Tenants,
 		billing:    opts.Billing,
+		wallet:     opts.Wallet,
+		metering:   opts.Metering,
+		quota:      opts.Quota,
 		now:        opts.Now,
 	}
 	if s.now == nil {
@@ -159,6 +178,32 @@ func New(opts Options) http.Handler {
 	mux.HandleFunc("GET /v1/tenants/{id}/billing/proxy/{path...}", s.proxyBilling)
 	mux.HandleFunc("POST /v1/tenants/{id}/billing/proxy/{path...}", s.proxyBilling)
 	mux.HandleFunc("POST /v1/billing/webhooks/killbill/{brand}/{token}", s.receiveKillBillNotification)
+
+	mux.Handle("GET /v1/tenants/{id}/wallet", s.member(s.getWallet))
+	mux.Handle("GET /v1/tenants/{id}/reservations", s.member(s.listReservations))
+	mux.Handle("POST /v1/tenants/{id}/reservations", s.member(s.createReservation))
+	mux.Handle("POST /v1/tenants/{id}/reservations/{ref}/settle", s.memberReducing(s.settleReservation))
+	mux.Handle("POST /v1/tenants/{id}/reservations/{ref}/release", s.memberReducing(s.releaseReservation))
+	mux.Handle("POST /v1/tenants/{id}/reservations/{ref}/extend", s.memberReducing(s.extendReservation))
+	mux.Handle("POST /v1/staff/tenants/{id}/reservations/{ref}/settle", s.authenticate(http.HandlerFunc(s.staffSettleReservation)))
+	mux.Handle("POST /v1/staff/tenants/{id}/reservations/{ref}/release", s.authenticate(http.HandlerFunc(s.staffReleaseReservation)))
+	mux.Handle("POST /v1/staff/tenants/{id}/reservations/{ref}/extend", s.authenticate(http.HandlerFunc(s.staffExtendReservation)))
+	mux.Handle("POST /v1/tenants/{id}/usage", s.member(s.recordUsage))
+	mux.Handle("POST /v1/tenants/{id}/usage/batch", s.member(s.recordUsageBatch))
+	mux.Handle("POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/reassign", s.authenticate(http.HandlerFunc(s.reassignUsageRollup)))
+	mux.Handle("POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/discard", s.authenticate(http.HandlerFunc(s.discardUsageRollup)))
+	mux.Handle("GET /v1/tenants/{id}/usage/events", s.member(s.listUsageEvents))
+	mux.Handle("GET /v1/tenants/{id}/usage/summary", s.member(s.getUsageSummary))
+	mux.Handle("GET /v1/tenants/{id}/usage/billed", s.member(s.getBilledUsage))
+	mux.Handle("POST /v1/tenants/{id}/entitlements/{feature}/consume", s.member(s.consumeEntitlement))
+	mux.Handle("POST /v1/tenants/{id}/entitlements/{feature}/release", s.memberReducing(s.releaseEntitlement))
+	mux.Handle("POST /v1/tenants/{id}/entitlements/{feature}/extend", s.member(s.extendEntitlement))
+	mux.Handle("POST /v1/staff/tenants/{id}/entitlements/{feature}/release", s.authenticate(http.HandlerFunc(s.staffReleaseEntitlement)))
+	mux.Handle("GET /v1/brands/{id}/meters", s.authenticate(http.HandlerFunc(s.listMeters)))
+	mux.Handle("PUT /v1/brands/{id}/meters", s.authenticate(http.HandlerFunc(s.replaceMeters)))
+	mux.Handle("GET /v1/brands/{id}/quotas", s.authenticate(http.HandlerFunc(s.listQuotas)))
+	mux.Handle("PUT /v1/brands/{id}/quotas", s.authenticate(http.HandlerFunc(s.replaceQuotas)))
+	mux.Handle("POST /v1/staff/tenants/{id}/quota-overrides", s.authenticate(http.HandlerFunc(s.setQuotaOverride)))
 
 	var h http.Handler = s.route(mux)
 	h = s.limitBody(h)

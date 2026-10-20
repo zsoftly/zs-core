@@ -1,13 +1,16 @@
 <?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <!-- The reference catalogue as applied by brands/zs-reference.yaml. It is
-     deploy/compose/killbill/catalogue.xml with a second product, core-basic,
-     whose plan core-basic-monthly has a 14-day trial and no usage. Its
-     effective date is later, because Kill Bill rejects a second version with
-     the effective date the compose bootstrap already uploaded. -->
+     deploy/compose/killbill/catalogue.xml with two more products. core-basic
+     has the plan core-basic-monthly, with a 14-day trial and no usage.
+     core-metered has the plan core-metered-monthly, with no trial and no
+     recurring price, which bills the usage unit api-call at 0.01 per call in
+     arrears, so forwarded usage shows on its first invoice. Its effective
+     date is later than the bootstrap's, because Kill Bill rejects a second
+     version with an effective date it already holds. -->
 <catalog xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:noNamespaceSchemaLocation="CatalogSchema.xsd">
 
-    <effectiveDate>2026-10-15T00:00:00+00:00</effectiveDate>
+    <effectiveDate>2026-10-19T00:00:00+00:00</effectiveDate>
     <catalogName>ZsReference</catalogName>
 
     <recurringBillingMode>IN_ADVANCE</recurringBillingMode>
@@ -26,6 +29,9 @@
             <category>BASE</category>
         </product>
         <product name="core-basic">
+            <category>BASE</category>
+        </product>
+        <product name="core-metered">
             <category>BASE</category>
         </product>
     </products>
@@ -172,6 +178,40 @@
                 </recurring>
             </finalPhase>
         </plan>
+        <plan name="core-metered-monthly">
+            <product>core-metered</product>
+            <finalPhase type="EVERGREEN">
+                <duration>
+                    <unit>UNLIMITED</unit>
+                </duration>
+                <usages>
+                    <usage name="core-metered-monthly-api-call" billingMode="IN_ARREAR" usageType="CONSUMABLE">
+                        <billingPeriod>MONTHLY</billingPeriod>
+                        <tiers>
+                            <tier>
+                                <blocks>
+                                    <tieredBlock>
+                                        <unit>api-call</unit>
+                                        <size>1</size>
+                                        <prices>
+                                            <price>
+                                                <currency>CAD</currency>
+                                                <value>0.01</value>
+                                            </price>
+                                            <price>
+                                                <currency>USD</currency>
+                                                <value>0.01</value>
+                                            </price>
+                                        </prices>
+                                        <max>100000000</max>
+                                    </tieredBlock>
+                                </blocks>
+                            </tier>
+                        </tiers>
+                    </usage>
+                </usages>
+            </finalPhase>
+        </plan>
     </plans>
 
     <priceLists>
@@ -179,6 +219,7 @@
             <plans>
                 <plan>core-test-monthly</plan>
                 <plan>core-basic-monthly</plan>
+                <plan>core-metered-monthly</plan>
             </plans>
         </defaultPriceList>
     </priceLists>

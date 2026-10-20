@@ -32,7 +32,7 @@ func TestCatalogueSubscriptionsAndInvoices(t *testing.T) {
 	ctx := context.Background()
 	f, kb, creds, acct := fakeTenant(t)
 	cat, err := kb.Catalogue(ctx, creds)
-	if err != nil || len(cat) != 1 || len(cat[0].Products) != 2 || cat[0].Products[0].Plans[0].Phases[1].Prices[0].Value != "10.00" {
+	if err != nil || len(cat) != 1 || len(cat[0].Products) != 3 || cat[0].Products[0].Plans[0].Phases[1].Prices[0].Value != "10.00" {
 		t.Fatalf("catalogue = %+v %v", cat, err)
 	}
 	id, err := kb.CreateSubscription(ctx, creds, cc, acct, enginetest.PlanUsage, "zs-sub-1")
@@ -221,5 +221,36 @@ func TestForward(t *testing.T) {
 	var kbErr *killbill.Error
 	if !errors.As(err, &kbErr) || kbErr.Code != 7005 || strings.Contains(err.Error(), "secret provider detail") || got.Get(killbill.HeaderCreatedBy) != cc.CreatedBy {
 		t.Fatalf("POST = %v %v", err, got)
+	}
+}
+
+func TestUsageRecordsAndTrackingIDs(t *testing.T) {
+	ctx := context.Background()
+	f, kb, creds, acct := fakeTenant(t)
+	sub, err := kb.CreateSubscription(ctx, creds, cc, acct, enginetest.PlanMetered, "zs-sub-metered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := killbill.SubscriptionUsageRecord{SubscriptionID: sub, TrackingID: "zs-usg-1", UnitUsageRecords: []killbill.UnitUsageRecords{
+		{UnitType: enginetest.UnitAPICall, UsageRecords: []killbill.UsageRecord{{RecordDate: "2026-10-20", Amount: "2.5"}}}}}
+	if err := kb.RecordUsage(ctx, creds, cc, rec); err != nil {
+		t.Fatal(err)
+	}
+	// Kill Bill deduplicates on the tracking ID per subscription, whatever
+	// the amount.
+	rec.UnitUsageRecords[0].UsageRecords[0].Amount = "7"
+	if err := kb.RecordUsage(ctx, creds, cc, rec); !errors.Is(err, killbill.ErrTrackingIDExists) {
+		t.Fatalf("same tracking ID: %v", err)
+	}
+	rec.SubscriptionID = "00000000-0000-0000-0000-000000000001"
+	if err := kb.RecordUsage(ctx, creds, cc, rec); !errors.Is(err, killbill.ErrNotFound) {
+		t.Fatalf("unknown subscription: %v", err)
+	}
+	got, err := kb.RolledUpUsage(ctx, creds, sub, "2026-10-01", "2026-11-01")
+	if err != nil || len(got.RolledUpUnits) != 1 || got.RolledUpUnits[0].UnitType != enginetest.UnitAPICall || got.RolledUpUnits[0].Amount != "2.500000000" {
+		t.Fatalf("rolled up = %+v %v", got, err)
+	}
+	if n := len(f.UsageRecords("zs-test")); n != 1 {
+		t.Fatalf("records = %d", n)
 	}
 }

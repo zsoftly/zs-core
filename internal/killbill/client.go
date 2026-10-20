@@ -6,8 +6,8 @@
 // configuration, user key-values, catalogue upload and read, overdue upload,
 // push notification callbacks, accounts (creation, lookup, balance, blocking
 // states, overdue state and closure), subscriptions, invoices, credits,
-// external charges, payments, refunds and payment methods. Every endpoint
-// was checked against Kill Bill 0.24.22.
+// external charges, payments, refunds, payment methods, usage records and
+// rolled-up usage. Every endpoint was checked against Kill Bill 0.24.22.
 //
 // Every write carries the X-Killbill-CreatedBy, X-Killbill-Reason and
 // X-Killbill-Comment headers from a CallContext, so Kill Bill's own audit log

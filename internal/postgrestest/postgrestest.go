@@ -9,6 +9,12 @@
 //
 // When ZS_TEST_POSTGRES_URL is unset and Docker is not reachable, New skips
 // the test with a message that says how to run it.
+//
+// Migrating a schema and dropping it lock every table, index and partition
+// of the schema. Many test binaries doing that at once on one server run
+// out of Postgres's shared lock table, so the harness runs those two steps
+// one at a time across every test process, under a server-wide advisory
+// lock. The tests themselves still run in parallel.
 package postgrestest
 
 import (
@@ -72,10 +78,34 @@ var (
 func New(t testing.TB) *DB {
 	t.Helper()
 	db := NewEmpty(t)
-	if _, err := database.Migrate(context.Background(), db.Pool, migrations.FS); err != nil {
+	err := withDDLLock(func() error {
+		_, err := database.Migrate(context.Background(), db.Pool, migrations.FS)
+		return err
+	})
+	if err != nil {
 		t.Fatalf("migrate test schema: %v", err)
 	}
 	return db
+}
+
+// ddlLockSQL is the key of the server-wide lock that serializes the
+// migration and the drop of test schemas.
+const ddlLockSQL = `hashtextextended('zs-core.postgrestest.ddl', 0)`
+
+// withDDLLock runs fn while this process holds the server-wide DDL lock of
+// the harness, on a connection of the admin pool.
+func withDDLLock(fn func() error) error {
+	ctx := context.Background()
+	conn, err := shared.admin.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire admin connection: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(`+ddlLockSQL+`)`); err != nil {
+		return fmt.Errorf("take the harness DDL lock: %w", err)
+	}
+	defer func() { _, _ = conn.Exec(ctx, `SELECT pg_advisory_unlock(`+ddlLockSQL+`)`) }()
+	return fn()
 }
 
 // NewEmpty returns an isolated schema without migrations, for tests of the
@@ -107,7 +137,11 @@ func NewEmpty(t testing.TB) *DB {
 	}
 	t.Cleanup(func() {
 		pool.Close()
-		if _, err := srv.admin.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
+		err := withDDLLock(func() error {
+			_, err := srv.admin.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+			return err
+		})
+		if err != nil {
 			t.Errorf("drop test schema %s: %v", schema, err)
 		}
 	})

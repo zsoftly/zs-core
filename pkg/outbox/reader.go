@@ -57,10 +57,28 @@ func (r *PostgresReader) WithClaimDuration(d time.Duration) *PostgresReader {
 	return &c
 }
 
+// InternalEventTypes are the event types Core writes for its own workers:
+// the Keycloak Organization mirror of tenants, the settlement relay of the
+// wallet and the usage forwarder's wake-up. Each has exactly one consumer,
+// whose reader names it with WithEventTypes. A reader without types, such
+// as a relay that delivers events to products, never claims them, so it
+// cannot take work away from that consumer.
+var InternalEventTypes = []string{"tenant.mirror", "wallet.settlement.requested", "metering.usage.recorded"}
+
+// IsInternal reports whether eventType is one of InternalEventTypes.
+func IsInternal(eventType string) bool {
+	for _, t := range InternalEventTypes {
+		if t == eventType {
+			return true
+		}
+	}
+	return false
+}
+
 // WithEventTypes returns a copy of r that claims only events of the given
 // types. A relay that serves one consumer, such as the Keycloak Organization
 // mirror of tenants, uses it so it never takes events meant for another. With
-// no types it claims every type.
+// no types it claims every type except InternalEventTypes.
 func (r *PostgresReader) WithEventTypes(types ...string) *PostgresReader {
 	c := *r
 	c.types = append([]string(nil), types...)
@@ -81,7 +99,7 @@ WITH due AS (
       AND quarantined_at IS NULL
       AND next_attempt_at <= now()
       AND (claimed_until IS NULL OR claimed_until <= now())
-      AND ($4::text[] IS NULL OR event_type = ANY($4::text[]))
+      AND (($4::text[] IS NULL AND NOT event_type = ANY($5::text[])) OR event_type = ANY($4::text[]))
     ORDER BY next_attempt_at, occurred_at, id
     LIMIT $1
     FOR UPDATE SKIP LOCKED
@@ -105,7 +123,7 @@ func (r *PostgresReader) Claim(ctx context.Context, limit int) (Claim, error) {
 	// claim, so it ends no later than the claim in the database.
 	claim := Claim{Token: token, Until: time.Now().Add(r.claimFor)}
 
-	rows, err := r.db.Query(ctx, claimSQL, limit, r.claimFor.Seconds(), token, r.types)
+	rows, err := r.db.Query(ctx, claimSQL, limit, r.claimFor.Seconds(), token, r.types, InternalEventTypes)
 	if err != nil {
 		return Claim{}, fmt.Errorf("claim outbox events: %w", err)
 	}

@@ -57,32 +57,29 @@ Every ZSoftly product needs the same things: a company with members and roles, a
 ## Architecture
 
 ```
-                 ZSoftly Core
+             ZSoftly Platform Core
                       |
-               Unified REST API
+                Unified APIs
                       |
          +------------+------------+
-         |            |            |
-      Identity      Billing     Extensions
-      Keycloak      Kill Bill   Plugin System
-         |            |            |
-      SSO/MFA       Wallets     Notifications
-      Users         Credits     Email Templates
-      Roles         Pricing     Tax Providers
-      Themes        Payments    Custom Workflows
-         |            |            |
+         |                         |
+      Keycloak                  Kill Bill
+      Identity                  Billing
+         |                         |
+      Themes                 Payment plugins
+      SSO / MFA              Stripe / PayPal / Creem
+      Users / Roles          Invoices / Subscriptions
+      Email templates        Usage / Payments
+         |                         |
          +------------+------------+
                       |
-            Multi-brand Configuration
+             ZSoftly Extensions
+           Wallets / Reservations
+           Metering / Entitlements
+           Branding / Notifications
                       |
-     +-----------+----+------+-----------+
-     |           |           |           |
-  Compute     Storage    Networking     DNS        IaaS
-  App Hosting Kubernetes Databases   CI Runners   PaaS
-     |           |           |           |
-  Own brand   Own brand   Own brand   Own brand
-  Own billing Own billing Own billing Own billing
-  Own users   Own users   Own users   Own users
+       Compute / Storage / Networking / DNS
+     App Hosting / Kubernetes / Databases / CI
 ```
 
 ## Non-negotiable rules
@@ -94,10 +91,11 @@ Every ZSoftly product needs the same things: a company with members and roles, a
 ## Design principles
 
 - Keycloak and Kill Bill remain independent services. Core integrates with them through their public APIs and never forks them.
+- Core packages, configures, brands and upgrades Keycloak and Kill Bill on one release cadence, and never forks them. Everything Core adds goes through their supported extension points.
 - Each module is self-hosted and deployable on its own. There is no single application that owns all the data.
 - Modules talk to each other through versioned APIs and events, not shared database tables.
 - Tenant isolation is enforced in every module, not only at the identity layer.
-- Money and usage are recorded as immutable ledgers. Corrections are new entries, never edits.
+- Kill Bill is the financial authority. Core extensions keep their own transactional records for reservations, metering and quotas, and never a competing customer balance or payment ledger.
 - Every API is documented, and every sensitive action is auditable.
 
 ## What every feature must ship with
@@ -112,6 +110,21 @@ Every ZSoftly product needs the same things: a company with members and roles, a
 ## Status
 
 ZSoftly Core is under active development. Expect bugs, breaking changes, and gaps in the documentation until the first stable release. The architecture and the module contracts are being written before any code lands. Issues and external pull requests are closed while the module contracts settle; see [CONTRIBUTING.md](CONTRIBUTING.md) for how to reach the maintainers and when contributions open.
+
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `cmd/zs-core` | The service binary, with `serve` and `migrate` commands. |
+| `pkg/` | Importable packages: `errors`, `idgen`, `scope`, `idempotency`, `events`, `outbox` and `audit`. Writers take a `pgx.Tx`, so a product can use them inside its own transaction. |
+| `internal/` | Service-only code: configuration, database and migration runner, the HTTP API and the Postgres test harness. |
+| `migrations/` | Forward-only SQL migrations, embedded in the binary. |
+| `api/openapi.yaml` | The OpenAPI 3.1 contract. Go types in `internal/httpapi/gen` are generated from it. |
+| `docs/` | Architecture, decisions, configuration, development and module guides. |
+
+## Development
+
+`make check` is the gate for every change; there is no hosted CI workflow. Start with [docs/development.md](docs/development.md) for building, testing and migrating, and [docs/configuration.md](docs/configuration.md) for every environment variable. Module guides are in [docs/modules](docs/modules), starting with [foundation](docs/modules/foundation.md) and [audit](docs/modules/audit.md). Code that started in other ZSoftly repositories is listed in [PROVENANCE.md](PROVENANCE.md).
 
 ## License
 

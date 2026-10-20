@@ -1,0 +1,102 @@
+# Development
+
+## TL;DR
+
+You need Go 1.26.1 or later and a Postgres 16 or later server. Docker is optional but needed for the integration tests unless you point them at a server of your own. `make check` is the gate for every change: it checks formatting, runs `go vet`, runs the unit tests and fails if the generated API types are stale. There is no hosted CI workflow, so run `make check` before you push, and run `make test-integration` when you touch SQL, migrations or anything under `pkg/` that talks to Postgres. Configuration is environment only; [configuration.md](configuration.md) lists every variable. The service applies its migrations before it reports ready.
+
+## Make targets
+
+| Target | What it does |
+| --- | --- |
+| `make fmt` | Formats every Go file with `gofmt`. |
+| `make fmt-check` | Fails if any Go file needs `gofmt`. |
+| `make vet` | Runs `go vet` with and without the `integration` build tag. |
+| `make lint` | Runs `make vet`, then `staticcheck` if it is installed. Without `staticcheck` it prints a notice and runs vet only. |
+| `make test` | Runs the unit tests. No database or Docker needed. |
+| `make test-race` | Runs the unit tests with the race detector. |
+| `make test-integration` | Runs the unit and integration tests against Postgres. |
+| `make build` | Builds `bin/zs-core`. |
+| `make generate` | Regenerates `internal/httpapi/gen/types.gen.go` from `api/openapi.yaml`. |
+| `make generate-check` | Fails if the generated types do not match the OpenAPI document. |
+| `make check` | `fmt-check`, `vet`, `test` and `generate-check`. This is the merge gate. |
+| `make stack-up`, `make stack-down`, `make stack-reset`, `make stack-logs`, `make stack-bootstrap`, `make doctor` | The reference stack. They run `docker compose` in the current shell and refuse to run on macOS. Use them on a build host. See [../deploy/compose/README.md](../deploy/compose/README.md). |
+
+## Run the service
+
+```bash
+cp .env.example .env            # then edit ZS_DATABASE_URL
+set -a; . ./.env; set +a
+make build
+bin/zs-core serve
+```
+
+`serve` applies pending migrations, then listens on `ZS_LISTEN_ADDR`. Check it with:
+
+```bash
+curl -i http://127.0.0.1:8080/healthz
+curl -i http://127.0.0.1:8080/readyz
+```
+
+To try the audit route, start with `ZS_DEV_TRUSTED_SCOPE_HEADERS=true` on a loopback address and send a brand and tenant:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/audit/events \
+  -H 'X-ZS-Brand: brd_<id>' -H 'X-ZS-Tenant: tnt_<id>'
+```
+
+The list is empty until a library caller writes audit events. Phase 1 has no HTTP write route.
+
+## Operator commands
+
+```bash
+bin/zs-core doctor              # one line per finding; exit 1 if any is FAIL
+bin/zs-core doctor --json       # the same report as JSON
+bin/zs-core upgrade check       # newer upstream versions; changes nothing
+bin/zs-core upgrade check --strict   # exit 1 if a release feed cannot be read
+```
+
+`doctor` checks the database (reachable, migrations, Postgres major version, clock skew), Keycloak, Kill Bill and KAUI against `components.yaml`. It needs `ZS_DATABASE_URL` and the component settings listed in [configuration.md](configuration.md). `upgrade check` needs no configuration. It reads GitHub releases for Keycloak and Kill Bill and Docker Hub tags for KAUI, prints a warning and exits 0 when a feed fails, and uses `GITHUB_TOKEN` if set to raise the GitHub rate limit. Both read `components.yaml` from the working directory unless `--components` says otherwise.
+
+## Migrations
+
+Migrations live in `migrations/` as `NNNNNN_name.up.sql`. They are embedded in the binary and forward only: there are no down files. To correct a migration, add a new one. Never edit a released file; the runner stores a SHA-256 checksum of each applied file and refuses to start if one changes.
+
+The runner takes a Postgres advisory lock per schema, so several instances can start at once and each migration still runs exactly once. Each migration runs in its own transaction with its history row in `schema_migrations`.
+
+```bash
+bin/zs-core migrate     # apply pending migrations and exit
+```
+
+`serve` runs the same step unless `ZS_MIGRATE_ON_START=false`. `/readyz` returns 503 while any embedded migration is missing from the database.
+
+Migrations use unqualified names, so they apply to the first schema on the connection's `search_path`. Library callers that embed Core run its migrations before their own.
+
+## Tests
+
+Unit tests sit next to the code and need nothing but Go.
+
+Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. Tests in different packages therefore run in parallel against one server without seeing each other's rows.
+
+The harness in `internal/postgrestest` chooses the server like this:
+
+1. If `ZS_TEST_POSTGRES_URL` is set, it uses that server. The URL must point at a loopback host, because the tests create and drop schemas there.
+2. Otherwise it starts one `postgres:18-alpine` container per test binary through testcontainers. The testcontainers reaper removes the container when the tests finish.
+3. If neither is available, each integration test is skipped with a message that says so.
+
+Testcontainers looks for Docker in several places, starting with `DOCKER_HOST`, and moves on to the next candidate when one does not answer. A wrong `DOCKER_HOST` therefore does not stop it from finding another running Docker. With Rancher Desktop, set `DOCKER_HOST=unix://$HOME/.rd/docker.sock` if the default socket is not linked. When the tests themselves run inside a container that shares the host network and the host Docker socket, set `TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1` so the tests connect to the mapped port on the host.
+
+```bash
+make test-integration
+ZS_TEST_POSTGRES_URL='postgres://zs:zs-test@127.0.0.1:55432/zs_core_test?sslmode=disable' make test-integration
+```
+
+## OpenAPI and generated types
+
+`api/openapi.yaml` (OpenAPI 3.1) is the source of truth for the HTTP contract. Go types are generated from it with `oapi-codegen`, which is pinned as a Go tool in `go.mod`, and committed in `internal/httpapi/gen/types.gen.go`. After changing the document, run `make generate` and commit both files. `make check` and the `gen` package test fail when the committed file is stale.
+
+## Repository conventions
+
+- Standard library `net/http` with method patterns, `log/slog`, `pgx/v5`. No web framework and no ORM.
+- Every tenant-owned query goes through `scope.Scope.Bind`, which refuses a scope without both a brand and a tenant.
+- Errors returned to clients are `pkg/errors` values. Their cause is logged and never written to a response.
+- Library functions that write take a `pgx.Tx`, so a caller can include them in its own transaction.

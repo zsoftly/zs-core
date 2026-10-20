@@ -1,0 +1,208 @@
+# ZSoftly Core reference stack. Development and tests only.
+# Run it on a build host, never on a workstation. See README.md.
+# Image tags here must equal components.yaml; a unit test enforces it.
+name: zs-core
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:18-alpine}
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set in .env}
+      KILLBILL_DB_PASSWORD: ${KILLBILL_DB_PASSWORD:?set in .env}
+      KAUI_DB_PASSWORD: ${KAUI_DB_PASSWORD:?set in .env}
+      ZS_CORE_DB_PASSWORD: ${ZS_CORE_DB_PASSWORD:?set in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./postgres/10-databases.sh:/docker-entrypoint-initdb.d/10-databases.sh:ro
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  mailpit:
+    image: ${MAILPIT_IMAGE:-axllent/mailpit:v1.26.2}
+    ports:
+      - "127.0.0.1:${MAILPIT_SMTP_HOST_PORT:-1025}:1025"
+      - "127.0.0.1:${MAILPIT_UI_HOST_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  keycloak:
+    image: zs-core/keycloak:local
+    build:
+      context: ./keycloak
+      args:
+        KEYCLOAK_IMAGE: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.8.1}
+    command: ["start", "--optimized", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set in .env}
+      KC_HOSTNAME: http://127.0.0.1:${KEYCLOAK_HOST_PORT:-8180}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .env}
+      ZS_STAFF_CLIENT_SECRET: ${ZS_STAFF_CLIENT_SECRET:?set in .env}
+    volumes:
+      - ./keycloak/zs-reference-realm.json:/opt/keycloak/data/import/zs-reference-realm.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${KEYCLOAK_HOST_PORT:-8180}:8080"
+      - "127.0.0.1:${KEYCLOAK_MANAGEMENT_HOST_PORT:-9000}:9000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          read -r line <&3 &&
+          case "$$line" in *' 200 '*) exit 0 ;; *) exit 1 ;; esac
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  killbill-prep:
+    image: ${KILLBILL_IMAGE:-killbill/killbill:0.24.22}
+    user: root
+    entrypoint: ["/bin/sh", "/scripts/prepare-killbill.sh"]
+    volumes:
+      - ddl:/ddl
+      - killbill-plugins:/var/lib/killbill/bundles/plugins
+      - ./db/prepare-killbill.sh:/scripts/prepare-killbill.sh:ro
+    restart: "no"
+
+  kaui-ddl:
+    image: ${KAUI_IMAGE:-killbill/kaui:4.0.31}
+    user: root
+    entrypoint: ["/bin/sh", "/scripts/export-kaui-ddl.sh"]
+    volumes:
+      - ddl:/ddl
+      - ./db/export-kaui-ddl.sh:/scripts/export-kaui-ddl.sh:ro
+    restart: "no"
+
+  db-init:
+    image: ${POSTGRES_IMAGE:-postgres:18-alpine}
+    entrypoint: ["/bin/sh", "/scripts/apply-ddl.sh"]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      KILLBILL_DB_PASSWORD: ${KILLBILL_DB_PASSWORD:?set in .env}
+      KAUI_DB_PASSWORD: ${KAUI_DB_PASSWORD:?set in .env}
+    volumes:
+      - ddl:/ddl:ro
+      - ./db/apply-ddl.sh:/scripts/apply-ddl.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      killbill-prep:
+        condition: service_completed_successfully
+      kaui-ddl:
+        condition: service_completed_successfully
+    restart: "no"
+
+  killbill:
+    image: ${KILLBILL_IMAGE:-killbill/killbill:0.24.22}
+    environment:
+      KILLBILL_DAO_URL: jdbc:postgresql://postgres:5432/killbill
+      KILLBILL_DAO_USER: killbill
+      KILLBILL_DAO_PASSWORD: ${KILLBILL_DB_PASSWORD:?set in .env}
+      KB_ADMIN_PASSWORD: ${KILLBILL_ADMIN_PASSWORD:?set in .env}
+      KILLBILL_METRICS_INFLUXDB: "false"
+      KB_org_killbill_billing_plugin_kpm_adminUsername: admin
+      KB_org_killbill_billing_plugin_kpm_adminPassword: ${KILLBILL_ADMIN_PASSWORD:?set in .env}
+    volumes:
+      - killbill-plugins:/var/lib/killbill/bundles/plugins
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${KILLBILL_HOST_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8080/1.0/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 90s
+    restart: unless-stopped
+
+  kaui:
+    image: ${KAUI_IMAGE:-killbill/kaui:4.0.31}
+    environment:
+      KAUI_DB_ADAPTER: postgresql
+      KAUI_DB_URL: jdbc:postgresql://postgres:5432/kaui
+      KAUI_DB_USERNAME: kaui
+      KAUI_DB_PASSWORD: ${KAUI_DB_PASSWORD:?set in .env}
+      KAUI_KILLBILL_URL: http://killbill:8080
+      KAUI_KILLBILL_API_KEY: ${KILLBILL_TENANT_API_KEY:-zs-reference}
+      KAUI_KILLBILL_API_SECRET: ${KILLBILL_TENANT_API_SECRET:?set in .env}
+      KAUI_SECRET_KEY_BASE: ${KAUI_SECRET_KEY_BASE:?set in .env}
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      killbill:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${KAUI_HOST_PORT:-9090}:8080"
+    healthcheck:
+      # Probe the root path, which answers with a redirect and renders no
+      # assets. Probing the sign-in page here makes several slow first
+      # requests overlap, and KAUI 4.0.31 then answers 500 on that page until
+      # it restarts. See README.md.
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 90s
+    restart: unless-stopped
+
+  core:
+    image: zs-core/core:dev
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      ZS_DATABASE_URL: postgres://zs_core:${ZS_CORE_DB_PASSWORD:?set in .env}@postgres:5432/zs_core?sslmode=disable
+      ZS_LISTEN_ADDR: 0.0.0.0:8080
+      ZS_LOG_FORMAT: ${ZS_LOG_FORMAT:-json}
+      ZS_KEYCLOAK_URL: http://keycloak:8080
+      ZS_KEYCLOAK_REALM: zs-reference
+      ZS_KEYCLOAK_ADMIN_USER: ${KEYCLOAK_ADMIN_USER:-admin}
+      ZS_KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .env}
+      ZS_KILLBILL_URL: http://killbill:8080
+      ZS_KILLBILL_ADMIN_USER: admin
+      ZS_KILLBILL_ADMIN_PASSWORD: ${KILLBILL_ADMIN_PASSWORD:?set in .env}
+      ZS_KAUI_URL: http://kaui:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${CORE_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  killbill-plugins:
+  ddl:

@@ -1,0 +1,279 @@
+openapi: 3.1.0
+info:
+  title: ZSoftly Core API
+  version: 0.1.0
+  summary: The /v1 HTTP surface of ZSoftly Core.
+  description: |
+    ZSoftly Core serves tenants, wallets, metering, catalogue, payments,
+    notifications and audit for ZSoftly products. This document is the
+    source of truth for the HTTP contract. Go request and response types are
+    generated from it.
+
+    Every response carries `Cache-Control: no-store` and an `X-Request-ID`
+    header. Every error uses the error envelope. Lists are paginated with
+    `limit` and `cursor` in and `next_cursor` out. Commands that change state
+    carry an `idempotency_key` field in the request body.
+
+    Phase 1 has no authentication. The brand and tenant scope of a `/v1`
+    request come from the `X-ZS-Brand` and `X-ZS-Tenant` headers, and only
+    when the server runs with `ZS_DEV_TRUSTED_SCOPE_HEADERS=true` on a
+    loopback address. Otherwise every `/v1` request returns `401
+    unauthenticated`. Phase 2 replaces the headers with Keycloak tokens and
+    API keys.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development
+tags:
+  - name: health
+    description: Process and readiness probes.
+  - name: audit
+    description: The append-only audit trail.
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      operationId: getHealthz
+      summary: Report that the process is up.
+      description: Returns 200 while the process can serve HTTP. It does not check dependencies.
+      responses:
+        "200":
+          description: The process is up.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HealthStatus"}
+  /readyz:
+    get:
+      tags: [health]
+      operationId: getReadyz
+      summary: Report that the service can take traffic.
+      description: Returns 200 when the database answers and every embedded migration is applied.
+      responses:
+        "200":
+          description: The service is ready.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/HealthStatus"}
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /v1/audit/events:
+    get:
+      tags: [audit]
+      operationId: listAuditEvents
+      summary: List audit events for one tenant.
+      description: |
+        Returns audit events of the tenant in scope, newest first. Filters
+        combine with AND. `occurred_after` is inclusive and `occurred_before`
+        is exclusive.
+      parameters:
+        - $ref: "#/components/parameters/BrandHeader"
+        - $ref: "#/components/parameters/TenantHeader"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - name: actor_id
+          in: query
+          description: Only events by this actor.
+          schema: {type: string, minLength: 1, maxLength: 255}
+        - name: action
+          in: query
+          description: Only events with this action, such as `tenant.member.added`.
+          schema: {$ref: "#/components/schemas/Action"}
+        - name: occurred_after
+          in: query
+          description: Only events at or after this time (RFC 3339).
+          schema: {type: string, format: date-time}
+        - name: occurred_before
+          in: query
+          description: Only events before this time (RFC 3339).
+          schema: {type: string, format: date-time}
+      responses:
+        "200":
+          description: One page of audit events.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuditEventPage"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+components:
+  headers:
+    RequestId:
+      description: The request ID. A valid inbound `X-Request-ID` is echoed; otherwise the server assigns one.
+      schema: {type: string, maxLength: 128}
+    CacheControl:
+      description: Always `no-store`.
+      schema: {type: string, const: no-store}
+  parameters:
+    BrandHeader:
+      name: X-ZS-Brand
+      in: header
+      required: true
+      description: |
+        Phase 1 development only. The brand in scope, as a `brd_` ID. Read
+        only when `ZS_DEV_TRUSTED_SCOPE_HEADERS=true`. Phase 2 derives the
+        brand from the token audience or API key instead.
+      schema: {$ref: "#/components/schemas/BrandId"}
+    TenantHeader:
+      name: X-ZS-Tenant
+      in: header
+      required: true
+      description: |
+        Phase 1 development only. The tenant in scope, as a `tnt_` ID. Read
+        only when `ZS_DEV_TRUSTED_SCOPE_HEADERS=true`.
+      schema: {$ref: "#/components/schemas/TenantId"}
+    Limit:
+      name: limit
+      in: query
+      description: The page size. Defaults to 50.
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` of the previous page. Opaque; do not build or parse it.
+      schema: {type: string, minLength: 1, maxLength: 128}
+  responses:
+    BadRequest:
+      description: The request is invalid.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+    Unauthenticated:
+      description: No valid credentials or scope.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+    Unavailable:
+      description: A dependency is unavailable. Retry later.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+  schemas:
+    ErrorEnvelope:
+      type: object
+      description: The body of every error response.
+      required: [error]
+      additionalProperties: false
+      properties:
+        error: {$ref: "#/components/schemas/Error"}
+    Error:
+      type: object
+      required: [code, message, retryable]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable code in snake_case. Clients branch on this value.
+          pattern: "^[a-z][a-z0-9]*(_[a-z0-9]+)*$"
+          examples: [idempotency_key_conflict]
+        message:
+          type: string
+          description: A safe human-readable message. Never contains dependency or provider text.
+        retryable:
+          type: boolean
+          description: True when the same request may succeed later.
+    NextCursor:
+      type: [string, "null"]
+      description: The cursor for the next page, or null on the last page.
+      maxLength: 128
+    IdempotencyKey:
+      type: string
+      description: |
+        Client-chosen key that makes a command safe to retry. Scoped to the
+        brand, the tenant and the actor. A retry with the same payload returns
+        the original result; a different payload returns `409
+        idempotency_key_conflict`.
+      minLength: 8
+      maxLength: 255
+      pattern: "^[\\x21-\\x7E]+$"
+    HealthStatus:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [ok, ready]
+    BrandId:
+      type: string
+      description: A brand ID.
+      pattern: "^brd_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    TenantId:
+      type: string
+      description: A tenant ID.
+      pattern: "^tnt_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    AuditEventId:
+      type: string
+      description: An audit event ID.
+      pattern: "^aud_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    Action:
+      type: string
+      description: A dotted lowercase action name.
+      pattern: "^[a-z0-9_]+(\\.[a-z0-9_]+)+$"
+      maxLength: 120
+    Actor:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [user, api_key, staff, service, provider, system]
+        id:
+          type: string
+          description: The actor ID. Absent only for the system actor.
+          maxLength: 255
+    AuditOutcome:
+      type: string
+      enum: [success, failure, denied]
+    AuditEvent:
+      type: object
+      required: [id, brand_id, tenant_id, actor, action, outcome, correlation_id, occurred_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/AuditEventId"}
+        brand_id: {$ref: "#/components/schemas/BrandId"}
+        tenant_id: {$ref: "#/components/schemas/TenantId"}
+        actor: {$ref: "#/components/schemas/Actor"}
+        action: {$ref: "#/components/schemas/Action"}
+        reason:
+          type: string
+          maxLength: 1000
+        outcome: {$ref: "#/components/schemas/AuditOutcome"}
+        correlation_id:
+          type: string
+          maxLength: 128
+        occurred_at:
+          type: string
+          format: date-time
+    AuditEventPage:
+      type: object
+      required: [data, next_cursor]
+      additionalProperties: false
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/AuditEvent"}
+        next_cursor: {$ref: "#/components/schemas/NextCursor"}

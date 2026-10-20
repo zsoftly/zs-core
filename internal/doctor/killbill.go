@@ -48,14 +48,14 @@ func checkKillBill(ctx context.Context, opts Options) (ComponentReport, []Findin
 		if len(unhealthy) > 0 {
 			add("health", Fail, "unhealthy checks: %s", strings.Join(unhealthy, ", "))
 		} else {
-			add("health", OK, "healthy at %s", t.URL)
+			add("health", OK, "healthy at %s", redactURL(t.URL))
 		}
 	} else {
 		add("health", Fail, "GET /1.0/healthcheck returned HTTP %d", status)
 	}
 
-	if t.AdminUser == "" {
-		add("version", Warn, "version and plugins not verified: set ZS_KILLBILL_ADMIN_USER and ZS_KILLBILL_ADMIN_PASSWORD (pin is %s)", pin.Version)
+	if t.AdminUser == "" || t.AdminPassword == "" {
+		add("version", Skip, "version not checked (no admin credentials): set ZS_KILLBILL_ADMIN_USER and ZS_KILLBILL_ADMIN_PASSWORD; plugins not checked either (pin is %s)", pin.Version)
 		return report, findings
 	}
 
@@ -95,14 +95,17 @@ func checkKillBill(ctx context.Context, opts Options) (ComponentReport, []Findin
 		findings = append(findings, f)
 	}
 
+	installed := map[string]bool{}
 	for _, p := range nodes[0].PluginsInfo {
 		info := PluginInfo{Key: p.PluginKey, Name: p.PluginName, Version: p.Version, State: p.State}
 		report.Plugins = append(report.Plugins, info)
 		if p.PluginKey == "" {
 			continue // platform bundle, versioned with Kill Bill itself
 		}
+		installed[p.PluginKey] = true
 		label := p.PluginKey
-		if pinned, ok := opts.Manifest.PinnedPlugin(p.PluginKey); ok {
+		pinned, ok := opts.Manifest.PinnedPlugin(p.PluginKey)
+		if ok {
 			if p.Version != pinned.Version {
 				add("plugin", Fail, "plugin %s version %s does not match the pin %s in components.yaml", label, p.Version, pinned.Version)
 			} else {
@@ -112,7 +115,16 @@ func checkKillBill(ctx context.Context, opts Options) (ComponentReport, []Findin
 			add("plugin", Warn, "plugin %s version %s is not listed in components.yaml (%s)", label, p.Version, p.State)
 		}
 		if p.State != "RUNNING" {
-			add("plugin", Warn, "plugin %s is %s", label, p.State)
+			if ok && pinned.Required() {
+				add("plugin", Fail, "plugin %s is %s; components.yaml marks it %s, so it must be RUNNING", label, p.State, pinned.Status)
+			} else {
+				add("plugin", Warn, "plugin %s is %s", label, p.State)
+			}
+		}
+	}
+	for _, pinned := range opts.Manifest.RequiredPlugins() {
+		if !installed[pinned.Name] {
+			add("plugin", Fail, "plugin %s %s is not installed; components.yaml marks it %s", pinned.Name, pinned.Version, pinned.Status)
 		}
 	}
 	platform := 0

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -26,6 +27,9 @@ const (
 	Warn Status = "warn"
 	// Fail means the stack does not match the release. It fails the run.
 	Fail Status = "fail"
+	// Skip means a pin could not be checked because the configuration does
+	// not allow it. It fails the run unless skips are allowed.
+	Skip Status = "skip"
 )
 
 // DefaultMaxClockSkew is the largest accepted difference between the clock of
@@ -77,6 +81,16 @@ type Report struct {
 func (r Report) Failed() bool {
 	for _, f := range r.Findings {
 		if f.Status == Fail {
+			return true
+		}
+	}
+	return false
+}
+
+// Skipped reports whether any finding is a skip.
+func (r Report) Skipped() bool {
+	for _, f := range r.Findings {
+		if f.Status == Skip {
 			return true
 		}
 	}
@@ -145,7 +159,7 @@ func Run(ctx context.Context, opts Options) Report {
 	add(one(checkKeycloak(ctx, opts)))
 	add(one(checkKillBill(ctx, opts)))
 	add(one(checkKAUI(ctx, opts)))
-	r.OK = !r.Failed()
+	r.OK = !r.Failed() && !r.Skipped()
 	return r
 }
 
@@ -195,6 +209,16 @@ func do(client *http.Client, req *http.Request, out any) (int, error) {
 		}
 	}
 	return resp.StatusCode, nil
+}
+
+// redactURL returns raw with any password masked, for printing. Configuration
+// rejects URLs with user information, so this is a second line of defence.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid URL>"
+	}
+	return u.Redacted()
 }
 
 // unreachable builds the failure finding for a transport error. The error text

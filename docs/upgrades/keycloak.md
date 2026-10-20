@@ -9,7 +9,7 @@ Core pins one Keycloak version in `components.yaml`. You change it only as part 
 - Core supports one step at a time: a patch release within a minor line (26.8.0 to 26.8.1), or from the last patch of one minor line to the first release of the next.
 - Skipping patch releases inside a minor line is fine. Skipping a minor line is not supported until a rehearsal row shows the same jump.
 - A major version change is a separate project with its own runbook.
-- Patch releases carry only security and bug fixes, so they can go into a Core patch release. A new minor line is a minor Core release (see [../releases.md](../releases.md)).
+- Patch releases carry only security and bug fixes, so they ship as a Core patch release. A new minor line is a minor Core release (see [../releases.md](../releases.md)).
 
 ## Pre-checks
 
@@ -27,7 +27,7 @@ Run on the build host, from the repository root:
 deploy/compose/rehearsal/backup.sh /tmp/zs-core-backup
 ```
 
-It writes `keycloak.dump` and `killbill.dump`, then restores the Keycloak dump into a scratch database and drops it again. A backup that has not been restored once is not a backup. For a production Keycloak, take the same `pg_dump -Fc` of the `keycloak` database and keep the old image digest next to it.
+It writes `keycloak.dump` and `killbill.dump`, then restores the Keycloak dump into a scratch database and drops it again. Restore every backup once before you trust it. For a production Keycloak, take the same `pg_dump -Fc` of the `keycloak` database and keep the old image digest next to it.
 
 ## Steps on the reference stack
 
@@ -39,7 +39,7 @@ It writes `keycloak.dump` and `killbill.dump`, then restores the Keycloak dump i
 ## Post-checks
 
 1. `make doctor` is green. It reads the version from the Admin API and compares it with the pin, and confirms the `zs-reference` realm exists.
-2. `deploy/compose/rehearsal/check.sh > after.txt` and `diff before.txt after.txt`. Only the server version line may differ. The user, realm, locales, client credentials grant and row counts must match.
+2. `deploy/compose/rehearsal/check.sh > after.txt` and `diff before.txt after.txt`. Only the server version line differs. The user, realm, locales, client credentials grant and row counts must match.
 3. Run the Phase 3 and Phase 4 gate tests against the stack once they exist.
 4. Sign in to the Keycloak admin console at `http://127.0.0.1:8180` through the SSH forward and look for warnings about deprecated features.
 
@@ -60,4 +60,4 @@ A component version changes in `components.yaml` only with a row here for that s
 
 | Date | From | To | Outcome | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-10-20 | 26.8.0 | 26.8.1 | Pass | Reference stack on the build host. Stack started on 26.8.0 with the `zs-reference` realm imported; one user (French locale, password credential) created through the Admin API. Backup restored into a scratch database with 3 users. Upgrade by changing the tag and rebuilding: only the `keycloak` container was recreated; Keycloak 26.8.1 started in 7.7 seconds. The user kept its ID and attributes, the realm kept its locales, the `zs-staff` client credentials grant still returned a token, and the schema changeset count stayed at 237, so this step needed no schema migration. The rehearsal also found that the Keycloak healthcheck reported healthy while `/realms/master` still answered 503; the healthcheck now checks the HTTP status line. `zs-core doctor` showed `FAIL keycloak: version 26.8.0 does not match the pin 26.8.1` before the upgrade and was green after it. |
+| 2026-10-20 | 26.8.0 | 26.8.1 | Pass | Reference stack on the build host. Started on 26.8.0 with the `zs-reference` realm imported and seeded one user (French locale, password credential) through the Admin API. Restored the backup into a scratch database with 3 users, then upgraded by changing the tag and rebuilding. Only the `keycloak` container was recreated, and Keycloak 26.8.1 started in 7.7 seconds. The user kept its ID and attributes, the realm kept its locales, the `zs-staff` client credentials grant still returned a token, and the schema changeset count stayed at 237, so no schema migration was needed. Found: the healthcheck reported healthy while `/realms/master` still answered 503. The healthcheck now checks the HTTP status line. `zs-core doctor` showed `FAIL keycloak: version 26.8.0 does not match the pin 26.8.1` before the upgrade and was green after it. |

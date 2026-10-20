@@ -40,8 +40,12 @@ test-race:
 
 # Runs unit and integration tests. Integration tests use ZS_TEST_POSTGRES_URL
 # when set, otherwise a Postgres 18 container through Docker, and skip with a
-# message when neither is available.
+# message when neither is available. Without ZS_TEST_POSTGRES_URL they start
+# containers, so they run only on a build host: one that sets ZS_BUILD_HOST=1.
 test-integration:
+	@if [ "$${ZS_BUILD_HOST:-}" != "1" ] && [ -z "$${ZS_TEST_POSTGRES_URL:-}" ]; then \
+		echo "refusing to run the integration tests: set ZS_BUILD_HOST=1 on a build host, or ZS_TEST_POSTGRES_URL to a Postgres server (docs/development.md)"; exit 1; \
+	fi
 	$(GO) test -tags integration -count=1 ./...
 
 build:
@@ -64,10 +68,11 @@ clean:
 
 # Reference stack. These targets run docker compose in the current shell, on the
 # host that will run the containers. That host is a build VM, never a
-# workstation: see deploy/compose/README.md. They refuse to run on macOS.
+# workstation: see deploy/compose/README.md. They run only where ZS_BUILD_HOST=1
+# is set, which the build VM does in /etc/environment.
 stack-guard:
-	@if [ "$$(uname -s)" = "Darwin" ] && [ "$${ZS_ALLOW_LOCAL_STACK:-}" != "1" ]; then \
-		echo "refusing to run the reference stack on a workstation; run it on the build VM (deploy/compose/README.md)"; exit 1; \
+	@if [ "$${ZS_BUILD_HOST:-}" != "1" ]; then \
+		echo "refusing to run the reference stack: ZS_BUILD_HOST=1 is not set. Run it on the build VM (deploy/compose/README.md)"; exit 1; \
 	fi
 
 # Builds the Keycloak and Core images, starts everything and waits for health.

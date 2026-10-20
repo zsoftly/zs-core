@@ -39,9 +39,11 @@ func checkKeycloak(ctx context.Context, opts Options) (ComponentReport, []Findin
 		return report, findings
 	}
 	report.Reachable = true
-	add("reachable", OK, "reachable at %s", t.URL)
+	add("reachable", OK, "reachable at %s", redactURL(t.URL))
 
-	if t.Realm != "" {
+	if t.Realm == "" {
+		add("realm", Skip, "realm not checked (ZS_KEYCLOAK_REALM is not set)")
+	} else {
 		status, err := getJSON(ctx, opts.HTTPClient, t.URL+"/realms/"+url.PathEscape(t.Realm), "", "", nil)
 		switch {
 		case err != nil:
@@ -53,8 +55,8 @@ func checkKeycloak(ctx context.Context, opts Options) (ComponentReport, []Findin
 		}
 	}
 
-	if t.AdminUser == "" {
-		add("version", Warn, "version not verified: set ZS_KEYCLOAK_ADMIN_USER and ZS_KEYCLOAK_ADMIN_PASSWORD (pin is %s)", pin.Version)
+	if t.AdminUser == "" || t.AdminPassword == "" {
+		add("version", Skip, "version not checked (no admin credentials): set ZS_KEYCLOAK_ADMIN_USER and ZS_KEYCLOAK_ADMIN_PASSWORD (pin is %s)", pin.Version)
 		return report, findings
 	}
 	version, err := keycloakVersion(ctx, opts.HTTPClient, t)

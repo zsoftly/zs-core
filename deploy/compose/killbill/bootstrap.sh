@@ -36,12 +36,33 @@ COMPOSE=(docker compose --project-directory "$compose_dir")
 log() { printf 'bootstrap: %s\n' "$*"; }
 die() { printf 'bootstrap: error: %s\n' "$*" >&2; exit 1; }
 
+# Credentials reach curl through config files readable only by this user,
+# never on the command line, where any local user could read them.
+secrets_dir="$(umask 077 && mktemp -d)"
+trap 'rm -rf "$secrets_dir"' EXIT
+
+# curl_quote escapes a value for a double-quoted curl config string.
+curl_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+(
+  umask 077
+  printf 'user = %s\n' "$(curl_quote "$KILLBILL_ADMIN_USER:$KILLBILL_ADMIN_PASSWORD")" > "$secrets_dir/admin.conf"
+  printf 'header = %s\nheader = %s\n' \
+    "$(curl_quote "X-Killbill-ApiKey: $TENANT_API_KEY")" \
+    "$(curl_quote "X-Killbill-ApiSecret: $KILLBILL_TENANT_API_SECRET")" > "$secrets_dir/tenant.conf"
+)
+
 admin_curl() {
-  curl -sS -u "$KILLBILL_ADMIN_USER:$KILLBILL_ADMIN_PASSWORD" -H "X-Killbill-CreatedBy: $CREATED_BY" "$@"
+  curl -sS --config "$secrets_dir/admin.conf" -H "X-Killbill-CreatedBy: $CREATED_BY" "$@"
 }
 
 tenant_curl() {
-  admin_curl -H "X-Killbill-ApiKey: $TENANT_API_KEY" -H "X-Killbill-ApiSecret: $KILLBILL_TENANT_API_SECRET" "$@"
+  admin_curl --config "$secrets_dir/tenant.conf" "$@"
 }
 
 # status_of prints only the HTTP status of a request.
@@ -95,23 +116,48 @@ tenant_status="$(status_of admin_curl "$KILLBILL_URL/1.0/kb/tenants?apiKey=$TENA
 if [ "$tenant_status" = "200" ]; then
   log "tenant $TENANT_API_KEY already exists"
 else
-  body="$(printf '{"apiKey":"%s","apiSecret":"%s"}' "$TENANT_API_KEY" "$KILLBILL_TENANT_API_SECRET")"
-  create_status="$(status_of admin_curl -X POST -H 'Content-Type: application/json' -d "$body" "$KILLBILL_URL/1.0/kb/tenants")"
+  # The body holds the tenant secret, so it goes through stdin.
+  create_status="$(printf '{"apiKey":"%s","apiSecret":"%s"}' "$TENANT_API_KEY" "$KILLBILL_TENANT_API_SECRET" |
+    status_of admin_curl -X POST -H 'Content-Type: application/json' --data-binary @- "$KILLBILL_URL/1.0/kb/tenants")"
   case "$create_status" in
     201 | 409) log "tenant $TENANT_API_KEY created (HTTP $create_status)" ;;
     *) die "creating tenant $TENANT_API_KEY returned HTTP $create_status" ;;
   esac
 fi
 
-# 2. Catalogue. Upload only when the plan is not there yet; Kill Bill keeps
-# every uploaded version, so blind re-uploads would pile up versions.
+# 2. Catalogue. The SHA-256 of the last uploaded catalogue.xml is kept in the
+# tenant's user key-value store. Upload only when the file differs from it, so
+# an edited catalogue is uploaded again while an unchanged one does not pile up
+# versions in Kill Bill, which keeps every upload.
 [ -f "$CATALOGUE_FILE" ] || die "catalogue file $CATALOGUE_FILE not found"
-if tenant_curl -H 'Accept: application/json' "$KILLBILL_URL/1.0/kb/catalog/availableBasePlans" 2> /dev/null | grep -q '"plan":"core-test-monthly"'; then
-  log "catalogue already holds core-test-monthly"
+catalogue_key="zs-core-catalogue-sha256"
+catalogue_digest="$(sha256sum "$CATALOGUE_FILE" | awk '{print $1}')"
+stored_digest="$(tenant_curl -H 'Accept: application/json' "$KILLBILL_URL/1.0/kb/tenants/userKeyValue/$catalogue_key" |
+  python3 -c 'import json, sys
+try:
+    values = json.load(sys.stdin).get("values") or []
+except ValueError:
+    values = []
+print(values[-1] if values else "")')"
+if [ "$stored_digest" = "$catalogue_digest" ]; then
+  log "catalogue unchanged (sha256 $catalogue_digest)"
 else
   upload_status="$(status_of tenant_curl -X POST -H 'Content-Type: text/xml' --data-binary "@$CATALOGUE_FILE" "$KILLBILL_URL/1.0/kb/catalog/xml")"
-  [ "$upload_status" = "201" ] || die "catalogue upload returned HTTP $upload_status"
-  log "catalogue uploaded"
+  case "$upload_status" in
+    201) ;;
+    400) die "catalogue upload returned HTTP 400. Kill Bill rejects an edited catalogue whose effectiveDate it already holds; give the edited catalogue a later effectiveDate" ;;
+    *) die "catalogue upload returned HTTP $upload_status" ;;
+  esac
+  # Kill Bill appends values to a user key; keep exactly one.
+  delete_status="$(status_of tenant_curl -X DELETE "$KILLBILL_URL/1.0/kb/tenants/userKeyValue/$catalogue_key")"
+  case "$delete_status" in
+    2??) ;;
+    *) die "clearing the stored catalogue digest returned HTTP $delete_status" ;;
+  esac
+  key_status="$(printf '%s' "$catalogue_digest" |
+    status_of tenant_curl -X POST -H 'Content-Type: text/plain' --data-binary @- "$KILLBILL_URL/1.0/kb/tenants/userKeyValue/$catalogue_key")"
+  [ "$key_status" = "201" ] || die "storing the catalogue digest returned HTTP $key_status"
+  log "catalogue uploaded (sha256 $catalogue_digest)"
 fi
 
 # 3. Payment plugin.

@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-The audit module records who did what, to which tenant, and with what result. Every write in Core appends one event in the same transaction as the change, so the event exists exactly when the change does. Each event carries the actor, brand, tenant, action, reason, outcome and a correlation ID. The table refuses `UPDATE`, `DELETE` and `TRUNCATE`; a correction is a new event. Queries always name one brand and one tenant, filter by actor, action and time, and page newest first with an opaque cursor. Export is planned for a later phase.
+The audit module records who did what, to which tenant, and with what result. Every write in Core appends one event in the same transaction as the change, so the event exists exactly when the change does. Each event carries the actor, brand, tenant, action, reason, outcome and a correlation ID. The table refuses `UPDATE`, `DELETE` and `TRUNCATE`. A correction is a new event. Queries always name one brand and one tenant, filter by actor, action and time, and page newest first with an opaque cursor. Export is Phase 6.
 
 ## Writing events
 
@@ -34,7 +34,7 @@ err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
 
 ## Querying events
 
-`audit.Query(ctx, db, scope, filter)` returns events of the scope's brand and tenant only. The scope must hold both; a partial scope returns `scope_required` before any SQL runs.
+`audit.Query(ctx, db, scope, filter)` returns events of the scope's brand and tenant only. The scope must hold both. A partial scope returns `scope_required` before any SQL runs.
 
 | Filter | Meaning |
 | --- | --- |
@@ -45,7 +45,7 @@ err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
 | `Limit` | 1 to 200, default 50. |
 | `Cursor` | `NextCursor` of the previous page. |
 
-Results are ordered by `occurred_at` then ID, newest first. The cursor encodes the position after the last event of the page. It cannot widen a query: it only moves the position inside the brand and tenant the query already names.
+Results are ordered by `occurred_at` then ID, newest first. The cursor encodes the position after the last event of the page. It cannot widen a query. It moves the position inside the brand and tenant the query names.
 
 ## HTTP
 

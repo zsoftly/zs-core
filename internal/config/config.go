@@ -273,6 +273,9 @@ func validateHTTPURL(raw string) error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return errors.New("must be an http:// or https:// URL with a host")
 	}
+	if u.User != nil {
+		return errors.New("must not contain a user name or password; use the *_ADMIN_USER and *_ADMIN_PASSWORD settings")
+	}
 	return nil
 }
 

@@ -24,7 +24,11 @@ func manifest() components.Manifest {
 			components.Postgres: {Version: "18", Image: "postgres:18-alpine"},
 		},
 		KillBillPlugins: components.KillBillPlugins{
-			ApprovedPaymentPlugins: []components.Plugin{{Name: "stripe", Version: "6.0.1"}},
+			ApprovedPaymentPlugins: []components.Plugin{
+				{Name: "stripe", Version: "6.0.1", Status: "verified_install"},
+				{Name: "adyen", Version: "0.10.0", Status: components.PluginStatusPinnedNotInstalled},
+				{Name: "paypal-express", Status: components.PluginStatusNoJavaArtifact},
+			},
 		},
 	}
 }
@@ -115,7 +119,7 @@ func TestKeycloakRealmMissingAndNoAdminCredentials(t *testing.T) {
 	if f := find(t, fs, "keycloak", "realm"); f.Status != Fail {
 		t.Fatalf("realm finding = %v", f)
 	}
-	if f := find(t, fs, "keycloak", "version"); f.Status != Warn || !strings.Contains(f.Message, "ZS_KEYCLOAK_ADMIN_USER") {
+	if f := find(t, fs, "keycloak", "version"); f.Status != Skip || !strings.HasPrefix(f.String(), "SKIP keycloak: version not checked (no admin credentials)") {
 		t.Fatalf("version finding = %v", f)
 	}
 	if report.MatchesPin != nil {
@@ -171,18 +175,74 @@ var platformBundle = map[string]any{
 	"version": nil, "state": "RUNNING",
 }
 
+var runningStripe = map[string]any{"pluginKey": "stripe", "pluginName": "stripe-plugin", "version": "6.0.1", "state": "RUNNING"}
+
 func TestKillBillMatchesPin(t *testing.T) {
-	srv := killBillServer(t, "0.24.22", true, []map[string]any{platformBundle})
+	srv := killBillServer(t, "0.24.22", true, []map[string]any{platformBundle, runningStripe})
 	opts := Options{Manifest: manifest(), HTTPClient: srv.Client(),
 		KillBill: Target{URL: srv.URL, AdminUser: "admin", AdminPassword: "pw"}}
 	report, fs := checkKillBill(context.Background(), opts)
 	if report.Version != "0.24.22" || report.MatchesPin == nil || !*report.MatchesPin || !report.Reachable {
 		t.Fatalf("report = %+v", report)
 	}
-	for _, check := range []string{"health", "version", "plugins"} {
+	for _, check := range []string{"health", "version", "plugin", "plugins"} {
 		if f := find(t, fs, "killbill", check); f.Status != OK {
 			t.Errorf("%s finding = %v", check, f)
 		}
+	}
+	for _, f := range fs {
+		if f.Status != OK {
+			t.Errorf("unexpected finding %v", f)
+		}
+	}
+}
+
+func TestKillBillRequiredPluginMissingOrStopped(t *testing.T) {
+	opts := Options{Manifest: manifest(), KillBill: Target{AdminUser: "admin", AdminPassword: "pw"}}
+
+	srv := killBillServer(t, "0.24.22", true, []map[string]any{platformBundle})
+	opts.HTTPClient, opts.KillBill.URL = srv.Client(), srv.URL
+	_, fs := checkKillBill(context.Background(), opts)
+	var missing bool
+	for _, f := range fs {
+		if f.Check == "plugin" && f.Status == Fail && strings.Contains(f.Message, "stripe 6.0.1 is not installed") {
+			missing = true
+		}
+		if strings.Contains(f.Message, "adyen") || strings.Contains(f.Message, "paypal") {
+			t.Errorf("a plugin not expected on the stack was reported: %v", f)
+		}
+	}
+	if !missing {
+		t.Fatalf("missing required plugin is not a failure: %v", fs)
+	}
+
+	stopped := map[string]any{"pluginKey": "stripe", "pluginName": "stripe-plugin", "version": "6.0.1", "state": "STOPPED"}
+	srv = killBillServer(t, "0.24.22", true, []map[string]any{platformBundle, stopped})
+	opts.HTTPClient, opts.KillBill.URL = srv.Client(), srv.URL
+	_, fs = checkKillBill(context.Background(), opts)
+	var notRunning bool
+	for _, f := range fs {
+		if f.Check == "plugin" && f.Status == Fail && strings.Contains(f.Message, "stripe is STOPPED") {
+			notRunning = true
+		}
+	}
+	if !notRunning {
+		t.Fatalf("stopped required plugin is not a failure: %v", fs)
+	}
+}
+
+func TestPrintedURLsAreRedacted(t *testing.T) {
+	srv := killBillServer(t, "0.24.22", true, []map[string]any{platformBundle, runningStripe})
+	u := strings.Replace(srv.URL, "http://", "http://ops:hunter2@", 1)
+	opts := Options{Manifest: manifest(), HTTPClient: srv.Client(), KillBill: Target{URL: u, AdminUser: "admin", AdminPassword: "pw"}}
+	_, fs := checkKillBill(context.Background(), opts)
+	for _, f := range fs {
+		if strings.Contains(f.Message, "hunter2") {
+			t.Fatalf("password printed: %v", f)
+		}
+	}
+	if f := find(t, fs, "killbill", "health"); !strings.Contains(f.Message, "xxxxx") {
+		t.Fatalf("health finding = %v", f)
 	}
 }
 
@@ -229,7 +289,7 @@ func TestKillBillUnhealthyAndAuthFailure(t *testing.T) {
 
 	opts.KillBill.AdminUser, opts.KillBill.AdminPassword = "", ""
 	_, fs = checkKillBill(context.Background(), opts)
-	if f := find(t, fs, "killbill", "version"); f.Status != Warn {
+	if f := find(t, fs, "killbill", "version"); f.Status != Skip || !strings.HasPrefix(f.String(), "SKIP killbill: version not checked (no admin credentials)") {
 		t.Fatalf("version finding without credentials = %v", f)
 	}
 }
@@ -358,5 +418,35 @@ func TestRunAggregatesAndRenders(t *testing.T) {
 	}
 	if decoded.OK || decoded.CoreRelease != "1.0.0-test" || len(decoded.Components) != 5 {
 		t.Fatalf("decoded = %+v", decoded)
+	}
+}
+
+func TestSkippedChecksAreReportedAndNotOK(t *testing.T) {
+	kc := keycloakServer(t, "26.8.1")
+	kb := killBillServer(t, "0.24.22", true, []map[string]any{platformBundle, runningStripe})
+	now := time.Now()
+	report := Run(context.Background(), Options{
+		Manifest:   manifest(),
+		Database:   fakeDB{version: "18.1", dbNow: func() time.Time { return now }},
+		Keycloak:   Target{URL: kc.URL},
+		KillBill:   Target{URL: kb.URL},
+		HTTPClient: http.DefaultClient,
+		Now:        func() time.Time { return now },
+	})
+	if report.Failed() || !report.Skipped() || report.OK {
+		t.Fatalf("failed=%v skipped=%v ok=%v: %v", report.Failed(), report.Skipped(), report.OK, report.Findings)
+	}
+	var text bytes.Buffer
+	if err := report.WriteText(&text); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"SKIP keycloak: realm not checked",
+		"SKIP keycloak: version not checked (no admin credentials)",
+		"SKIP killbill: version not checked (no admin credentials)",
+	} {
+		if !strings.Contains(text.String(), want) {
+			t.Errorf("missing %q in:\n%s", want, text.String())
+		}
 	}
 }

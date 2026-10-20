@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/zsoftly/zs-core/pkg/events"
 	"github.com/zsoftly/zs-core/pkg/idgen"
@@ -11,24 +12,39 @@ import (
 
 type fakeReader struct {
 	pending     []events.Envelope
+	until       time.Time
 	published   []idgen.UUID
+	deferred    []idgen.UUID
 	failures    map[idgen.UUID]int
 	maxAttempts map[idgen.UUID]int
 }
 
-func (f *fakeReader) Unpublished(context.Context, int) ([]events.Envelope, error) {
-	return f.pending, nil
+func newFakeReader(pending ...events.Envelope) *fakeReader {
+	return &fakeReader{pending: pending, failures: map[idgen.UUID]int{}, maxAttempts: map[idgen.UUID]int{}}
 }
 
-func (f *fakeReader) MarkPublished(_ context.Context, ids []idgen.UUID) error {
-	f.published = append(f.published, ids...)
+func (f *fakeReader) Claim(context.Context, int) (Claim, error) {
+	until := f.until
+	if until.IsZero() {
+		until = time.Now().Add(time.Minute)
+	}
+	return Claim{Token: []byte("token"), Until: until, Events: f.pending}, nil
+}
+
+func (f *fakeReader) MarkPublished(_ context.Context, _ []byte, id idgen.UUID) error {
+	f.published = append(f.published, id)
 	return nil
 }
 
-func (f *fakeReader) RecordFailure(_ context.Context, id idgen.UUID, maxAttempts int) (bool, error) {
+func (f *fakeReader) RecordFailure(_ context.Context, _ []byte, id idgen.UUID, maxAttempts int) (bool, error) {
 	f.failures[id]++
 	f.maxAttempts[id] = maxAttempts
 	return f.failures[id] >= maxAttempts, nil
+}
+
+func (f *fakeReader) Defer(_ context.Context, _ []byte, id idgen.UUID) error {
+	f.deferred = append(f.deferred, id)
+	return nil
 }
 
 func envelope(t *testing.T, eventType string) events.Envelope {
@@ -52,11 +68,7 @@ func TestRelayPublishesSuccessesAndRecordsFailures(t *testing.T) {
 	failing := envelope(t, "test.fail")
 	terminal := envelope(t, "test.terminal")
 	deferred := envelope(t, "test.deferred")
-	reader := &fakeReader{
-		pending:     []events.Envelope{ok, failing, terminal, deferred},
-		failures:    map[idgen.UUID]int{},
-		maxAttempts: map[idgen.UUID]int{},
-	}
+	reader := newFakeReader(ok, failing, terminal, deferred)
 	handler := HandlerFunc(func(_ context.Context, e events.Envelope) error {
 		switch e.Type {
 		case "test.fail":
@@ -85,10 +97,30 @@ func TestRelayPublishesSuccessesAndRecordsFailures(t *testing.T) {
 	if _, recorded := reader.failures[deferred.StorageID()]; recorded {
 		t.Fatal("deferred event spent a retry")
 	}
+	if len(reader.deferred) != 1 || reader.deferred[0] != deferred.StorageID() {
+		t.Fatalf("deferred event was not rescheduled: %v", reader.deferred)
+	}
+}
+
+func TestRelayStopsWhenTheClaimExpires(t *testing.T) {
+	first := envelope(t, "test.first")
+	second := envelope(t, "test.second")
+	reader := newFakeReader(first, second)
+	reader.until = time.Now().Add(50 * time.Millisecond)
+	var handled []string
+	handler := HandlerFunc(func(ctx context.Context, e events.Envelope) error {
+		handled = append(handled, e.Type)
+		<-ctx.Done()
+		return nil
+	})
+	count, err := NewRelay("test", reader, handler, 10, 3, nil).RunOnce(context.Background())
+	if count != 1 || err == nil || len(handled) != 1 {
+		t.Fatalf("RunOnce = %d, %v, handled %v", count, err, handled)
+	}
 }
 
 func TestRelayEmptyOutbox(t *testing.T) {
-	reader := &fakeReader{failures: map[idgen.UUID]int{}, maxAttempts: map[idgen.UUID]int{}}
+	reader := newFakeReader()
 	relay := NewRelay("test", reader, HandlerFunc(func(context.Context, events.Envelope) error {
 		t.Fatal("handler called")
 		return nil
@@ -99,7 +131,7 @@ func TestRelayEmptyOutbox(t *testing.T) {
 }
 
 func TestRunStopsOnCancel(t *testing.T) {
-	reader := &fakeReader{failures: map[idgen.UUID]int{}, maxAttempts: map[idgen.UUID]int{}}
+	reader := newFakeReader()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	NewRelay("test", reader, HandlerFunc(func(context.Context, events.Envelope) error { return nil }), 1, 1, nil).Run(ctx, 1)

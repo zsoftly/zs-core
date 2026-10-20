@@ -52,9 +52,10 @@ const (
 	CodeIdentityProviderUnavailable Code = "ZS-1102"
 	CodeBillingUnavailable          Code = "ZS-1103"
 
-	CodeIdempotencyKeyInvalid    Code = "ZS-1200"
-	CodeIdempotencyKeyConflict   Code = "ZS-1201"
-	CodeIdempotencyKeyInProgress Code = "ZS-1202"
+	CodeIdempotencyKeyInvalid     Code = "ZS-1200"
+	CodeIdempotencyKeyConflict    Code = "ZS-1201"
+	CodeIdempotencyKeyInProgress  Code = "ZS-1202"
+	CodeIdempotencyResultTooLarge Code = "ZS-1203"
 
 	CodeInvalidCursor Code = "ZS-1300"
 	CodeInvalidLimit  Code = "ZS-1301"
@@ -92,6 +93,7 @@ var definitions = []Definition{
 	{CodeIdempotencyKeyInvalid, "idempotency_key_invalid", http.StatusBadRequest, false, "The idempotency_key must be 8 to 255 printable characters."},
 	{CodeIdempotencyKeyConflict, "idempotency_key_conflict", http.StatusConflict, false, "The idempotency_key was already used with a different request."},
 	{CodeIdempotencyKeyInProgress, "idempotency_key_in_progress", http.StatusConflict, true, "A request with this idempotency_key is still in progress."},
+	{CodeIdempotencyResultTooLarge, "idempotency_result_too_large", http.StatusInternalServerError, false, "The command ran but its result was too large to store; it is not run again for this idempotency_key."},
 	{CodeInvalidCursor, "invalid_cursor", http.StatusBadRequest, false, "The cursor is invalid."},
 	{CodeInvalidLimit, "invalid_limit", http.StatusBadRequest, false, "The limit is out of range."},
 	{CodeScopeRequired, "scope_required", http.StatusBadRequest, false, "A brand and a tenant scope are required."},

@@ -28,7 +28,7 @@ func checkKAUI(ctx context.Context, opts Options) (ComponentReport, []Finding) {
 		return report, []Finding{{name, "reachable", Fail, fmt.Sprintf("GET / returned HTTP %d", status)}}
 	}
 	report.Reachable = true
-	return report, []Finding{{name, "reachable", OK, fmt.Sprintf("reachable at %s (HTTP 200); the version is not exposed, pin is %s", opts.KAUI.URL, pin.Version)}}
+	return report, []Finding{{name, "reachable", OK, fmt.Sprintf("reachable at %s (HTTP 200); the version is not exposed, pin is %s", redactURL(opts.KAUI.URL), pin.Version)}}
 }
 
 func getStatus(ctx context.Context, client *http.Client, url string) (int, error) {

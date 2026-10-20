@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-You need Go 1.26.1 or later and a Postgres 16 or later server. Docker is optional but needed for the integration tests unless you point them at a server of your own. `make check` is the gate for every change: it checks formatting, runs `go vet`, runs the unit tests and fails if the generated API types are stale. There is no hosted CI workflow, so run `make check` before you push, and run `make test-integration` when you touch SQL, migrations or anything under `pkg/` that talks to Postgres. Configuration is environment only; [configuration.md](configuration.md) lists every variable. The service applies its migrations before it reports ready.
+You need Go 1.26.1 or later and a Postgres server. Postgres 18 is what the stack and the test harness run. Earlier majors are not tested. Docker runs the integration tests unless you point them at your own server. `make check` gates every change. It checks formatting, runs `go vet`, runs the unit tests and fails when the generated API types are stale. There is no hosted CI workflow, so run `make check` before you push, and run `make test-integration` when you touch SQL, migrations or anything under `pkg/` that talks to Postgres. Configuration is environment only; [configuration.md](configuration.md) lists every variable. The service applies its migrations before it reports ready.
 
 ## Make targets
 
@@ -14,12 +14,12 @@ You need Go 1.26.1 or later and a Postgres 16 or later server. Docker is optiona
 | `make lint` | Runs `make vet`, then `staticcheck` if it is installed. Without `staticcheck` it prints a notice and runs vet only. |
 | `make test` | Runs the unit tests. No database or Docker needed. |
 | `make test-race` | Runs the unit tests with the race detector. |
-| `make test-integration` | Runs the unit and integration tests against Postgres. |
+| `make test-integration` | Runs the unit and integration tests against Postgres. Runs only where `ZS_BUILD_HOST=1` or `ZS_TEST_POSTGRES_URL` is set. |
 | `make build` | Builds `bin/zs-core`. |
 | `make generate` | Regenerates `internal/httpapi/gen/types.gen.go` from `api/openapi.yaml`. |
 | `make generate-check` | Fails if the generated types do not match the OpenAPI document. |
 | `make check` | `fmt-check`, `vet`, `test` and `generate-check`. This is the merge gate. |
-| `make stack-up`, `make stack-down`, `make stack-reset`, `make stack-logs`, `make stack-bootstrap`, `make doctor` | The reference stack. They run `docker compose` in the current shell and refuse to run on macOS. Use them on a build host. See [../deploy/compose/README.md](../deploy/compose/README.md). |
+| `make stack-up`, `make stack-down`, `make stack-reset`, `make stack-logs`, `make stack-bootstrap`, `make doctor` | The reference stack. They run `docker compose` in the current shell, and only where `ZS_BUILD_HOST=1` is set. Use them on a build host. See [../deploy/compose/README.md](../deploy/compose/README.md). |
 
 ## Run the service
 
@@ -49,8 +49,9 @@ The list is empty until a library caller writes audit events. Phase 1 has no HTT
 ## Operator commands
 
 ```bash
-bin/zs-core doctor              # one line per finding; exit 1 if any is FAIL
+bin/zs-core doctor              # one line per finding; exit 1 if any is FAIL or SKIP
 bin/zs-core doctor --json       # the same report as JSON
+bin/zs-core doctor --allow-skips   # exit 0 despite SKIP findings (a pin not checked)
 bin/zs-core upgrade check       # newer upstream versions; changes nothing
 bin/zs-core upgrade check --strict   # exit 1 if a release feed cannot be read
 ```
@@ -59,9 +60,9 @@ bin/zs-core upgrade check --strict   # exit 1 if a release feed cannot be read
 
 ## Migrations
 
-Migrations live in `migrations/` as `NNNNNN_name.up.sql`. They are embedded in the binary and forward only: there are no down files. To correct a migration, add a new one. Never edit a released file; the runner stores a SHA-256 checksum of each applied file and refuses to start if one changes.
+Migrations live in `migrations/` as `NNNNNN_name.up.sql`. They are embedded in the binary and forward only. There are no down files. To correct a migration, add a new one. Never edit a released file. The runner stores a SHA-256 checksum of each applied file and refuses to start if one changes.
 
-The runner takes a Postgres advisory lock per schema, so several instances can start at once and each migration still runs exactly once. Each migration runs in its own transaction with its history row in `schema_migrations`.
+The runner takes a Postgres advisory lock per schema, so you can start several instances at once and each migration still runs once. Each migration runs in its own transaction with its history row in `schema_migrations`.
 
 ```bash
 bin/zs-core migrate     # apply pending migrations and exit
@@ -83,7 +84,9 @@ The harness in `internal/postgrestest` chooses the server like this:
 2. Otherwise it starts one `postgres:18-alpine` container per test binary through testcontainers. The testcontainers reaper removes the container when the tests finish.
 3. If neither is available, each integration test is skipped with a message that says so.
 
-Testcontainers looks for Docker in several places, starting with `DOCKER_HOST`, and moves on to the next candidate when one does not answer. A wrong `DOCKER_HOST` therefore does not stop it from finding another running Docker. With Rancher Desktop, set `DOCKER_HOST=unix://$HOME/.rd/docker.sock` if the default socket is not linked. When the tests themselves run inside a container that shares the host network and the host Docker socket, set `TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1` so the tests connect to the mapped port on the host.
+Testcontainers checks `DOCKER_HOST` first, then other Docker sockets. A wrong `DOCKER_HOST` does not stop it. On Rancher Desktop, set `DOCKER_HOST=unix://$HOME/.rd/docker.sock`. In a container that shares the host network and Docker socket, set `TESTCONTAINERS_HOST_OVERRIDE=127.0.0.1`.
+
+`make test-integration` and the `make stack-*` targets need a positive marker before they start containers. They run only where `ZS_BUILD_HOST=1` is set in the environment, which the build VM does in `/etc/environment`, or, for `make test-integration` only, where `ZS_TEST_POSTGRES_URL` is set. Without either they refuse and exit non-zero. Never set `ZS_BUILD_HOST` on a workstation. See [../deploy/compose/README.md](../deploy/compose/README.md#the-build-host-marker).
 
 ```bash
 make test-integration
@@ -99,4 +102,4 @@ ZS_TEST_POSTGRES_URL='postgres://zs:zs-test@127.0.0.1:55432/zs_core_test?sslmode
 - Standard library `net/http` with method patterns, `log/slog`, `pgx/v5`. No web framework and no ORM.
 - Every tenant-owned query goes through `scope.Scope.Bind`, which refuses a scope without both a brand and a tenant.
 - Errors returned to clients are `pkg/errors` values. Their cause is logged and never written to a response.
-- Library functions that write take a `pgx.Tx`, so a caller can include them in its own transaction.
+- Library functions that write take a `pgx.Tx`, so a caller runs them inside its own transaction.

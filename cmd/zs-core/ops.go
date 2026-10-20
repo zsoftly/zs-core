@@ -32,11 +32,13 @@ func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 	return fs
 }
 
-// runDoctor implements `zs-core doctor`. Exit 0 when nothing failed, 1 when a
-// finding failed, 2 for a usage or configuration error.
+// runDoctor implements `zs-core doctor`. Exit 0 when every pin was checked and
+// nothing failed, 1 when a finding failed or a check was skipped (unless
+// --allow-skips), 2 for a usage or configuration error.
 func runDoctor(args, environ []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("doctor", stderr)
 	asJSON := fs.Bool("json", false, "write the report as JSON")
+	allowSkips := fs.Bool("allow-skips", false, "exit 0 even when a check was skipped for lack of credentials or settings")
 	componentsFile := fs.String("components", defaultComponentsFile, "path to components.yaml")
 	timeout := fs.Duration("timeout", 60*time.Second, "overall time limit")
 	if err := fs.Parse(args); err != nil {
@@ -87,7 +89,13 @@ func runDoctor(args, environ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if report.Failed() {
+	return doctorExitCode(report, *allowSkips)
+}
+
+// doctorExitCode is 1 when a finding failed, or when a check was skipped and
+// skips are not allowed, so a green doctor means every pin was checked.
+func doctorExitCode(report doctor.Report, allowSkips bool) int {
+	if report.Failed() || (report.Skipped() && !allowSkips) {
 		return 1
 	}
 	return 0

@@ -2,11 +2,21 @@
 
 ## TL;DR
 
-This directory holds the Docker Compose stack that runs every pinned component of a Core release: Postgres 18, Keycloak, Kill Bill, KAUI, Mailpit and Core itself. It is for development and tests. Run it on a build host, never on a workstation, because it starts a JVM-heavy stack with real databases. `make stack-up` builds what needs building, starts everything and waits until every healthcheck passes. `make stack-bootstrap` then creates the `zs-reference` Kill Bill tenant and uploads a small test catalogue. `make doctor` proves the running stack matches `components.yaml`. Every port binds to `127.0.0.1` on the build host, so you reach the stack through SSH port forwards. `make stack-reset` deletes all data.
+This directory holds the Docker Compose stack that runs every pinned component of a Core release: Postgres 18, Keycloak, Kill Bill, KAUI, Mailpit and Core itself. It is for development and tests. Run it on a build host, never on a workstation, because it starts several JVM services and real databases. `make stack-up` builds what needs building, starts everything and waits until every healthcheck passes. `make stack-bootstrap` then creates the `zs-reference` Kill Bill tenant and uploads a small test catalogue. `make doctor` proves the running stack matches `components.yaml`. Every port binds to `127.0.0.1` on the build host, so you reach the stack through SSH port forwards. `make stack-reset` deletes all data.
 
 ## Run it on the build host
 
-The `make stack-*` targets run `docker compose` in the shell you are in. They refuse to run on macOS. The build host needs Docker with the Compose plugin, `make`, `rsync`, `curl` and `python3`.
+The `make stack-*` targets run `docker compose` in the shell you are in. The build host needs Docker with the Compose plugin, `make`, `rsync`, `curl` and `python3`.
+
+### The build host marker
+
+The `make stack-*` targets and `make test-integration` run only where `ZS_BUILD_HOST=1` is set in the environment. Everywhere else they refuse and exit non-zero. The build VM sets the marker for every login in `/etc/environment`:
+
+```bash
+echo 'ZS_BUILD_HOST=1' | sudo tee -a /etc/environment
+```
+
+Never set it on a workstation. `make test-integration` also runs where `ZS_TEST_POSTGRES_URL` points at a Postgres server you already run, because then it starts no containers.
 
 Copy the working tree to the build host, then run the stack there:
 
@@ -16,7 +26,7 @@ rsync -az --delete --exclude .git --exclude bin --exclude /deploy/compose/.env \
 ssh <user>@<build-host> 'cd /tmp/zs-core && make stack-up && make stack-bootstrap && make doctor'
 ```
 
-The first `make stack-up` creates `deploy/compose/.env` from `.env.example`. The example holds placeholder passwords that are fine on a loopback-only stack and nowhere else. A clean start, with the upstream images already pulled, takes about two minutes. Pulling the images the first time takes longer.
+The first `make stack-up` creates `deploy/compose/.env` from `.env.example`. The example holds placeholder passwords. Use them on a loopback-only stack and nowhere else. A clean start, with the upstream images already pulled, takes about two minutes. Pulling the images the first time takes longer.
 
 To reach the web interfaces from your workstation, forward the ports over SSH:
 
@@ -27,7 +37,7 @@ ssh -N \
   <user>@<build-host>
 ```
 
-Then open Keycloak at `http://127.0.0.1:8180`, KAUI at `http://127.0.0.1:9090` and Mailpit at `http://127.0.0.1:8025`. Keycloak's hostname is fixed to `http://127.0.0.1:8180`, so it must be reached on that exact address and port. Forward it to the same local port.
+Then open Keycloak at `http://127.0.0.1:8180`, KAUI at `http://127.0.0.1:9090` and Mailpit at `http://127.0.0.1:8025`. Keycloak's hostname is fixed to `http://127.0.0.1:8180`. Reach it on that exact address and forward it to the same local port.
 
 When you are done, clean up on the build host:
 
@@ -59,7 +69,7 @@ ssh <user>@<build-host> 'rm -rf /tmp/zs-core'
 | `core` | built from the `Dockerfile` at the repository root | 8080 | `zs-core serve`, running as a non-root user. |
 | `killbill-prep`, `kaui-ddl`, `db-init` | upstream images | none | One-shot helpers that load the Kill Bill and KAUI schemas. They exit when done. |
 
-The image tags in `compose.yaml` must equal `components.yaml`. A unit test in `internal/components` fails when they differ. To rehearse an upgrade you override a tag in `.env` (`KEYCLOAK_IMAGE`, `KILLBILL_IMAGE`, `KAUI_IMAGE`, `POSTGRES_IMAGE`, `MAILPIT_IMAGE`). `zs-core doctor` then reports the mismatch. See [../../docs/upgrades/keycloak.md](../../docs/upgrades/keycloak.md) and [../../docs/upgrades/killbill.md](../../docs/upgrades/killbill.md).
+The image defaults in `compose.yaml` are pinned by digest (`image@sha256:...`, with the tag in a comment beside it) and must equal the `image` and `digest` of `components.yaml`. A unit test in `internal/components` fails when they differ. To rehearse an upgrade, override an image in `.env` with a plain tag or a digest (`KEYCLOAK_IMAGE`, `KILLBILL_IMAGE`, `KAUI_IMAGE`, `POSTGRES_IMAGE`, `MAILPIT_IMAGE`). `zs-core doctor` then reports the mismatch. See [../../docs/upgrades/keycloak.md](../../docs/upgrades/keycloak.md) and [../../docs/upgrades/killbill.md](../../docs/upgrades/killbill.md).
 
 ## Design notes
 
@@ -83,7 +93,7 @@ Changing the JSON later does not change an existing realm. Reset the stack or us
 
 ### Kill Bill
 
-Kill Bill needs its schema before it starts, and the image does not create it. The schema files ship inside the Kill Bill jars. `killbill-prep` extracts them from the pinned image into a shared volume, in the order they must be applied, so they always match the version in use. `db-init` then loads them into the `killbill` database when it is empty. The Postgres bridge file creates MySQL-compatible types, helper functions and an event trigger, which needs a superuser, so `db-init` applies that one file as `postgres` and the rest as the `killbill` role. KAUI's schema is loaded the same way into the `kaui` database. A database that already has its tables is left alone, so a restart never reapplies a schema.
+Kill Bill needs its schema before it starts, and the image does not create it. The schema files ship inside the Kill Bill jars. `killbill-prep` extracts them from the pinned image into a shared volume, in the order they must be applied, so they always match the version in use. `db-init` then loads them into the `killbill` database when it is empty. The Postgres bridge file creates MySQL-compatible types, helper functions and an event trigger, which needs a superuser, so `db-init` applies that one file as `postgres` and the rest as the `killbill` role. KAUI's schema is loaded the same way into the `kaui` database. `db-init` skips a database that already has its tables, so a restart never reapplies a schema.
 
 The image reads its database settings from `KILLBILL_DAO_URL`, `KILLBILL_DAO_USER` and `KILLBILL_DAO_PASSWORD`, and the password of the built-in `admin` user from `KB_ADMIN_PASSWORD`. Its unauthenticated health endpoint is `/1.0/healthcheck`. The `/1.0/kb/healthcheck` path does not exist in 0.24.22.
 
@@ -93,7 +103,7 @@ The `killbill-plugins` volume holds `/var/lib/killbill/bundles/plugins`, so inst
 
 KAUI needs a database of its own, so the stack creates a fourth database, `kaui`. Users sign in with their Kill Bill credentials, and `db-init` allows the `admin` user, as the upstream KAUI database template does.
 
-KAUI 4.0.31 has an upstream fault. On two cold starts, while the healthcheck probed the sign-in page, that page answered HTTP 500 with "Asset ... was not declared to be precompiled in production" and kept doing so until the container restarted. Both times, the first requests had overlapped while the page was still rendering for the first time. The healthcheck therefore probes `/`, which redirects without rendering assets. If you see the 500, run `docker compose restart kaui` and load the sign-in page once before anything else. Report it upstream before removing this note.
+KAUI 4.0.31 has an upstream fault. On two cold starts, while the healthcheck probed the sign-in page, that page answered HTTP 500 with "Asset ... was not declared to be precompiled in production" and kept doing so until the container restarted. Both times, the first requests overlapped during the first render. The healthcheck probes the sign-in page and requires HTTP 200, so healthy means the page renders. Its curl call gives up after 120 seconds, before the 130-second probe timeout, and Docker runs one probe at a time, so the probes never overlap a slow first render. A cold start on the build host with this healthcheck came up healthy without the fault. If you see the 500, run `docker compose restart kaui` and load the sign-in page once before anything else. File the upstream report before you remove this note.
 
 ### Core
 
@@ -109,17 +119,17 @@ KAUI 4.0.31 has an upstream fault. On two cold starts, while the healthcheck pro
 
 ### How plugin installation behaves on this image
 
-KPM is bundled and works, with three limits that the script handles.
+KPM is bundled and works. The script handles three limits.
 
-- The image carries two KPM parts: the command line tool `kpm` (version 0.12.4) and the `killbill-platform-osgi-bundles-kpm` bundle. The command line tool in this version installs Java plugins only. It cannot install Ruby plugins.
+- The image carries two KPM parts: the KPM command line tool `kpm` (version 0.12.4) and the KPM OSGi bundle `killbill-platform-osgi-bundles-kpm` (version 0.41.23). The command line tool in this version installs Java plugins only. It cannot install Ruby plugins.
 - The bundle installs a plugin at runtime when you send an `INSTALL_PLUGIN` node command to `POST /1.0/kb/nodesInfo`. It needs the admin credentials in `KB_org_killbill_billing_plugin_kpm_adminUsername` and `..._adminPassword`, which `compose.yaml` sets. Its default download address has a doubled slash that Maven Central rejects, so the script passes the artifact address in the `pluginUri` property instead of letting the bundle build it. After the install the plugin is `STOPPED`, so the script sends a `START_PLUGIN` command.
 - The plugin's own tables are not created by Kill Bill. The script loads the `ddl.sql` shipped inside the plugin jar into the `killbill` database before it starts the plugin.
 
-So nothing has to be baked into the image, and `deploy/compose/killbill/Dockerfile` does not exist. Installed plugins live in the `killbill-plugins` volume.
+Nothing is baked into the image, so `deploy/compose/killbill/Dockerfile` does not exist. Installed plugins live in the `killbill-plugins` volume.
 
-The Stripe version is read from `components.yaml`, which pins the Java plugin 8.0.3 (`org.kill-bill.billing.plugin.java:stripe-plugin`). The 6.x Stripe releases are Ruby plugins and cannot be installed on this Kill Bill image. `STRIPE_PLUGIN_VERSION` overrides the pin for a rehearsal; `zs-core doctor` reports any installed Stripe version that differs from the pin.
+The Stripe version is read from `components.yaml`, which pins the Java plugin 8.0.3 (`org.kill-bill.billing.plugin.java:stripe-plugin`). The 6.x Stripe releases are Ruby plugins and cannot be installed on this Kill Bill image. `STRIPE_PLUGIN_VERSION` overrides the pin for a rehearsal. `zs-core doctor` reports any installed Stripe version that differs from the pin.
 
-The Stripe configuration the script uploads sets only `org.killbill.billing.plugin.stripe.apiKey`. Use a test-mode key (`sk_test_...`). The script refuses anything else. Payment flows against Stripe have not been exercised by this stack.
+The Stripe configuration the script uploads sets only `org.killbill.billing.plugin.stripe.apiKey`. Use a test-mode key (`sk_test_...`). The script refuses anything else. This stack has not run a live Stripe payment.
 
 ## Files
 

@@ -193,18 +193,29 @@ func TestDoReleasesOnError(t *testing.T) {
 	}
 }
 
-func TestDoRejectsOversizedResult(t *testing.T) {
+func TestDoStoresTooLargeMarkerAndDoesNotRunAgain(t *testing.T) {
 	store := NewMemoryStore()
 	key := testKey(t)
 	fp := mustFingerprint(t, "op", `{}`)
-	_, _, err := Do(context.Background(), store, key, fp, func(context.Context) (Result, error) {
+	var calls int32
+	fn := func(context.Context) (Result, error) {
+		atomic.AddInt32(&calls, 1)
 		return Result{Status: 200, Body: make([]byte, MaxResultBytes+1)}, nil
-	})
-	if !zserrors.IsCode(err, zserrors.CodeInternal) {
-		t.Fatalf("err = %v", err)
 	}
-	if _, reserved, _ := store.Reserve(context.Background(), key, fp); !reserved {
-		t.Fatal("oversized result left the key reserved")
+	_, replayed, err := Do(context.Background(), store, key, fp, fn)
+	if !zserrors.IsCode(err, zserrors.CodeIdempotencyResultTooLarge) || replayed {
+		t.Fatalf("first = %v %v", replayed, err)
+	}
+	_, replayed, err = Do(context.Background(), store, key, fp, fn)
+	if !zserrors.IsCode(err, zserrors.CodeIdempotencyResultTooLarge) || !replayed {
+		t.Fatalf("replay = %v %v", replayed, err)
+	}
+	if calls != 1 {
+		t.Fatalf("command ran %d times", calls)
+	}
+	status, env := zserrors.ToEnvelope(err)
+	if status != 500 || env.Error.Code != "idempotency_result_too_large" || env.Error.Retryable {
+		t.Fatalf("envelope = %d %+v", status, env)
 	}
 }
 
@@ -214,19 +225,197 @@ func TestStaleLeaseTakeoverOnlyForSamePayload(t *testing.T) {
 	store.now = func() time.Time { return now }
 	key := testKey(t)
 	fp := mustFingerprint(t, "op", `{"a":1}`)
-	if _, reserved, _ := store.Reserve(context.Background(), key, fp); !reserved {
+	if r, _ := store.Reserve(context.Background(), key, fp); !r.Reserved {
 		t.Fatal("first reserve failed")
 	}
 	now = now.Add(PendingLeaseDuration + time.Second)
-	if _, reserved, _ := store.Reserve(context.Background(), key, mustFingerprint(t, "op", `{"a":2}`)); reserved {
+	if r, _ := store.Reserve(context.Background(), key, mustFingerprint(t, "op", `{"a":2}`)); r.Reserved {
 		t.Fatal("different payload took over a stale lease")
 	}
-	if _, reserved, _ := store.Reserve(context.Background(), key, fp); !reserved {
+	if r, _ := store.Reserve(context.Background(), key, fp); !r.Reserved {
 		t.Fatal("identical retry could not take over a stale lease")
 	}
 	now = now.Add(RecordRetention + time.Second)
-	if _, reserved, _ := store.Reserve(context.Background(), key, mustFingerprint(t, "op", `{"a":3}`)); !reserved {
+	if r, _ := store.Reserve(context.Background(), key, mustFingerprint(t, "op", `{"a":3}`)); !r.Reserved {
 		t.Fatal("expired record still blocks the key")
+	}
+}
+
+// clock lets a test move the time of a MemoryStore from inside a command.
+type clock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *clock) Now() time.Time      { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *clock) Add(d time.Duration) { c.mu.Lock(); c.now = c.now.Add(d); c.mu.Unlock() }
+
+func TestDoLeaseTakeoverKeepsTheNewOwnersResult(t *testing.T) {
+	store := NewMemoryStore()
+	c := &clock{now: time.Now().UTC()}
+	store.now = c.Now
+	key := testKey(t)
+	fp := mustFingerprint(t, "op", `{"a":1}`)
+	ctx := context.Background()
+
+	_, _, errA := Do(ctx, store, key, fp, func(context.Context) (Result, error) {
+		// A outlives its lease; the identical retry B takes the key over,
+		// runs and stores its result.
+		c.Add(PendingLeaseDuration + time.Second)
+		resB, replayed, errB := Do(ctx, store, key, fp, func(context.Context) (Result, error) {
+			return Result{Status: 201, Body: []byte(`"b"`)}, nil
+		})
+		if errB != nil || replayed || string(resB.Body) != `"b"` {
+			t.Errorf("B = %+v %v %v", resB, replayed, errB)
+		}
+		return Result{Status: 201, Body: []byte(`"a"`)}, nil
+	})
+	if !zserrors.IsCode(errA, zserrors.CodeIdempotencyKeyInProgress) {
+		t.Fatalf("A after losing the lease = %v, want idempotency_key_in_progress", errA)
+	}
+	res, replayed, err := Do(ctx, store, key, fp, func(context.Context) (Result, error) {
+		t.Fatal("command ran a third time")
+		return Result{}, nil
+	})
+	if err != nil || !replayed || string(res.Body) != `"b"` {
+		t.Fatalf("replay = %+v %v %v, want B's result", res, replayed, err)
+	}
+}
+
+func TestDoReleaseAfterTakeoverKeepsTheNewReservation(t *testing.T) {
+	store := NewMemoryStore()
+	c := &clock{now: time.Now().UTC()}
+	store.now = c.Now
+	key := testKey(t)
+	fp := mustFingerprint(t, "op", `{"a":1}`)
+	ctx := context.Background()
+
+	var b Reservation
+	boom := errors.New("provider down")
+	_, _, errA := Do(ctx, store, key, fp, func(context.Context) (Result, error) {
+		c.Add(PendingLeaseDuration + time.Second)
+		var err error
+		if b, err = store.Reserve(ctx, key, fp); err != nil || !b.Reserved {
+			t.Fatalf("B could not take over: %+v %v", b, err)
+		}
+		return Result{}, boom
+	})
+	if !errors.Is(errA, boom) {
+		t.Fatalf("A = %v", errA)
+	}
+	if r, _ := store.Reserve(ctx, key, fp); r.Reserved || r.Existing.Status != StatusPending {
+		t.Fatalf("A's release removed B's reservation: %+v", r)
+	}
+	if err := store.Complete(ctx, key, b.OwnerToken, Result{Status: 200, Body: []byte(`{}`)}); err != nil {
+		t.Fatalf("B complete = %v", err)
+	}
+}
+
+func TestDoBoundsTheCommandByTheLease(t *testing.T) {
+	store := NewMemoryStore()
+	key := testKey(t)
+	fp := mustFingerprint(t, "op", `{}`)
+	before := time.Now()
+	_, _, err := Do(context.Background(), store, key, fp, func(ctx context.Context) (Result, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("command context has no deadline")
+		}
+		if d := deadline.Sub(before); d <= 0 || d > PendingLeaseDuration+time.Second {
+			t.Fatalf("command deadline is %v after start, want the lease of %v", d, PendingLeaseDuration)
+		}
+		return Result{Status: 200}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	short := &shortLeaseStore{MemoryStore: NewMemoryStore(), lease: 20 * time.Millisecond}
+	key2 := testKey(t)
+	_, _, err = Do(context.Background(), short, key2, fp, func(ctx context.Context) (Result, error) {
+		<-ctx.Done()
+		return Result{}, ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("command past its lease = %v, want deadline exceeded", err)
+	}
+	if r, _ := short.MemoryStore.Reserve(context.Background(), key2, fp); !r.Reserved {
+		t.Fatal("reservation not released after the command hit its lease")
+	}
+}
+
+// shortLeaseStore reports a short lease so a test can watch the command
+// context end.
+type shortLeaseStore struct {
+	*MemoryStore
+	lease time.Duration
+}
+
+func (s *shortLeaseStore) Reserve(ctx context.Context, key Key, fp string) (Reservation, error) {
+	r, err := s.MemoryStore.Reserve(ctx, key, fp)
+	if r.Reserved {
+		r.LeaseExpiresAt = time.Now().Add(s.lease)
+	}
+	return r, err
+}
+
+// failingCompleteStore fails Complete a set number of times.
+type failingCompleteStore struct {
+	Store
+	failures int32
+	marked   int32
+}
+
+func (s *failingCompleteStore) Complete(ctx context.Context, key Key, owner []byte, result Result) error {
+	if atomic.AddInt32(&s.failures, -1) >= 0 {
+		return errors.New("connection reset")
+	}
+	return s.Store.Complete(ctx, key, owner, result)
+}
+
+func (s *failingCompleteStore) MarkUnstored(ctx context.Context, key Key, owner []byte, reason string) error {
+	atomic.AddInt32(&s.marked, 1)
+	return s.Store.MarkUnstored(ctx, key, owner, reason)
+}
+
+func TestDoCompleteFailureDoesNotRunTheCommandAgain(t *testing.T) {
+	store := &failingCompleteStore{Store: NewMemoryStore(), failures: 1}
+	key := testKey(t)
+	fp := mustFingerprint(t, "op", `{}`)
+	var calls int32
+	fn := func(context.Context) (Result, error) {
+		atomic.AddInt32(&calls, 1)
+		return Result{Status: 201}, nil
+	}
+	_, _, err := Do(context.Background(), store, key, fp, fn)
+	if !zserrors.IsCode(err, zserrors.CodeDatabaseUnavailable) || store.marked != 1 {
+		t.Fatalf("first = %v, marked %d", err, store.marked)
+	}
+	_, _, err = Do(context.Background(), store, key, fp, fn)
+	if !zserrors.IsCode(err, zserrors.CodeIdempotencyKeyInProgress) {
+		t.Fatalf("retry = %v, want idempotency_key_in_progress", err)
+	}
+	if calls != 1 {
+		t.Fatalf("command ran %d times", calls)
+	}
+}
+
+func TestDoBookkeepingSurvivesCancelledCaller(t *testing.T) {
+	store := NewMemoryStore()
+	key := testKey(t)
+	fp := mustFingerprint(t, "op", `{}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, _, err := Do(ctx, store, key, fp, func(context.Context) (Result, error) {
+		cancel()
+		return Result{Status: 200, Body: []byte(`{}`)}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, replayed, err := Do(context.Background(), store, key, fp, func(context.Context) (Result, error) {
+		t.Fatal("command ran again")
+		return Result{}, nil
+	}); err != nil || !replayed {
+		t.Fatalf("replay = %v %v", replayed, err)
 	}
 }
 

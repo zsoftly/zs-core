@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zsoftly/zs-core/internal/doctor"
 )
 
 func TestRunUsageAndConfigErrors(t *testing.T) {
@@ -36,10 +38,10 @@ func TestRunUsageAndConfigErrors(t *testing.T) {
 
 const testComponents = `core_release: 1.0.0-test
 components:
-  keycloak: {version: 26.8.1, image: "quay.io/keycloak/keycloak:26.8.1"}
-  killbill: {version: 0.24.22, image: "killbill/killbill:0.24.22"}
-  kaui: {version: 4.0.31, image: "killbill/kaui:4.0.31"}
-  postgres: {version: "18", image: "postgres:18-alpine"}
+  keycloak: {version: 26.8.1, image: "quay.io/keycloak/keycloak:26.8.1", digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+  killbill: {version: 0.24.22, image: "killbill/killbill:0.24.22", digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+  kaui: {version: 4.0.31, image: "killbill/kaui:4.0.31", digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+  postgres: {version: "18", image: "postgres:18-alpine", digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
 `
 
 func writeComponents(t *testing.T) string {
@@ -154,5 +156,24 @@ func TestDoctorConfigurationErrors(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope.yaml")
 	if code := run([]string{"doctor", "--components", missing}, environ, &out, &errOut); code != 2 {
 		t.Fatalf("missing components: exit %d", code)
+	}
+}
+
+func TestDoctorExitCodeTreatsSkipsAsFailureUnlessAllowed(t *testing.T) {
+	skipped := doctor.Report{Findings: []doctor.Finding{
+		{Component: "keycloak", Check: "version", Status: doctor.Skip, Message: "version not checked (no admin credentials)"},
+	}}
+	if code := doctorExitCode(skipped, false); code != 1 {
+		t.Fatalf("skip without --allow-skips: exit %d", code)
+	}
+	if code := doctorExitCode(skipped, true); code != 0 {
+		t.Fatalf("skip with --allow-skips: exit %d", code)
+	}
+	failed := doctor.Report{Findings: []doctor.Finding{{Component: "kaui", Check: "reachable", Status: doctor.Fail}}}
+	if code := doctorExitCode(failed, true); code != 1 {
+		t.Fatalf("fail with --allow-skips: exit %d", code)
+	}
+	if code := doctorExitCode(doctor.Report{}, false); code != 0 {
+		t.Fatalf("clean report: exit %d", code)
 	}
 }

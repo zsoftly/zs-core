@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-A brand is one product on a Core deployment: one Keycloak realm, one Kill Bill tenant, one manifest. A tenant is a personal or organization account inside a brand, backed by a Keycloak Organization and a Kill Bill account. A person is a Keycloak identity keyed on issuer plus subject and reaches a tenant only through an explicit membership that Core records. Permissions are `resource:action` strings the brand registers; a member's permissions are the union of their teams, and three locked system teams follow the membership role. API keys belong to one tenant, are stored as digests, expire, and never exceed what their creator can do today. Staff grants are brand-scoped rows in Core. Every authorization decision fails closed. This is the Phase 3 contract.
+A brand is one product on a Core deployment: one Keycloak realm, one Kill Bill tenant, one manifest. A tenant is a personal or organization account inside a brand, backed by a Keycloak Organization and a Kill Bill account. A person is a Keycloak identity keyed on issuer plus subject and reaches a tenant only through an explicit membership that Core records. Permissions are `resource:action` strings the brand registers. A member holds the union of their teams' permissions. Three locked system teams follow the membership role. API keys belong to one tenant, are stored as digests, expire, and never exceed their creator's current permissions. Staff grants are brand-scoped rows in Core. Every authorization decision fails closed. This is the Phase 3 contract.
 
 ## Brands
 
@@ -11,7 +11,7 @@ Table `brands`: `id` (`brd_`), `slug` (unique, lowercase, 2 to 40 chars), `name`
 The manifest (`brands/<slug>.yaml`, schema `api/schemas/brand-manifest.json`) declares:
 
 - `identity`: realm display name, login theme, email theme, locales (`en`, `fr`), customer client (OIDC public client with PKCE), staff client, service clients, brokered providers (Google, Microsoft, GitHub, enterprise OIDC or SAML) with secret references, authentication policy (`mfa: optional | required | required_for_staff`, TOTP and WebAuthn allowed), token lifetimes, required actions (verify email, update profile).
-- `billing`: Kill Bill tenant key, catalogue file path, currencies, legal seller name and address, payment plugin (`stripe`, `paypal-express`, `adyen`, or a custom plugin name) with a configuration reference, invoice plugin (optional, for tax), email template set, overdue policy file.
+- `billing`: Kill Bill tenant key, catalogue file path, currencies, legal seller name and address, payment plugin (`stripe`, `adyen`, `paypal-express` once a Java plugin exists, or a custom plugin name) with a configuration reference, invoice plugin (optional, for tax), email template set, overdue policy file.
 - `notifications`: sender identity, reply-to, webhook endpoints with secret references.
 - `permissions`: the `resource:action` strings the product uses beyond the built-ins.
 
@@ -29,7 +29,7 @@ Table `identities`: `id` (`idn_`), `brand_id`, `issuer`, `subject`, `keycloak_us
 
 Rules:
 
-- Created on first authenticated contact with a verified email claim. Without `email_verified: true` the caller is authenticated but may not create a tenant or accept an invitation: `403 email_not_verified`.
+- Created on first authenticated contact with a verified email claim. Without `email_verified: true` the caller is authenticated but cannot create a tenant or accept an invitation. The API returns `403 email_not_verified`.
 - Email is refreshed from the token; it is never used to find or merge identities.
 - Verification: RS256 against the realm JWKS, `iss` equals the realm issuer, `aud` contains a brand audience, `typ` is `Bearer`, `exp` and `nbf` with 60 seconds leeway, `azp` equals the configured client when the manifest sets one. MFA is read from `amr` and `acr`; `RequireRecentMFA(15 minutes)` guards API key creation, owner transfer and member removal.
 - A token stays valid until it expires. Core re-checks membership and tenant status on every request, so a removed member loses access at once.
@@ -72,7 +72,14 @@ Staff tokens are verified against the brand's staff client. Authority comes only
 
 ## Scope resolution
 
-Middleware resolves `{brand, tenant?, principal, permissions}` before any handler: brand from issuer and audience or key prefix (`401` if unknown); credential verified (`401 token_invalid`, `401 api_key_invalid`, `503 authentication_unavailable` when JWKS or the database is down); tenant route membership loaded (`404 tenant_not_found` if missing, inactive, or wrong tenant for a key); handlers call `scope.Require(ctx, "resource:action")` (`403 permission_denied`). The Phase 1 trusted-header mode is removed here.
+Middleware resolves `{brand, tenant?, principal, permissions}` before any handler, in this order:
+
+1. Brand from issuer and audience or key prefix (`401` if unknown).
+2. Credential verified (`401 token_invalid`, `401 api_key_invalid`, `503 authentication_unavailable` when JWKS or the database is down).
+3. Tenant route membership loaded (`404 tenant_not_found` if missing, inactive, or wrong tenant for a key).
+4. Handlers call `scope.Require(ctx, "resource:action")` (`403 permission_denied`).
+
+The Phase 1 trusted-header mode is removed here.
 
 ## Routes
 

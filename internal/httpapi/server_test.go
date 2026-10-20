@@ -227,7 +227,7 @@ func TestAuditRouteScopeAndParameterErrors(t *testing.T) {
 		{"repeated", brand, tenant, "?action=a.b&action=c.d", "validation_failed"},
 	}
 	for _, c := range cases {
-		req := httptest.NewRequest(http.MethodGet, "/v1/audit/events"+c.query, nil)
+		req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/v1/audit/events"+c.query, nil)
 		if c.brand != "" {
 			req.Header.Set(headerBrand, c.brand)
 		}
@@ -237,6 +237,33 @@ func TestAuditRouteScopeAndParameterErrors(t *testing.T) {
 		rec := do(t, h, req)
 		if code, _ := decodeEnvelope(t, rec); rec.Code != http.StatusBadRequest || code != c.want {
 			t.Errorf("%s: %d %s, want %s", c.name, rec.Code, rec.Body, c.want)
+		}
+	}
+}
+
+func TestTrustedScopeHeadersRequireLoopbackHost(t *testing.T) {
+	h := New(Options{TrustedScopeHeaders: true})
+	brand, _ := idgen.New(idgen.Brand)
+	tenant, _ := idgen.New(idgen.Tenant)
+	for host, loopback := range map[string]bool{
+		"127.0.0.1": true, "127.0.0.1:8080": true, "localhost": true, "LOCALHOST:8080": true,
+		"[::1]": true, "[::1]:8080": true,
+		"example.com": false, "attacker.example:8080": false, "127.0.0.2": false, "0.0.0.0:8080": false, "": false,
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/audit/events?limit=0", nil)
+		req.Host = host
+		req.Header.Set(headerBrand, brand)
+		req.Header.Set(headerTenant, tenant)
+		rec := do(t, h, req)
+		code, _ := decodeEnvelope(t, rec)
+		// A loopback Host reaches the route, which rejects limit=0; any other
+		// Host stops at the scope middleware.
+		want := "bad_request"
+		if loopback {
+			want = "invalid_limit"
+		}
+		if rec.Code != http.StatusBadRequest || code != want {
+			t.Errorf("Host %q: %d %s, want %s", host, rec.Code, rec.Body, want)
 		}
 	}
 }

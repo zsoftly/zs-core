@@ -78,16 +78,17 @@ func TestToEnvelopeForUntypedAndUnknown(t *testing.T) {
 
 func TestStatusMapping(t *testing.T) {
 	cases := map[Code]int{
-		CodeValidation:               http.StatusBadRequest,
-		CodeNotFound:                 http.StatusNotFound,
-		CodeUnauthenticated:          http.StatusUnauthorized,
-		CodeForbidden:                http.StatusForbidden,
-		CodeIdempotencyKeyConflict:   http.StatusConflict,
-		CodePayloadTooLarge:          http.StatusRequestEntityTooLarge,
-		CodeMethodNotAllowed:         http.StatusMethodNotAllowed,
-		CodeRateLimited:              http.StatusTooManyRequests,
-		CodeDatabaseUnavailable:      http.StatusServiceUnavailable,
-		CodeIdempotencyKeyInProgress: http.StatusConflict,
+		CodeValidation:                http.StatusBadRequest,
+		CodeNotFound:                  http.StatusNotFound,
+		CodeUnauthenticated:           http.StatusUnauthorized,
+		CodeForbidden:                 http.StatusForbidden,
+		CodeIdempotencyKeyConflict:    http.StatusConflict,
+		CodePayloadTooLarge:           http.StatusRequestEntityTooLarge,
+		CodeMethodNotAllowed:          http.StatusMethodNotAllowed,
+		CodeRateLimited:               http.StatusTooManyRequests,
+		CodeDatabaseUnavailable:       http.StatusServiceUnavailable,
+		CodeIdempotencyKeyInProgress:  http.StatusConflict,
+		CodeIdempotencyResultTooLarge: http.StatusInternalServerError,
 	}
 	for code, want := range cases {
 		status, env := ToEnvelope(New(code, ""))

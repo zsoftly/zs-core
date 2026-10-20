@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-The foundation is the shared plumbing every module uses. It fixes the error envelope, the public ID format, the brand and tenant scope, idempotent commands, the event envelope and the transactional outbox, and it runs the migrations and serves the health probes. All of it is importable from `pkg/` and takes a `pgx.Tx` where it writes, so a product can call it inside its own transaction. The HTTP server in `internal/httpapi` only translates. Phase 1 has no authentication; see the trusted scope headers in [configuration.md](../configuration.md).
+The foundation is the shared plumbing every module uses. It fixes the error envelope, the public ID format, the brand and tenant scope, idempotent commands, the event envelope and the transactional outbox, and it runs the migrations and serves the health probes. All of it is importable from `pkg/` and takes a `pgx.Tx` where it writes, so a product can call it inside its own transaction. The HTTP server in `internal/httpapi` only translates. Phase 1 has no authentication. See the trusted scope headers in [configuration.md](../configuration.md).
 
 ## Packages
 
@@ -28,7 +28,7 @@ Every error response has this shape and nothing else:
 {"error": {"code": "idempotency_key_conflict", "message": "...", "retryable": false}}
 ```
 
-Clients branch on `code`. `message` is safe to show and never carries database, provider or stack text; the cause of an error is logged with the request ID instead. A dependency failure is a 503 with a `*_unavailable` code and `retryable: true`. Any error that is not a typed `pkg/errors` value becomes `500 internal_error`.
+Clients branch on `code`. `message` is safe to show. It never carries database, provider or stack text. The service logs the cause with the request ID. A dependency failure is a 503 with a `*_unavailable` code and `retryable: true`. Any error that is not a typed `pkg/errors` value becomes `500 internal_error`.
 
 | ZS code | Name | Status | Retryable |
 | --- | --- | --- | --- |
@@ -48,6 +48,7 @@ Clients branch on `code`. `message` is safe to show and never carries database, 
 | ZS-1200 | `idempotency_key_invalid` | 400 | no |
 | ZS-1201 | `idempotency_key_conflict` | 409 | no |
 | ZS-1202 | `idempotency_key_in_progress` | 409 | yes |
+| ZS-1203 | `idempotency_result_too_large` | 500 | no |
 | ZS-1300 | `invalid_cursor` | 400 | no |
 | ZS-1301 | `invalid_limit` | 400 | no |
 | ZS-1400 | `scope_required` | 400 | no |
@@ -70,22 +71,51 @@ A command that changes state takes an `idempotency_key` body field of 8 to 255 p
 - Same key, same payload: the stored result is returned and the command does not run again.
 - Same key, different payload: `409 idempotency_key_conflict`.
 - Same key while the first request still runs: `409 idempotency_key_in_progress`, retryable.
-- The command returns an error: the reservation is released so the client can retry.
+- The command returns an error: the reservation is released so the client retries.
 
 The payload fingerprint is a SHA-256 of the operation name and the canonical JSON body, so field order and whitespace do not matter. A reservation whose process died is taken over after two minutes, but only by an identical payload.
 
 ## Events and outbox
 
-An event envelope carries `envelope_version`, an `evt_` ID, a dotted `type`, a `schema_version`, `occurred_at`, the `producer` service and instance, the `actor`, the `brand_id`, the `tenant_id` for tenant-owned events, the `aggregate`, a `correlation_id`, an optional `causation_id` and the W3C `traceparent` of the request that caused it.
+An event envelope carries these fields:
+
+- `envelope_version`
+- an `evt_` ID
+- a dotted `type`
+- a `schema_version`
+- `occurred_at`
+- the `producer` service and instance
+- the `actor`
+- the `brand_id`
+- the `tenant_id`, for tenant-owned events
+- the `aggregate`
+- a `correlation_id`
+- an optional `causation_id`
+- the W3C `traceparent` of the request that caused it
 
 `outbox.Write` inserts the envelope in the caller's transaction. A `Relay` reads due events oldest first, hands each to a handler and marks it published on success. A failure is retried after 5 seconds, doubling up to 5 minutes, and the event is quarantined after 10 failures by default. Delivery is at least once; consumers deduplicate on the event ID.
 
 ## HTTP behaviour
 
-Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `X-Request-ID`. A valid inbound `X-Request-ID` is echoed; otherwise the server assigns a UUIDv7. An inbound `traceparent` is continued; otherwise the server starts a new trace so logs and events still carry one. No tracing exporter is configured in Phase 1. Request bodies are limited to 1 MiB. A panic becomes `500 internal_error` and its stack is logged. Unknown routes and wrong methods return the error envelope.
+Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `X-Request-ID`. The server also follows these rules:
+
+- A valid inbound `X-Request-ID` is echoed. Otherwise the server assigns a UUIDv7.
+- An inbound `traceparent` is continued. Otherwise the server starts a new trace so logs and events still carry one.
+- No tracing exporter is configured in Phase 1.
+- Request bodies are limited to 1 MiB.
+- A panic becomes `500 internal_error` and its stack is logged.
+- Unknown routes and wrong methods return the error envelope.
 
 | Route | Purpose |
 | --- | --- |
 | `GET /healthz` | 200 while the process serves HTTP. |
 | `GET /readyz` | 200 when the database answers and every migration is applied, otherwise 503. |
 | `GET /v1/audit/events` | Audit events of one tenant; see [audit.md](audit.md). |
+
+## Known limits
+
+These are accepted for Phase 1 and scheduled for later hardening.
+
+- The audit trail is append-only because triggers reject `UPDATE`, `DELETE` and `TRUNCATE` on `audit_events`. The runtime database role owns the table, so it could drop the triggers. A separate migration-owner role, with the runtime role limited to `INSERT` and `SELECT`, is Phase 6 hardening.
+- The migration runner ignores versions in `schema_migrations` that the binary does not embed. An older binary started against a newer schema, after a downgrade, therefore reports ready. Phase 6 adds a refusal to start when the binary is older than the schema.
+- The Phase 1 tenant isolation proof runs only in the integration suite (`make test-integration`), which the build host runs. `make check` alone does not run it.

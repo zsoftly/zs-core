@@ -155,3 +155,15 @@ func TestComponentSettingsAreValidatedWithoutValues(t *testing.T) {
 		t.Errorf("error leaks a value: %q", msg)
 	}
 }
+
+func TestComponentURLsRejectUserInfo(t *testing.T) {
+	for _, name := range []string{"ZS_KEYCLOAK_URL", "ZS_KILLBILL_URL", "ZS_KAUI_URL"} {
+		_, err := Load([]string{dbURL, name + "=https://ops:pw-userinfo@host.internal"})
+		if err == nil || !strings.Contains(err.Error(), name+" must not contain a user name or password") {
+			t.Errorf("%s with userinfo: %v", name, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "pw-userinfo") {
+			t.Errorf("error leaks the password: %v", err)
+		}
+	}
+}

@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -221,6 +223,13 @@ func (s *server) scoped(next http.Handler) http.Handler {
 			s.writeError(w, r, zserrors.New(zserrors.CodeUnauthenticated, ""))
 			return
 		}
+		// A loopback listener can still be reached through a browser by DNS
+		// rebinding or by a local proxy; requiring a loopback Host refuses
+		// both.
+		if !loopbackHost(r.Host) {
+			s.writeError(w, r, zserrors.New(zserrors.CodeBadRequest, "Trusted scope headers are accepted only with a loopback Host."))
+			return
+		}
 		sc, err := scope.Parse(r.Header.Get(headerBrand), r.Header.Get(headerTenant))
 		if err != nil {
 			s.writeError(w, r, err)
@@ -228,6 +237,21 @@ func (s *server) scoped(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(scope.WithContext(r.Context(), sc)))
 	})
+}
+
+// loopbackHost reports whether a Host header names 127.0.0.1, localhost or
+// [::1], with or without a port.
+func loopbackHost(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	switch strings.ToLower(host) {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	}
+	return false
 }
 
 // isBodyTooLarge reports whether err came from the body limit.

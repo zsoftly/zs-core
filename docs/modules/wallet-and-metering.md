@@ -2,11 +2,11 @@
 
 ## TL;DR
 
-Kill Bill is the financial authority: it holds every customer credit, invoice and payment, and nothing in Core competes with that. What Kill Bill does not do, and products need before and during work, Core adds as extensions with their own transactional records: a reservation that holds credit before a job starts, a usage ingestion path with caller event IDs and validated dimensions that ends in Kill Bill usage records, and quotas that answer "may this tenant do this now" from plan limits and current counters. The wallet a product sees is a view: Kill Bill's credit balance minus Core's active reservations. Settlement always ends in Kill Bill, as usage on a subscription or as consumed credit, so the two never disagree for longer than one sweep. This is the Phase 4 extension contract and it is the open-source value ZSoftly builds on top of Kill Bill.
+Kill Bill is the financial authority: it holds every customer credit, invoice and payment, and nothing in Core competes with that. Products also need things Kill Bill does not provide. Core adds them as extensions with their own transactional records: a reservation that holds credit before a job starts, a usage path that ends in Kill Bill usage records, and quotas that answer whether a tenant may act now. The wallet a product sees is a view: Kill Bill's credit balance minus Core's active reservations. Settlement always ends in Kill Bill, as usage on a subscription or as consumed credit, so the two never disagree for longer than one sweep. This is the Phase 4 extension contract.
 
 ## Rule
 
-Core extension tables may hold holds, counters, idempotency and audit. They never hold a customer balance of their own, never record a payment, and never issue an invoice. Every amount that changes what a customer owes or owns is written to Kill Bill, and Core's records reference the Kill Bill object they produced. A reconciliation sweep compares the two and raises `wallet.reconciliation_mismatch` on any drift; it never silently corrects Kill Bill.
+Core extension tables may hold holds, counters, idempotency and audit. They never hold a customer balance of their own, never record a payment, and never issue an invoice. Every amount that changes what a customer owes or owns is written to Kill Bill, and Core's records reference the Kill Bill object they produced. A reconciliation sweep compares the two and raises `wallet.reconciliation_mismatch` on any drift; it never changes Kill Bill's records.
 
 ## Units
 
@@ -14,16 +14,23 @@ Credit and usage quantities are `int64` micro-units. Money is `int64` minor unit
 
 ## Wallet view
 
-`GET /v1/tenants/{id}/wallet` returns, per currency: `killbill_credit_minor` (the account's credit balance from Kill Bill), `reserved_minor` (sum of Core reservations in `held`), `available_minor` (the difference, floored at the brand's overdraft allowance), `overdue_state` (from Kill Bill), and `low_balance` (available below the brand or tenant threshold). Credits are granted only through Kill Bill: a promo or voucher code (`credit_codes` table in Core: brand, code digest, amount, currency, caps, expiry, reason) resolves to one Kill Bill credit with the code as the reason; staff grants write a Kill Bill credit with a reason; purchases arrive as Kill Bill payments against a credit invoice through the brand's payment plugin. Expiry of Core-issued credits is a sweeper that writes the negative Kill Bill credit for the unused remainder.
+`GET /v1/tenants/{id}/wallet` returns, per currency: `killbill_credit_minor` (the account's credit balance from Kill Bill), `reserved_minor` (sum of Core reservations in `held`), `available_minor` (the difference, floored at the brand's overdraft allowance), `overdue_state` (from Kill Bill), and `low_balance` (available below the brand or tenant threshold). Credits are granted only through Kill Bill. Each credit source works as follows:
+
+- Promo codes: a promo or voucher code (`credit_codes` table in Core: brand, code digest, amount, currency, caps, expiry, reason) resolves to one Kill Bill credit with the code as the reason.
+- Staff grants: a staff grant writes a Kill Bill credit with a reason.
+- Purchases: a purchase arrives as a Kill Bill payment against a credit invoice through the brand's payment plugin.
+- Expiry: a sweeper writes the negative Kill Bill credit for the unused remainder of Core-issued credits.
 
 ## Reservations
 
 Table `reservations`: `id` (`rsv_`), `brand_id`, `tenant_id`, `currency`, `external_ref` (caller key, unique per tenant), `attempt`, `label`, `amount_minor`, `status` (`held`, `settled`, `released`, `expired`), `lease_expires_at`, `settled_minor`, `killbill_ref` (the usage record tracking ID or credit ID that settlement produced), timestamps. Table `reservation_events`: append-only history of reserve, grow, extend, settle, release, expire with actor and correlation ID.
 
-- `Reserve(ctx, tx, scope, {ExternalRef, Attempt, Label, AmountMinor, LeaseDuration})` locks the tenant (advisory lock), reads `available_minor` (Kill Bill balance cached with a short TTL and refreshed on a miss, minus held reservations in the same transaction), and refuses with `insufficient_credit` and the shortfall when the request exceeds it, or `wallet_on_hold` when the tenant is suspended or the Kill Bill account is blocked. A replay with the same ref and attempt returns the hold when the amount is equal or smaller, and grows it when larger. It never shrinks.
-- `Settle(ctx, tx, scope, ExternalRef, Attempt, {Usage: {subscription, unit, quantity_micro, event_id} | CreditMinor})` writes the result to Kill Bill first (a usage record on the subscription, or a negative credit when the brand bills prepaid credit directly), stores the Kill Bill reference, marks the hold `settled`, releases the remainder. If Kill Bill is unreachable the settlement is queued in the outbox and the hold stays `held` with `settlement_pending: true`; the relay completes it and the hold cannot be reserved against again.
+- `Reserve(ctx, tx, scope, {ExternalRef, Attempt, Label, AmountMinor, LeaseDuration})` locks the tenant (advisory lock), reads `available_minor` (Kill Bill balance cached with a short TTL and refreshed on a miss, minus held reservations in the same transaction), and refuses with `insufficient_credit` and the shortfall when the request exceeds it, or `wallet_on_hold` when the tenant is suspended or the Kill Bill account is blocked.
+- Reserve replay: a replay with the same ref and attempt returns the hold when the amount is equal or smaller, and grows it when larger. It never shrinks.
+- `Settle(ctx, tx, scope, ExternalRef, Attempt, {Usage: {subscription, unit, quantity_micro, event_id} | CreditMinor})` writes the result to Kill Bill first (a usage record on the subscription, or a negative credit when the brand bills prepaid credit directly), stores the Kill Bill reference, marks the hold `settled`, releases the remainder.
+- Settle with Kill Bill down: if Kill Bill is unreachable the settlement is queued in the outbox and the hold stays `held` with `settlement_pending: true`. The relay completes it, and the hold cannot be reserved against again.
 - `Release` returns the hold. `Extend` renews the lease. A sweeper expires holds past their lease and emits `reservation.expired`.
-- Library entry points take `pgx.Tx` so a scheduler can reserve inside its own transaction (decision 0001). Over HTTP the same calls are idempotent on `external_ref` and `attempt`.
+- Library entry points take `pgx.Tx` so a scheduler reserves inside its own transaction (decision 0001). Over HTTP the same calls are idempotent on `external_ref` and `attempt`.
 
 ## Metering
 
@@ -32,7 +39,7 @@ Table `meters`: per brand, `slug`, `unit` (`minute`, `second`, `byte`, `gib_hour
 - `RecordUsage` and `RecordUsageBatch` (up to 1 000, all or nothing) are idempotent on `(tenant, meter, event_id)`; a different payload for the same key returns `409 usage_event_conflict`. `occurred_at` outside the brand's backfill window (default 7 days back, 5 minutes forward) is rejected.
 - Forwarding: events are rolled up per tenant, subscription, unit and period by the forwarder and written to Kill Bill as usage records with `trackingId` set to a deterministic digest of the rollup, so Kill Bill deduplicates a retry. The forwarder runs from the outbox; an event not forwarded within 24 hours raises `metering.forward_backlog`.
 - Rating and pricing are Kill Bill's: the catalogue defines the usage unit prices, tiers and billing mode. Core never stores a price.
-- `GetUsageSummary` and `ListUsageEvents` read Core's tables; `GET /v1/tenants/{id}/usage/billed` reads Kill Bill's rolled-up usage for the period so a product can show both.
+- `GetUsageSummary` and `ListUsageEvents` read Core's tables; `GET /v1/tenants/{id}/usage/billed` reads Kill Bill's rolled-up usage for the period so a product shows both.
 
 ## Quotas and entitlements
 

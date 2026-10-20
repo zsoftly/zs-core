@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -95,6 +96,19 @@ func (m Manifest) validate() error {
 			problems = append(problems, fmt.Sprintf("components.%s.image is missing", name))
 		}
 	}
+	names := make([]string, 0, len(m.Components))
+	for name := range m.Components {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		switch digest := m.Components[name].Digest; {
+		case digest == "":
+			problems = append(problems, fmt.Sprintf("components.%s.digest is missing", name))
+		case !digestPattern.MatchString(digest):
+			problems = append(problems, fmt.Sprintf("components.%s.digest %q is not sha256:<64 lowercase hex>", name, digest))
+		}
+	}
 	if len(problems) > 0 {
 		sort.Strings(problems)
 		return errors.New("invalid components file: " + strings.Join(problems, "; "))
@@ -102,10 +116,47 @@ func (m Manifest) validate() error {
 	return nil
 }
 
+// digestPattern is the form of an image digest pin.
+var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// PinnedReference returns the image reference pinned by digest, such as
+// postgres@sha256:..., which is what the reference stack pulls.
+func (c Component) PinnedReference() string {
+	return ImageRepository(c.Image) + "@" + c.Digest
+}
+
 // Component returns the named component.
 func (m Manifest) Component(name string) (Component, bool) {
 	c, ok := m.Components[name]
 	return c, ok
+}
+
+// Plugin statuses in components.yaml that mean the plugin is not expected on
+// a running stack.
+const (
+	PluginStatusNoJavaArtifact     = "no_java_artifact"
+	PluginStatusPinnedNotInstalled = "pinned_not_installed"
+)
+
+// Required reports whether a running stack must have the plugin installed and
+// running: every pinned plugin except those marked no_java_artifact or
+// pinned_not_installed.
+func (p Plugin) Required() bool {
+	return p.Status != PluginStatusNoJavaArtifact && p.Status != PluginStatusPinnedNotInstalled
+}
+
+// RequiredPlugins returns the approved payment plugins and installable
+// plugins that a running stack must have.
+func (m Manifest) RequiredPlugins() []Plugin {
+	var required []Plugin
+	for _, list := range [][]Plugin{m.KillBillPlugins.ApprovedPaymentPlugins, m.KillBillPlugins.Installable} {
+		for _, p := range list {
+			if p.Required() {
+				required = append(required, p)
+			}
+		}
+	}
+	return required
 }
 
 // PinnedPlugin returns the pinned version of a Kill Bill plugin by name,
@@ -130,4 +181,15 @@ func ImageTag(image string) string {
 		return ""
 	}
 	return image[colon+1:]
+}
+
+// ImageRepository returns an image reference without its tag or digest.
+func ImageRepository(image string) string {
+	if at := strings.Index(image, "@"); at >= 0 {
+		image = image[:at]
+	}
+	if tag := ImageTag(image); tag != "" {
+		image = image[:len(image)-len(tag)-1]
+	}
+	return image
 }

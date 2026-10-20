@@ -1,11 +1,13 @@
 # ZSoftly Core reference stack. Development and tests only.
 # Run it on a build host, never on a workstation. See README.md.
-# Image tags here must equal components.yaml; a unit test enforces it.
+# Image defaults are pinned by digest and must equal components.yaml; a unit
+# test enforces it. The comment after each pin is its tag. A rehearsal
+# override in .env may name a plain tag.
 name: zs-core
 
 services:
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:18-alpine}
+    image: ${POSTGRES_IMAGE:-postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873}  # postgres:18-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
@@ -19,14 +21,17 @@ services:
     ports:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      # Over TCP: during first start the image runs the init scripts on a
+      # server that listens on the unix socket only, so a TCP answer means the
+      # init scripts, which create zs_core, have finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d zs_core"]
       interval: 5s
       timeout: 3s
       retries: 20
     restart: unless-stopped
 
   mailpit:
-    image: ${MAILPIT_IMAGE:-axllent/mailpit:v1.26.2}
+    image: ${MAILPIT_IMAGE:-axllent/mailpit@sha256:079759020faa42e243a07aaa3e31086de70e93e78b02b844e4149e0108dd5428}  # axllent/mailpit:v1.26.2
     ports:
       - "127.0.0.1:${MAILPIT_SMTP_HOST_PORT:-1025}:1025"
       - "127.0.0.1:${MAILPIT_UI_HOST_PORT:-8025}:8025"
@@ -42,7 +47,7 @@ services:
     build:
       context: ./keycloak
       args:
-        KEYCLOAK_IMAGE: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.8.1}
+        KEYCLOAK_IMAGE: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244}  # quay.io/keycloak/keycloak:26.8.1
     command: ["start", "--optimized", "--import-realm"]
     environment:
       KC_DB: postgres
@@ -80,7 +85,7 @@ services:
     restart: unless-stopped
 
   killbill-prep:
-    image: ${KILLBILL_IMAGE:-killbill/killbill:0.24.22}
+    image: ${KILLBILL_IMAGE:-killbill/killbill@sha256:e135615bd14f8ff52d258a4b6a936b4cd0276e30a874a7e2c4690f7a1e28f7f1}  # killbill/killbill:0.24.22
     user: root
     entrypoint: ["/bin/sh", "/scripts/prepare-killbill.sh"]
     volumes:
@@ -90,7 +95,7 @@ services:
     restart: "no"
 
   kaui-ddl:
-    image: ${KAUI_IMAGE:-killbill/kaui:4.0.31}
+    image: ${KAUI_IMAGE:-killbill/kaui@sha256:5629cc499696a9247fde6ac3b0bbd46e53d8466bd5383f4258865c3e73b7f9d6}  # killbill/kaui:4.0.31
     user: root
     entrypoint: ["/bin/sh", "/scripts/export-kaui-ddl.sh"]
     volumes:
@@ -99,7 +104,7 @@ services:
     restart: "no"
 
   db-init:
-    image: ${POSTGRES_IMAGE:-postgres:18-alpine}
+    image: ${POSTGRES_IMAGE:-postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873}  # postgres:18-alpine
     entrypoint: ["/bin/sh", "/scripts/apply-ddl.sh"]
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
@@ -118,7 +123,7 @@ services:
     restart: "no"
 
   killbill:
-    image: ${KILLBILL_IMAGE:-killbill/killbill:0.24.22}
+    image: ${KILLBILL_IMAGE:-killbill/killbill@sha256:e135615bd14f8ff52d258a4b6a936b4cd0276e30a874a7e2c4690f7a1e28f7f1}  # killbill/killbill:0.24.22
     environment:
       KILLBILL_DAO_URL: jdbc:postgresql://postgres:5432/killbill
       KILLBILL_DAO_USER: killbill
@@ -143,7 +148,7 @@ services:
     restart: unless-stopped
 
   kaui:
-    image: ${KAUI_IMAGE:-killbill/kaui:4.0.31}
+    image: ${KAUI_IMAGE:-killbill/kaui@sha256:5629cc499696a9247fde6ac3b0bbd46e53d8466bd5383f4258865c3e73b7f9d6}  # killbill/kaui:4.0.31
     environment:
       KAUI_DB_ADAPTER: postgresql
       KAUI_DB_URL: jdbc:postgresql://postgres:5432/kaui
@@ -161,15 +166,16 @@ services:
     ports:
       - "127.0.0.1:${KAUI_HOST_PORT:-9090}:8080"
     healthcheck:
-      # Probe the root path, which answers with a redirect and renders no
-      # assets. Probing the sign-in page here makes several slow first
-      # requests overlap, and KAUI 4.0.31 then answers 500 on that page until
-      # it restarts. See README.md.
-      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1:8080/"]
-      interval: 10s
-      timeout: 5s
-      retries: 40
-      start_period: 90s
+      # Probe the sign-in page and require 200, so healthy means the page
+      # renders. curl gives up before the probe timeout, so a slow first
+      # render is never abandoned and repeated: KAUI 4.0.31 answers 500 on
+      # that page until it restarts when several first renders overlap. See
+      # README.md.
+      test: ["CMD-SHELL", "test \"$$(curl -sS -o /dev/null -w '%{http_code}' --max-time 120 http://127.0.0.1:8080/users/sign_in)\" = 200"]
+      interval: 15s
+      timeout: 130s
+      retries: 20
+      start_period: 180s
     restart: unless-stopped
 
   core:

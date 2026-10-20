@@ -8,12 +8,12 @@ ZSoftly Core reads its configuration from environment variables only. There is n
 
 | Variable | Type | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `ZS_DATABASE_URL` | Postgres URL | none | yes | Connection URL, `postgres://` or `postgresql://`, with a host. May hold a password; it is never logged. |
+| `ZS_DATABASE_URL` | Postgres URL | none | yes | Connection URL, `postgres://` or `postgresql://`, with a host. The URL may hold the password. The service never logs it. |
 | `ZS_DATABASE_MAX_CONNS` | integer, 1 to 1000 | `10` | no | Maximum connections in the pool. |
 | `ZS_LISTEN_ADDR` | `host:port` | `127.0.0.1:8080` | no | HTTP listen address. Use `0.0.0.0:8080` or `:8080` to listen on every interface. |
 | `ZS_LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` | no | Minimum log level. |
 | `ZS_LOG_FORMAT` | `json`, `text` | `json` | no | Log line format on standard error. |
-| `ZS_MIGRATE_ON_START` | `true`, `false` | `true` | no | Apply pending migrations before `serve` listens. When `false`, run `zs-core migrate` first; `/readyz` stays at 503 until the migrations are applied. |
+| `ZS_MIGRATE_ON_START` | `true`, `false` | `true` | no | Apply pending migrations before `serve` listens. When `false`, run `zs-core migrate` first. `/readyz` stays at 503 until you apply the migrations. |
 | `ZS_HTTP_READ_HEADER_TIMEOUT` | Go duration | `5s` | no | Time allowed to read request headers. |
 | `ZS_HTTP_READ_TIMEOUT` | Go duration | `30s` | no | Time allowed to read a whole request. |
 | `ZS_HTTP_WRITE_TIMEOUT` | Go duration | `30s` | no | Time allowed to write a response. |
@@ -33,7 +33,7 @@ Booleans accept exactly `true` or `false`. Durations use Go syntax, such as `500
 
 ## Component settings and `zs-core doctor`
 
-`serve` and `migrate` ignore the Keycloak, Kill Bill and KAUI settings. `zs-core doctor` uses them to check that a running stack matches `components.yaml`. It also needs `ZS_DATABASE_URL` for the database check. Each URL must be `http://` or `https://` with a host. An admin user without its password, or the reverse, is a configuration error. Error messages name the variable and never repeat its value.
+`serve` and `migrate` ignore the Keycloak, Kill Bill and KAUI settings. `zs-core doctor` uses them to check that a running stack matches `components.yaml`. It also needs `ZS_DATABASE_URL` for the database check. Each URL must be `http://` or `https://` with a host. An admin user without its password, or the reverse, is a configuration error.
 
 `doctor` reads `components.yaml` from the working directory. Pass `--components <file>` to use another path. The Core container image carries the file in its working directory, so `docker compose exec core zs-core doctor` needs no flag.
 
@@ -41,7 +41,7 @@ Variables that start with `ZS_TEST_` are reserved for the test suite. The servic
 
 ## Trusted scope headers (Phase 1 only)
 
-Phase 1 has no authentication. Every `/v1` request needs a brand and a tenant, and the only way to supply them is the header pair `X-ZS-Brand: brd_...` and `X-ZS-Tenant: tnt_...`. The service reads these headers only when `ZS_DEV_TRUSTED_SCOPE_HEADERS=true`. Anyone who can reach the port can then act as any tenant of any brand. For that reason the service refuses to start with the flag unless it listens on `127.0.0.1`, `::1` or `localhost`, and it logs a warning at start.
+Phase 1 has no authentication. Every `/v1` request needs a brand and a tenant, and the only way to supply them is the header pair `X-ZS-Brand: brd_...` and `X-ZS-Tenant: tnt_...`. The service reads these headers only when `ZS_DEV_TRUSTED_SCOPE_HEADERS=true`. Anyone who reaches the port acts as any tenant of any brand. The service therefore refuses to start with the flag unless it listens on `127.0.0.1`, `::1` or `localhost`. It logs a warning at start.
 
 Without the flag, every `/v1` request returns `401 unauthenticated`. `/healthz` and `/readyz` work either way.
 

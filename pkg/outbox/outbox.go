@@ -1,12 +1,16 @@
 // Package outbox is the transactional outbox for ZSoftly Core events.
 //
 // Write inserts an event in the caller's transaction, so the event commits or
-// rolls back with the state change that produced it. A Relay later reads
-// unpublished events, hands each to a Handler and marks it published only
-// after the handler succeeds. A failed delivery is retried with exponential
-// backoff and quarantined after a bounded number of attempts. Delivery is at
-// least once, so handlers must be idempotent; the evt_ ID is the
-// deduplication key.
+// rolls back with the state change that produced it. A Relay later claims a
+// batch of due events, hands each to a Handler and marks it published only
+// after the handler succeeds. A claim locks its rows with FOR UPDATE SKIP
+// LOCKED and stamps them with a token and an expiry, so several relays can
+// share one table without delivering an event twice; the events of a relay
+// that crashes become due again when its claim expires. A failed delivery is
+// retried with exponential backoff and quarantined after a bounded number of
+// attempts. A row that cannot be decoded is quarantined at once and does not
+// block the rows behind it. Delivery is at least once, so handlers must be
+// idempotent; the evt_ ID is the deduplication key.
 package outbox
 
 import (

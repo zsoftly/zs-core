@@ -33,6 +33,7 @@ Commands:
   migrate        apply pending migrations and exit
   doctor         check the database, Keycloak, Kill Bill and KAUI against components.yaml
                    --json                 write the report as JSON
+                   --allow-skips          exit 0 when a check was skipped (no credentials)
                    --components <file>    components file (default components.yaml)
   upgrade check  list newer upstream versions of the pinned components; changes nothing
                    --strict               exit 1 when a release feed cannot be read

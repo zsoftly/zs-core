@@ -53,7 +53,7 @@ killbill_plugins:
       source: https://github.com/killbill/killbill-email-notifications-plugin
       status: pinned_not_installed
   platform_bundles_in_image:   # shipped inside killbill/killbill:0.24.22, not installed by Core
-    - kpm 0.41.23
+    - kpm 0.41.23 (KPM OSGi bundle)
     - logger 0.41.23
     - metrics 0.41.23
   plugin_framework: killbill-base-plugin 5.2.2

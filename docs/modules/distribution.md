@@ -2,21 +2,31 @@
 
 ## TL;DR
 
-A Core release is a tested bundle: pinned Keycloak, Kill Bill, KAUI and Postgres images, the Core extensions built against them, the Core API, and the upgrade notes. `components.yaml` is the single place versions live. `deploy/compose` brings the whole reference stack up from one command for development and tests, `zs-core doctor` proves a running stack matches the release, and `docs/upgrades/` holds one runbook per component with the rehearsal record for each version step. Products upgrade by taking a Core release, never by bumping a component on their own. This is the Phase 2 contract.
+A Core release is a tested bundle: pinned Keycloak, Kill Bill, KAUI and Postgres images, the Core extensions built against them, the Core API, and the upgrade notes. `components.yaml` is the single place versions live. `deploy/compose` brings the reference stack up from one command. `zs-core doctor` proves a running stack matches the release. `docs/upgrades/` holds one runbook per component, with the rehearsal record for each version step. Products upgrade by taking a Core release, never by bumping a component on their own. This is the Phase 2 contract.
 
 ## Components
 
-See `components.yaml`. Each entry pins a version, an image reference, and the upstream source. Images are pinned by digest as well as tag before a release is cut; development may run on the tag.
+See `components.yaml`. Each entry pins a version, an image reference, and the upstream source. Images carry a tag and a digest in `components.yaml`. The compose file uses the tag.
 
 ## Reference stack
 
-`deploy/compose/compose.yaml` runs: Postgres 18 (one instance, separate databases for Keycloak, Kill Bill and Core), Keycloak 26.8.1 in production mode behind its own hostname settings with the Core theme mounted, Kill Bill 0.24.22 with KPM and the bundled plugins, KAUI 4.0.31, and Core. Mailpit catches email. Everything binds to loopback. One command: `make stack-up`; `make stack-down`; `make stack-reset` wipes data.
+`deploy/compose/compose.yaml` runs: Postgres 18 (one instance, separate databases for Keycloak, Kill Bill, KAUI and Core), Keycloak 26.8.1 in production mode behind its own hostname settings, Kill Bill 0.24.22 with KPM and the bundled plugins, KAUI 4.0.31, and Core. Mailpit catches email. Everything binds to loopback. Run `make stack-up` to start it and `make stack-down` to stop it. `make stack-reset` wipes data.
 
-Keycloak: the stack imports a `zs-reference` realm from `deploy/compose/keycloak/` with the customer and staff clients, two brokered provider mocks, and the Core theme, so the token verification tests have a real issuer. Kill Bill: the stack creates a `zs-reference` tenant with the test catalogue and the Stripe plugin in test mode when `STRIPE_TEST_SECRET_KEY` is present, otherwise with the built-in `__EXTERNAL_PAYMENT__` plugin.
+Keycloak: the stack imports a `zs-reference` realm from `deploy/compose/keycloak/`. It has the customer and staff clients and the `en` and `fr` locales, so the token tests have a real issuer. Kill Bill: the stack creates a `zs-reference` tenant with the test catalogue and the Stripe plugin in test mode when `STRIPE_TEST_SECRET_KEY` is present, otherwise with the built-in `__EXTERNAL_PAYMENT__` plugin.
 
 ## Doctor
 
-`zs-core doctor` connects to each component and reports: reachable, version, version matches `components.yaml`, migrations applied (Core), plugins installed and versions (Kill Bill), realm present and theme active (Keycloak), clock skew, TLS. Any mismatch is a non-zero exit with one line per finding. `doctor --json` is for automation.
+`zs-core doctor` connects to each component and checks each of these against `components.yaml` where it applies:
+
+- Database: reachable, with the Postgres major version.
+- Migrations: applied (Core).
+- Keycloak: version and realm present.
+- Kill Bill: version, plugins installed and their versions.
+- KAUI: reachable. It does not expose its version.
+- Clock skew.
+- Version match for Keycloak and Kill Bill.
+
+Any mismatch is a non-zero exit with one line per finding. `doctor --json` is for automation.
 
 ## Upgrades
 

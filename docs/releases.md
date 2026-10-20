@@ -22,7 +22,7 @@ A Core release is a git tag `vX.Y.Z` on `main`. The `core_release` value in `com
 | Any component version change (Keycloak, Kill Bill, KAUI, Postgres, a pinned plugin) | At least minor, with a rehearsal row for the step |
 | Breaking API change, or a component major version change | Major |
 
-A component patch release that fixes a security problem can ship as a Core patch release when the rehearsal shows no schema or configuration change. Say so in the release notes.
+A component security patch ships as a Core patch release when the rehearsal shows no schema or configuration change. Say so in the release notes.
 
 ## Process
 
@@ -47,8 +47,8 @@ The notes list, in this order:
 - API changes, with migration notes for callers;
 - database migrations added since the last release, and whether `zs-core migrate` must run before the new version serves;
 - the upgrade runbooks that apply, and the rehearsal rows added;
-- known issues, including upstream faults Core works around, each with the upstream issue link and the version where the workaround can go.
+- known issues, including upstream faults Core works around, each with the upstream issue link and the version that lets you remove the workaround.
 
 ## Taking a release in a product
 
-A product upgrades by moving to the new tag. It runs the runbooks for the components that changed, in the order the notes give, on a staging copy first. It does not change a component version independently of Core.
+A product upgrades by moving to the new tag. It runs the runbooks for the components that changed, in the order the notes give, on a staging copy first. It never changes a component version on its own.

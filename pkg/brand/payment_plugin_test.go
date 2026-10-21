@@ -5,14 +5,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/zsoftly/zs-core/internal/components"
+	"github.com/zsoftly/zs-core/internal/kbplugin"
+	"github.com/zsoftly/zs-core/internal/killbill"
 )
 
 // javaCase is one row of testdata/java_properties.json: how
@@ -304,6 +309,145 @@ func TestVerifyPluginJar(t *testing.T) {
 	}
 	if err := CheckPluginRepository("https://repo1.maven.org/maven2"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestVerifyPluginJarRefusesRedirects(t *testing.T) {
+	var redirected atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirected.Add(1)
+		_, _ = w.Write([]byte("jar"))
+	}))
+	t.Cleanup(target.Close)
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"?token=private-token", http.StatusFound)
+	}))
+	t.Cleanup(mirror.Close)
+	client := mirror.Client()
+	err := verifyPluginJar(context.Background(), client, mirror.URL+"?token=private-token", components.Plugin{Name: "stripe"})
+	var unavailable *killbill.Unavailable
+	if !errors.As(err, &unavailable) || unavailable.Status != http.StatusFound || redirected.Load() != 0 {
+		t.Fatalf("redirect = %v, target requests = %d", err, redirected.Load())
+	}
+	if strings.Contains(err.Error(), "private-token") || client.CheckRedirect != nil {
+		t.Fatal("redirect refusal leaked the token or changed the supplied client")
+	}
+}
+
+type pluginTransport func(*http.Request) (*http.Response, error)
+
+func (f pluginTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type failingPluginBody struct {
+	message string
+	closed  bool
+}
+
+func (b *failingPluginBody) Read([]byte) (int, error) { return 0, errors.New(b.message) }
+func (b *failingPluginBody) Close() error             { b.closed = true; return nil }
+
+func TestVerifyPluginJarRedactsTransportAndReadFailures(t *testing.T) {
+	const token = "private-mirror-token"
+	const uri = "https://mirror.example.test/a.jar?token=" + token
+	for _, failure := range []string{"transport", "response read"} {
+		t.Run(failure, func(t *testing.T) {
+			body := &failingPluginBody{message: "read failed at " + uri}
+			client := &http.Client{Transport: pluginTransport(func(r *http.Request) (*http.Response, error) {
+				if failure == "transport" {
+					return nil, fmt.Errorf("request failed at %s", r.URL)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: body, Header: make(http.Header), Request: r}, nil
+			})}
+			err := verifyPluginJar(context.Background(), client, uri, components.Plugin{Name: "stripe"})
+			if !killbill.IsUnavailable(err) {
+				t.Fatalf("failure = %v, want unavailable", err)
+			}
+			for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+				if strings.Contains(cause.Error(), token) || strings.Contains(cause.Error(), uri) {
+					t.Fatal("mirror credential appears in the returned error chain")
+				}
+			}
+			if failure == "response read" && !body.closed {
+				t.Fatal("failed mirror response was not closed")
+			}
+		})
+	}
+}
+
+func TestPluginInstallRequiresMirrorAtPlanAndExecution(t *testing.T) {
+	var state atomic.Value
+	state.Store("")
+	var commands, downloads atomic.Int32
+	pin := components.Plugin{Name: "stripe", Version: "8.0.3", Sha256: strings.Repeat("a", 64)}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/1.0/kb/nodesInfo" && r.Method == http.MethodGet:
+			var plugins []killbill.PluginInfo
+			if current := state.Load().(string); current != "" {
+				plugins = []killbill.PluginInfo{{PluginKey: pin.Name, Version: pin.Version, State: current}}
+			}
+			_ = json.NewEncoder(w).Encode([]killbill.NodeInfo{{NodeName: "node-1", PluginsInfo: plugins}})
+		case r.URL.Path == "/1.0/kb/nodesInfo" && r.Method == http.MethodPost:
+			commands.Add(1)
+			http.Error(w, "unexpected command", http.StatusInternalServerError)
+		default:
+			downloads.Add(1)
+			http.Error(w, "unexpected download", http.StatusInternalServerError)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	kb, err := killbill.New(killbill.Config{URL: srv.URL, AdminUser: "admin", AdminPassword: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	use := pluginUse{pin: pin, kind: pluginKindPayment, field: "billing.payment_plugin"}
+	deps := Deps{KillBill: kb, PluginRepository: srv.URL + "/repository", PluginHTTP: srv.Client()}
+	for _, base := range []string{"", srv.URL} {
+		missing := deps
+		missing.PluginMirrorURL = base
+		if changes, err := planPlugin(ctx, missing, use); codeOf(err) != "plugin_unavailable" || len(changes) != 0 {
+			t.Fatalf("missing mirror settings: changes=%v err=%v", changes, err)
+		}
+	}
+	configured := deps
+	configured.PluginMirrorURL, configured.PluginMirrorSecret = srv.URL, []byte(strings.Repeat("m", 32))
+	changes, err := planPlugin(ctx, configured, use)
+	if err != nil || len(changes) != 1 || changes[0].Action != ActionCreate || len(changes[0].Fields) < 2 || changes[0].Fields[1].After != "mirror" {
+		t.Fatalf("configured mirror plan = %+v, %v", changes, err)
+	}
+	diff, err := json.Marshal(changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(diff), string(configured.PluginMirrorSecret)) ||
+		strings.Contains(string(diff), kbplugin.Token(configured.PluginMirrorSecret, pin.Name, pin.Version, pin.Sha256)) {
+		t.Fatal("plan exposes a mirror credential")
+	}
+	for _, change := range []string{"removed URL", "changed secret"} {
+		current := configured
+		if change == "removed URL" {
+			current.PluginMirrorURL = ""
+		} else {
+			current.PluginMirrorSecret = []byte(strings.Repeat("n", 32))
+		}
+		if err := changes[0].run(ctx, &runState{deps: current}); codeOf(err) != "plugin_unavailable" {
+			t.Fatalf("execution after %s: %v", change, err)
+		}
+	}
+	if err := installPlugin(ctx, &runState{deps: configured}, pin, installSource{name: "repository", uri: srv.URL + "/repository"}, true); codeOf(err) != "plugin_unavailable" {
+		t.Fatalf("direct repository source accepted: %v", err)
+	}
+	state.Store("RUNNING")
+	if changes, err := planPlugin(ctx, deps, use); err != nil || len(changes) != 0 {
+		t.Fatalf("already-running plugin needs a mirror: %v %v", changes, err)
+	}
+	state.Store("STOPPED")
+	if changes, err := planPlugin(ctx, deps, use); err != nil || len(changes) != 1 || changes[0].Action != ActionUpdate {
+		t.Fatalf("start-only plan needs a mirror: %v %v", changes, err)
+	}
+	if commands.Load() != 0 || downloads.Load() != 0 {
+		t.Fatalf("rejected install contacted KPM/repository: commands=%d downloads=%d", commands.Load(), downloads.Load())
 	}
 }
 

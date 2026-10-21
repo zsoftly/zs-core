@@ -129,6 +129,14 @@ ZSoftly Core is under active development. Expect bugs, breaking changes, and gap
 
 `make check` gates every change. No hosted CI workflow exists. Start with [docs/development.md](docs/development.md) for building, testing and migrating, and [docs/configuration.md](docs/configuration.md) for every environment variable. Module guides are in [docs/modules](docs/modules), starting with [foundation](docs/modules/foundation.md), [audit](docs/modules/audit.md), [brands](docs/modules/brands.md), [tenants](docs/modules/tenants.md), [API keys](docs/modules/api-keys.md), [billing](docs/modules/billing.md), [wallet](docs/modules/wallet.md), [metering](docs/modules/metering.md) and [quotas](docs/modules/quotas.md). Code that started in other ZSoftly repositories is listed in [PROVENANCE.md](PROVENANCE.md).
 
+Phase 5a adds [plugin operations](docs/modules/plugins.md), [invoice rendering](docs/modules/invoices.md), and [billing surface](docs/modules/billing-surface.md) guides.
+
+### Known Phase 5a deviations
+
+- Tenant creation copies the creator's verified email to the Kill Bill account. Membership and ownership changes do not reconcile that recipient, so former members may continue receiving billing mail. This disclosure risk remains unresolved.
+- Invoice numbers are server-wide unique and increasing, with per-tenant gaps. Owner review is pending; numbering is not gapless.
+- V1 remains incomplete. Keycloak event ingestion, guide acceptance, and theme claims are not part of this candidate.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

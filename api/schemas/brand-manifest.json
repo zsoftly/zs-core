@@ -208,10 +208,24 @@
           "properties": {
             "name": {"$ref": "#/$defs/name"},
             "country": {"type": "string", "pattern": "^[A-Z]{2}$"},
-            "address": {"type": "string", "minLength": 1, "maxLength": 1000}
+            "address": {"type": "string", "minLength": 1, "maxLength": 1000, "description": "The one-line form of address_lines. Set one of the two."},
+            "address_lines": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"type": "string", "minLength": 1, "maxLength": 200}},
+            "tax_registrations": {"type": "array", "maxItems": 10, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 100}, "description": "Tax registration numbers printed on invoices, such as GST/HST 123456789 RT0001."}
           }
         },
         "payment_plugin": {
+          "description": "The one-plugin form of payment_plugins, kept as an alias. It is a list of this plugin as the default. Set one of the two.",
+          "$ref": "#/$defs/paymentPlugin"
+        },
+        "payment_plugins": {
+          "description": "The brand's payment plugins. Exactly one is default: true. It is the plugin of the brand's payment methods.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {"$ref": "#/$defs/paymentPlugin"}
+        },
+        "invoice_plugin": {
+          "description": "An invoice plugin, for tax, from approved_invoice_plugins of components.yaml.",
           "type": "object",
           "additionalProperties": false,
           "required": ["name", "mode", "config_ref"],
@@ -219,17 +233,42 @@
             "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
             "version": {"type": "string", "pattern": "^[0-9A-Za-z.+-]{1,50}$"},
             "mode": {"type": "string", "enum": ["test", "live"], "description": "test is the only mode v1 accepts. live is refused."},
-            "config_key": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "description": "The plugin service name Kill Bill stores the configuration under. Must be empty or killbill-<name>, which is the default."},
+            "config_key": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "description": "Must be empty or killbill-<name>, which is the default."},
             "config_ref": {"$ref": "#/$defs/secretRef"}
           }
         },
-        "invoice_plugin": {
+        "invoice_templates": {
+          "description": "The files Kill Bill renders the brand's invoices with. Each is uploaded when its SHA-256 differs from what Kill Bill holds.",
           "type": "object",
           "additionalProperties": false,
-          "required": ["name"],
           "properties": {
-            "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
-            "version": {"type": "string", "pattern": "^[0-9A-Za-z.+-]{1,50}$"}
+            "template": {"$ref": "#/$defs/relativePath", "description": "HTML Mustache invoice template."},
+            "manual_pay_template": {"$ref": "#/$defs/relativePath", "description": "HTML Mustache template for accounts that pay manually."},
+            "translations": {"$ref": "#/$defs/localeFiles", "description": "Invoice translation per locale, Java properties."},
+            "catalogue_translations": {"$ref": "#/$defs/localeFiles", "description": "Catalogue translation per locale, Java properties."}
+          }
+        },
+        "email": {
+          "description": "Billing email through the email-notifications plugin of components.yaml. Apply installs the plugin, uploads its per-tenant configuration and the templates of each locale.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sender", "smtp"],
+          "properties": {
+            "sender": {"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+$", "maxLength": 320},
+            "events": {"type": "array", "uniqueItems": true, "items": {"enum": ["INVOICE_CREATION", "INVOICE_NOTIFICATION", "INVOICE_PAYMENT_SUCCESS", "INVOICE_PAYMENT_FAILED", "SUBSCRIPTION_CANCEL"]}, "description": "The Kill Bill events that send email. Defaults to INVOICE_CREATION."},
+            "smtp": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["host", "port"],
+              "properties": {
+                "host": {"type": "string", "pattern": "^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$"},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "use_ssl": {"type": "boolean"},
+                "username_ref": {"$ref": "#/$defs/secretRef"},
+                "password_ref": {"$ref": "#/$defs/secretRef"}
+              }
+            },
+            "templates": {"$ref": "#/$defs/relativePath", "description": "A directory with one subdirectory per locale holding the plugin's template files, such as en/InvoiceCreation.mustache, and Translation.properties."}
           }
         },
         "templates": {"$ref": "#/$defs/relativePath"},
@@ -256,6 +295,24 @@
           "items": {"$ref": "#/$defs/meter"}
         }
       }
+    },
+    "paymentPlugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "mode", "config_ref"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+        "version": {"type": "string", "pattern": "^[0-9A-Za-z.+-]{1,50}$"},
+        "mode": {"type": "string", "enum": ["test", "live"], "description": "test is the only mode v1 accepts. live is refused."},
+        "config_key": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "description": "The plugin service name Kill Bill stores the configuration under. Must be empty or killbill-<name>, which is the default."},
+        "config_ref": {"$ref": "#/$defs/secretRef"},
+        "default": {"type": "boolean", "description": "The plugin of the brand's payment methods. Exactly one plugin of payment_plugins sets it."}
+      }
+    },
+    "localeFiles": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/locale"},
+      "additionalProperties": {"$ref": "#/$defs/relativePath"}
     },
     "meter": {
       "type": "object",

@@ -1,6 +1,7 @@
 package components
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -85,11 +86,12 @@ func TestComposeImagesMatchPins(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]Component{
-		"POSTGRES_IMAGE": m.Components[Postgres],
-		"KEYCLOAK_IMAGE": m.Components[Keycloak],
-		"KILLBILL_IMAGE": m.Components[KillBill],
-		"KAUI_IMAGE":     m.Components[KAUI],
-		"MAILPIT_IMAGE":  m.Components["mailpit"],
+		"POSTGRES_IMAGE":  m.Components[Postgres],
+		"KEYCLOAK_IMAGE":  m.Components[Keycloak],
+		"KILLBILL_IMAGE":  m.Components[KillBill],
+		"KAUI_IMAGE":      m.Components[KAUI],
+		"MAILPIT_IMAGE":   m.Components["mailpit"],
+		"GOTENBERG_IMAGE": m.Components[Gotenberg],
 	}
 	for variable, c := range want {
 		re := regexp.MustCompile(`\$\{` + variable + `:-([^}]+)\}(.*)`)
@@ -161,7 +163,7 @@ func TestPluginArtifactsNeedSha256(t *testing.T) {
 		head += "  " + name + ":\n    version: \"1\"\n    image: x/" + name + ":1\n    digest: sha256:" + strings.Repeat("a", 64) + "\n"
 	}
 	plugin := func(extra string) string {
-		return head + "killbill_plugins:\n  repository: https://repo.example.test\n  approved_payment_plugins:\n    - name: stripe\n      version: 8.0.3\n      artifact: g:stripe-plugin\n" + extra
+		return head + "killbill_plugins:\n  repository: https://repo.example.test\n  approved_payment_plugins:\n    - name: stripe\n      version: 8.0.3\n      artifact: g:stripe-plugin\n      status: pinned_not_installed\n" + extra
 	}
 	if _, err := Parse([]byte(plugin("      sha256: " + strings.Repeat("c", 64) + "\n"))); err != nil {
 		t.Fatalf("valid sha256 rejected: %v", err)
@@ -175,9 +177,77 @@ func TestPluginArtifactsNeedSha256(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, p := range append(m.KillBillPlugins.ApprovedPaymentPlugins, m.KillBillPlugins.Installable...) {
+	for _, p := range m.Plugins() {
 		if p.Artifact != "" && len(p.Sha256) != 64 {
 			t.Errorf("%s has no sha256", p.Name)
 		}
+		if p.HasArtifact() && len(p.Tables) == 0 {
+			t.Errorf("%s lists no tables", p.Name)
+		}
+	}
+	if g, ok := m.Component(Gotenberg); !ok || !g.Optional || g.Licence != "MIT" || ImageTag(g.Image) != g.Version {
+		t.Errorf("gotenberg pin = %+v", g)
+	}
+}
+
+func TestLoadValidatesPluginStatuses(t *testing.T) {
+	head := "core_release: 1\ncomponents:\n"
+	for _, name := range []string{Keycloak, KillBill, KAUI, Postgres} {
+		head += "  " + name + ":\n    version: \"1\"\n    image: x/" + name + ":1\n    digest: sha256:" + strings.Repeat("a", 64) + "\n"
+	}
+	for _, list := range []string{"approved_payment_plugins", "approved_invoice_plugins", "installable"} {
+		t.Run(list, func(t *testing.T) {
+			for _, tc := range []struct {
+				name, status string
+				omit, valid  bool
+			}{
+				{name: "missing", omit: true},
+				{name: "empty"},
+				{name: "unknown", status: "optional"},
+				{name: "required typo", status: "requried"},
+				{name: "required", status: "required", valid: true},
+				{name: "verified install", status: "verified_install", valid: true},
+				{name: "not installed", status: "pinned_not_installed", valid: true},
+				{name: "no artifact", status: "no_java_artifact", valid: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					doc := head + "killbill_plugins:\n  " + list + ":\n    - name: demo\n      version: 1.0.0\n"
+					if tc.status != "no_java_artifact" {
+						doc += "      artifact: g:demo-plugin\n      sha256: " + strings.Repeat("b", 64) + "\n"
+					}
+					if !tc.omit {
+						doc += fmt.Sprintf("      status: %q\n", tc.status)
+					}
+					path := filepath.Join(t.TempDir(), "components.yaml")
+					if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					m, err := Load(path)
+					if !tc.valid {
+						if err == nil || !strings.Contains(err.Error(), "killbill_plugins."+list+" demo.status") {
+							t.Fatalf("invalid plugin status was not rejected with its location: %v", err)
+						}
+						if m.CoreRelease != "" || len(m.Components) != 0 || len(m.Plugins()) != 0 {
+							t.Fatal("invalid plugin status returned a usable manifest")
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("known status rejected: %v", err)
+					}
+					plugin, ok := m.PinnedPlugin("demo")
+					if !ok || plugin.Status != tc.status || plugin.Required() != (tc.status == "required") {
+						t.Fatalf("status semantics changed: %+v", plugin)
+					}
+					wantRequired := 0
+					if tc.status == "required" {
+						wantRequired = 1
+					}
+					if got := len(m.RequiredPlugins()); got != wantRequired {
+						t.Fatalf("required plugin count = %d, want %d", got, wantRequired)
+					}
+				})
+			}
+		})
 	}
 }

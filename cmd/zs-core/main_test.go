@@ -178,6 +178,26 @@ func TestDoctorExitCodeTreatsSkipsAsFailureUnlessAllowed(t *testing.T) {
 	}
 }
 
+func TestDoctorExitCodeRejectsUnlistedPluginFailures(t *testing.T) {
+	for _, state := range []string{"RUNNING", "STOPPED"} {
+		t.Run(state, func(t *testing.T) {
+			report := doctor.Report{Findings: []doctor.Finding{
+				{Component: "killbill", Check: "plugin", Status: doctor.Fail,
+					Message: "plugin custom version 1.0.0 is not listed in components.yaml (" + state + ")"},
+			}}
+			for _, allowSkips := range []bool{false, true} {
+				if code := doctorExitCode(report, allowSkips); code != 1 {
+					t.Errorf("unlisted %s plugin with allow-skips=%t: exit %d, want 1", state, allowSkips, code)
+				}
+			}
+			report.Findings = append(report.Findings, doctor.Finding{Component: "killbill", Check: "plugin_tables", Status: doctor.Skip})
+			if code := doctorExitCode(report, true); code != 1 {
+				t.Errorf("allowed table-check skip masked unlisted plugin: exit %d", code)
+			}
+		})
+	}
+}
+
 func TestGrantRevokeUsage(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := run([]string{"grant", "remove", "--brand", "zs-reference"}, nil, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "grant revoke") {
@@ -209,7 +229,7 @@ func TestBrandRefusesPluginRepositoryWithoutHTTPS(t *testing.T) {
 	pins := testComponents + `killbill_plugins:
   repository: http://repo1.maven.org/maven2
   approved_payment_plugins:
-    - {name: stripe, version: 8.0.3, artifact: "org.kill-bill.billing.plugin.java:stripe-plugin", sha256: "` + strings.Repeat("a", 64) + `"}
+    - {name: stripe, version: 8.0.3, artifact: "org.kill-bill.billing.plugin.java:stripe-plugin", status: pinned_not_installed, sha256: "` + strings.Repeat("a", 64) + `"}
 `
 	componentsPath := filepath.Join(dir, "components.yaml")
 	if err := os.WriteFile(componentsPath, []byte(pins), 0o600); err != nil {
@@ -221,5 +241,33 @@ func TestBrandRefusesPluginRepositoryWithoutHTTPS(t *testing.T) {
 	code := run([]string{"brand", "diff", "--components", componentsPath, filepath.Join(dir, "zs-reference.yaml")}, env, &out, &errOut)
 	if code != 2 || !strings.Contains(errOut.String(), "not an https URL") {
 		t.Fatalf("http repository: exit %d %q", code, errOut.String())
+	}
+}
+
+func TestPluginUsageAndConfigurationErrors(t *testing.T) {
+	componentsPath := filepath.Join("..", "..", "components.yaml")
+	db := "ZS_DATABASE_URL=postgres://u:pw@127.0.0.1:1/x"
+	cases := []struct {
+		args []string
+		env  []string
+		want string
+	}{
+		{[]string{"plugin"}, nil, "Usage"},
+		{[]string{"plugin", "ddl"}, nil, "Usage"},
+		{[]string{"plugin", "ddl", "apply", "--components", componentsPath, "stripe"}, []string{db}, "--operator is required"},
+		{[]string{"plugin", "ddl", "apply", "--components", componentsPath, "--operator", "x"}, []string{db}, "name one plugin, or pass --all"},
+		{[]string{"plugin", "ddl", "apply", "--components", componentsPath, "--operator", "x", "--all", "stripe"}, []string{db}, "not both"},
+		{[]string{"plugin", "ddl", "apply", "--components", componentsPath, "--operator", "x", "unknown"}, []string{db}, "is not pinned"},
+		{[]string{"plugin", "ddl", "apply", "--components", componentsPath, "--operator", "x", "stripe"}, []string{db}, "needs ZS_KILLBILL_DATABASE_URL"},
+		{[]string{"plugin", "ddl", "apply", "--components", componentsPath, "--operator", "x", "paypal-express"}, []string{db}, "has no Java artifact"},
+		{[]string{"plugin", "ddl", "show", "--components", componentsPath, "unknown"}, nil, "is not pinned"},
+		{[]string{"plugin", "ddl", "show", "--components", componentsPath, "stripe"}, []string{"ZS_PLUGIN_MIRROR_DIR=relative"}, "must be an absolute directory path"},
+		{[]string{"plugin", "mirror", "sync", "--components", componentsPath}, nil, "needs ZS_PLUGIN_MIRROR_DIR"},
+	}
+	for _, c := range cases {
+		var out, errOut bytes.Buffer
+		if code := run(c.args, c.env, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), c.want) {
+			t.Errorf("%v: exit %d %q, want %q", c.args, code, errOut.String(), c.want)
+		}
 	}
 }

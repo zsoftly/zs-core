@@ -154,7 +154,9 @@ func TestOverspendNeverExceedsAvailableCredit(t *testing.T) {
 	}()
 	// The cache: the clock moves past the TTL again and again, so callers
 	// refresh the Kill Bill credit mid-run, and credit arrives.
+	cacheDone := make(chan struct{})
 	go func() {
+		defer close(cacheDone)
 		for i := 0; ; i++ {
 			select {
 			case <-stop:
@@ -196,6 +198,7 @@ func TestOverspendNeverExceedsAvailableCredit(t *testing.T) {
 	wg.Wait()
 	close(stop)
 	<-monitorDone
+	<-cacheDone
 	if msg := violation.Load(); msg != nil {
 		t.Fatal(msg)
 	}
@@ -270,15 +273,27 @@ func TestSettlementRetriesAreIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	a, _ := e.settle(sc, "twice-charge", 0, wallet.Settlement{CreditMinor: 40})
-	b, _ := e.settle(sc, "twice-charge", 0, wallet.Settlement{CreditMinor: 40})
+	a, err := e.settle(sc, "twice-charge", 0, wallet.Settlement{CreditMinor: 40})
+	if err != nil {
+		t.Fatalf("initial charge settlement: %v", err)
+	}
+	b, err := e.settle(sc, "twice-charge", 0, wallet.Settlement{CreditMinor: 40})
+	if err != nil {
+		t.Fatalf("replayed charge settlement: %v", err)
+	}
 	if charges() != 1 || a.KillBillRef != b.KillBillRef {
 		t.Fatalf("charge settled twice: %d charges", charges())
 	}
 	chargeItem(a)
 	use := wallet.Settlement{Usage: &wallet.UsageSettlement{Unit: enginetest.UnitAPICall, QuantityMicro: 3_000_000, Subscription: sub}}
-	u1, _ := e.settle(sc, "twice-usage", 0, use)
-	u2, _ := e.settle(sc, "twice-usage", 0, use)
+	u1, err := e.settle(sc, "twice-usage", 0, use)
+	if err != nil {
+		t.Fatalf("initial usage settlement: %v", err)
+	}
+	u2, err := e.settle(sc, "twice-usage", 0, use)
+	if err != nil {
+		t.Fatalf("replayed usage settlement: %v", err)
+	}
 	if usage(u1.KillBillRef) != 1 || u1.KillBillRef != u2.KillBillRef {
 		t.Fatalf("usage settled twice: %d records", usage(u1.KillBillRef))
 	}

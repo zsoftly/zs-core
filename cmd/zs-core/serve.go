@@ -12,8 +12,10 @@ import (
 	"github.com/zsoftly/zs-core/internal/components"
 	"github.com/zsoftly/zs-core/internal/config"
 	"github.com/zsoftly/zs-core/internal/httpapi"
+	"github.com/zsoftly/zs-core/internal/kbplugin"
 	"github.com/zsoftly/zs-core/internal/keycloak"
 	"github.com/zsoftly/zs-core/internal/killbill"
+	"github.com/zsoftly/zs-core/internal/pdfrender"
 	"github.com/zsoftly/zs-core/internal/secrets"
 	"github.com/zsoftly/zs-core/migrations"
 	"github.com/zsoftly/zs-core/pkg/billing"
@@ -59,6 +61,22 @@ func newAPIOptions(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, l
 	if opts.BrandDeps.KillBill != nil {
 		opts.Billing = &billing.Service{DB: pool, KillBill: opts.BrandDeps.KillBill, Secrets: resolver,
 			WebhookSecret: []byte(cfg.KillBillWebhookSecret), Log: log}
+		if cfg.PDFRendererURL != "" {
+			renderer, err := pdfrender.New(cfg.PDFRendererURL, nil)
+			if err != nil {
+				return httpapi.Options{}, err
+			}
+			opts.Billing.PDF = renderer
+		}
+	}
+	if cfg.PluginMirrorDir != "" && cfg.PluginMirrorSecret != "" {
+		pins, err := components.Load(defaultComponentsFile)
+		if err != nil {
+			return httpapi.Options{}, fmt.Errorf("the plugin mirror needs components.yaml: %w", err)
+		}
+		opts.PluginMirror = &kbplugin.Mirror{Dir: cfg.PluginMirrorDir, Manifest: pins, Secret: []byte(cfg.PluginMirrorSecret)}
+		opts.PluginMirrorSecret = []byte(cfg.PluginMirrorSecret)
+		log.Info("plugin mirror served", "dir", cfg.PluginMirrorDir)
 	}
 	opts.Wallet, opts.Metering, opts.Quota = newExtensions(pool, opts.Billing, cfg, log)
 	if cfg.BrandsDir != "" {
@@ -102,10 +120,11 @@ func checkBrandsDir(ctx context.Context, dir string, refs brand.SecretRefChecker
 	return nil
 }
 
-// applyBillingDeps gives brand apply the approved payment plugins of
-// components.yaml, read from the working directory, and the push
+// applyBillingDeps gives brand apply the pinned plugins of components.yaml,
+// read from the working directory, the plugin mirror and the push
 // notification callback settings. Without components.yaml, an apply that
-// names a payment plugin is refused with plugin_unavailable.
+// names a plugin is refused with plugin_unavailable. serve never sets the
+// plugin table check: it never reads the Kill Bill database.
 func applyBillingDeps(deps *brand.Deps, cfg config.Config, log *slog.Logger) {
 	deps.WebhookBaseURL = cfg.KillBillCallbackURL
 	deps.WebhookSecret = []byte(cfg.KillBillWebhookSecret)
@@ -116,8 +135,7 @@ func applyBillingDeps(deps *brand.Deps, cfg config.Config, log *slog.Logger) {
 		}
 		return
 	}
-	deps.PaymentPlugins = m.KillBillPlugins.ApprovedPaymentPlugins
-	deps.PluginRepository = m.KillBillPlugins.Repository
+	setPluginDeps(deps, m, cfg)
 }
 
 // startCreditSweeper runs the credit expiry sweeper every interval until

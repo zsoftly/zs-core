@@ -46,6 +46,9 @@ type brandEngines struct {
 	realm    string
 	creds    killbill.TenantCredentials
 	currency string
+	// locales and defaultLocale are the brand's locales.
+	locales       []string
+	defaultLocale string
 }
 
 func (e Engines) forBrand(ctx context.Context, q Querier, id idgen.UUID) (brandEngines, error) {
@@ -67,6 +70,7 @@ func (e Engines) forBrand(ctx context.Context, q Querier, id idgen.UUID) (brandE
 		brandID: rec.ID, slug: rec.Slug, realm: rec.KeycloakRealm,
 		creds:    killbill.TenantCredentials{APIKey: rec.KillBillAPIKey, APISecret: secret},
 		currency: rec.Manifest.Billing.Currencies[0],
+		locales:  rec.Manifest.Identity.Locales, defaultLocale: rec.Manifest.Identity.DefaultLocale,
 	}, nil
 }
 

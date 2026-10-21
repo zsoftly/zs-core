@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/zsoftly/zs-core/internal/killbill"
+	"github.com/zsoftly/zs-core/internal/pdfrender"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/scope"
 	"github.com/zsoftly/zs-core/pkg/tenant"
@@ -173,10 +174,11 @@ func (s *Service) GetInvoice(ctx context.Context, sc scope.Scope, id string) (In
 	return invoiceOf(in, true)
 }
 
-// InvoicePDF answers invoice_pdf_unavailable for an invoice of the tenant.
-// PDF rendering needs an invoice template plugin, and components.yaml pins
-// none in this release. An invoice of another tenant is not_found.
-func (s *Service) InvoicePDF(ctx context.Context, sc scope.Scope, id string) ([]byte, error) {
+// InvoiceHTML returns Kill Bill's HTML rendering of an invoice of the
+// tenant: the brand's invoice template and translations, in the locale of
+// the tenant's Kill Bill account. An invoice of another tenant is
+// not_found.
+func (s *Service) InvoiceHTML(ctx context.Context, sc scope.Scope, id string) ([]byte, error) {
 	a, err := s.account(ctx, sc)
 	if err != nil {
 		return nil, err
@@ -184,5 +186,36 @@ func (s *Service) InvoicePDF(ctx context.Context, sc scope.Scope, id string) ([]
 	if _, err := s.ownedInvoice(ctx, a, id); err != nil {
 		return nil, err
 	}
-	return nil, zserrors.New(zserrors.CodeInvoicePDFUnavailable, "")
+	html, err := s.KillBill.InvoiceHTML(ctx, a.creds, id)
+	if err != nil {
+		return nil, kbError(err)
+	}
+	return html, nil
+}
+
+// InvoicePDF renders Kill Bill's HTML of an invoice of the tenant through
+// the PDF renderer and returns the PDF to stream. Without a renderer it
+// answers invoice_pdf_unavailable for an invoice of the tenant. An invoice
+// of another tenant is not_found. A renderer that fails is
+// pdf_renderer_unavailable. The caller closes the PDF.
+func (s *Service) InvoicePDF(ctx context.Context, sc scope.Scope, id string) (pdfrender.PDF, error) {
+	a, err := s.account(ctx, sc)
+	if err != nil {
+		return pdfrender.PDF{}, err
+	}
+	if _, err := s.ownedInvoice(ctx, a, id); err != nil {
+		return pdfrender.PDF{}, err
+	}
+	if s.PDF == nil {
+		return pdfrender.PDF{}, zserrors.New(zserrors.CodeInvoicePDFUnavailable, "")
+	}
+	html, err := s.KillBill.InvoiceHTML(ctx, a.creds, id)
+	if err != nil {
+		return pdfrender.PDF{}, kbError(err)
+	}
+	pdf, err := s.PDF.Render(ctx, html)
+	if err != nil {
+		return pdfrender.PDF{}, zserrors.Wrap(zserrors.CodePDFRendererUnavailable, "", err)
+	}
+	return pdf, nil
 }

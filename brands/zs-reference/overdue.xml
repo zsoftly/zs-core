@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Overdue states of the reference brand. Kill Bill moves an account with an
+  unpaid invoice to WARNING after 14 days, which blocks plan changes, and to
+  BLOCKED after 30 days, which also disables entitlement. Core reads the
+  state as a hold. See docs/modules/billing.md.
+-->
+<overdueConfig>
+    <accountOverdueStates>
+        <initialReevaluationInterval>
+            <unit>DAYS</unit>
+            <number>1</number>
+        </initialReevaluationInterval>
+        <state name="BLOCKED">
+            <condition>
+                <timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+                    <unit>DAYS</unit>
+                    <number>30</number>
+                </timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+            </condition>
+            <externalMessage>Payment is 30 days overdue</externalMessage>
+            <blockChanges>true</blockChanges>
+            <disableEntitlementAndChangesBlocked>true</disableEntitlementAndChangesBlocked>
+        </state>
+        <state name="WARNING">
+            <condition>
+                <timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+                    <unit>DAYS</unit>
+                    <number>14</number>
+                </timeSinceEarliestUnpaidInvoiceEqualsOrExceeds>
+            </condition>
+            <externalMessage>Payment is 14 days overdue</externalMessage>
+            <blockChanges>true</blockChanges>
+            <disableEntitlementAndChangesBlocked>false</disableEntitlementAndChangesBlocked>
+            <autoReevaluationInterval>
+                <unit>DAYS</unit>
+                <number>1</number>
+            </autoReevaluationInterval>
+        </state>
+    </accountOverdueStates>
+</overdueConfig>

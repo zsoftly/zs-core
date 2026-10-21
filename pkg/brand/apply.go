@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -49,11 +50,28 @@ type Deps struct {
 	// PaymentPlugins are the approved payment plugins of components.yaml.
 	// A manifest that names a payment plugin is refused without them.
 	PaymentPlugins []components.Plugin
-	// PluginRepository is the Maven repository KPM downloads plugins from,
-	// killbill_plugins.repository of components.yaml. It must be https.
+	// InvoicePlugins are the approved invoice plugins of components.yaml.
+	// A manifest that names an invoice plugin is refused without them.
+	InvoicePlugins []components.Plugin
+	// InstallablePlugins are the installable plugins of components.yaml,
+	// such as email-notifications. A manifest with billing.email is
+	// refused without them.
+	InstallablePlugins []components.Plugin
+	// PluginRepository is the Maven source in components.yaml. KPM installs
+	// only from PluginMirrorURL; repository fallback is refused.
 	PluginRepository string
-	// PluginHTTP downloads a plugin jar so its SHA-256 is checked against
-	// components.yaml before KPM installs it. Nil means a default client.
+	// PluginMirrorURL is Core's base URL as Kill Bill reaches the plugin
+	// mirror, ZS_PLUGIN_MIRROR_URL, and PluginMirrorSecret the deployment's
+	// ZS_PLUGIN_MIRROR_SECRET. Both are required to install any plugin.
+	PluginMirrorURL    string
+	PluginMirrorSecret []byte
+	// PluginTables, when set, returns the tables of a plugin that the Kill
+	// Bill database lacks. Apply refuses a plugin with missing tables with
+	// plugin_tables_missing before anything changes. The command line sets
+	// it when ZS_KILLBILL_DATABASE_URL is set. serve never does.
+	PluginTables func(ctx context.Context, pin components.Plugin) ([]string, error)
+	// PluginHTTP checks the mirror's jar against components.yaml before KPM
+	// installs from the same verified mirror. Nil means a default client.
 	PluginHTTP *http.Client
 	// WebhookBaseURL is where Kill Bill reaches Core, and WebhookSecret the
 	// deployment's ZS_KILLBILL_WEBHOOK_SECRET. With both set, apply
@@ -178,13 +196,14 @@ func Plan(ctx context.Context, deps Deps, m *Manifest, opts Options) (Diff, erro
 }
 
 // Apply converges Keycloak and Kill Bill to m and records the brand. It
-// holds a database lock per brand slug for its duration, so two applies of
-// one brand never interleave. With opts.ExpectBrand set, the lock is taken
-// only after the slug is known to belong to that brand, so a manifest for
-// another brand cannot hold that brand's lock. Every change is audited with
-// its diff after it succeeds, or with outcome failure when it fails, and
-// Apply stops at the first failure; running it again continues from the
-// state reached.
+// holds a database lock per brand slug for its duration. It also takes a
+// shared Kill Bill plugin-state database lock before planning and holds it
+// until Apply returns, serializing Core planning and execution in that
+// database. With opts.ExpectBrand set, the brand lock is taken only after the
+// slug is known to belong to that brand, so a manifest for another brand
+// cannot hold that brand's lock. Every change is audited with its diff after
+// it succeeds, or with outcome failure when it fails, and Apply stops at the
+// first failure; running it again continues from the state reached.
 func Apply(ctx context.Context, deps Deps, m *Manifest, opts Options) (Diff, error) {
 	if opts.CorrelationID == "" {
 		opts.CorrelationID = idgen.MustNewV7().String()
@@ -209,6 +228,12 @@ func Apply(ctx context.Context, deps Deps, m *Manifest, opts Options) (Diff, err
 	}
 	if !locked {
 		return Diff{}, zserrors.New(zserrors.CodeBrandApplyInProgress, "")
+	}
+	if err := lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.brand.apply.shared-killbill', 0))`).Scan(&locked); err != nil {
+		return Diff{}, zserrors.Wrap(zserrors.CodeDatabaseUnavailable, "", err)
+	}
+	if !locked {
+		return Diff{}, zserrors.New(zserrors.CodeBrandApplyInProgress, "Another brand apply is using shared Kill Bill plugin state. Retry after it finishes.")
 	}
 
 	p, err := makePlan(ctx, deps, m, opts)
@@ -359,7 +384,7 @@ func checkRealmSSL(m *Manifest, opts Options) error {
 // opts.ConfirmSensitiveChange.
 func (p *plan) checkGates(opts Options) error {
 	if p.paymentPluginChange && strings.TrimSpace(opts.Reason) == "" {
-		return zserrors.New(zserrors.CodeReasonRequired, "Changing the payment plugin requires a reason.")
+		return zserrors.New(zserrors.CodeReasonRequired, "Changing a plugin or its configuration requires a reason.")
 	}
 	if len(p.sensitive) > 0 && opts.ConfirmSensitiveChange != nil {
 		return opts.ConfirmSensitiveChange(p.sensitive)
@@ -367,28 +392,20 @@ func (p *plan) checkGates(opts Options) error {
 	return nil
 }
 
-// paymentPluginChanged reports whether the apply changes the brand's payment
-// plugin: its configuration in Kill Bill, or its name, configuration key or
-// configuration reference in the manifest, or adds or removes it.
+// paymentPluginChanged reports whether the apply changes a plugin of the
+// brand: a plugin install or configuration in Kill Bill, or the payment
+// plugins or the invoice plugin of the manifest.
 func paymentPluginChanged(prev, m *Manifest, changes []Change) bool {
 	for _, ch := range changes {
 		if ch.Target == TargetPluginConfig || ch.Target == TargetPlugin {
 			return true
 		}
 	}
-	var before *PaymentPlugin
+	before := &Manifest{}
 	if prev != nil {
-		before = prev.Billing.PaymentPlugin
+		before = prev
 	}
-	next := m.Billing.PaymentPlugin
-	switch {
-	case before == nil && next == nil:
-		return false
-	case before == nil || next == nil:
-		return true
-	}
-	return before.Name != next.Name || before.Version != next.Version || before.Mode != next.Mode ||
-		before.ConfigKey != next.ConfigKey || before.ConfigRef != next.ConfigRef
+	return !jsonEqual(before.Billing.Plugins(), m.Billing.Plugins()) || !jsonEqual(before.Billing.InvoicePlugin, m.Billing.InvoicePlugin)
 }
 
 // sensitiveFields lists the fields of the apply that decide how people
@@ -428,7 +445,9 @@ func sensitiveFields(prev, m *Manifest, changes []Change) []string {
 		{"identity.staff_client", before.Identity.StaffClient, m.Identity.StaffClient},
 		{"identity.service_clients", before.Identity.ServiceClients, m.Identity.ServiceClients},
 		{"identity.identity_providers", before.Identity.IdentityProviders, m.Identity.IdentityProviders},
-		{"billing.payment_plugin", before.Billing.PaymentPlugin, m.Billing.PaymentPlugin},
+		{"billing.payment_plugins", before.Billing.Plugins(), m.Billing.Plugins()},
+		{"billing.invoice_plugin", before.Billing.InvoicePlugin, m.Billing.InvoicePlugin},
+		{"billing.email.smtp", emailSMTP(before.Billing.Email), emailSMTP(m.Billing.Email)},
 	} {
 		if !jsonEqual(c.old, c.value) {
 			set[c.field] = true
@@ -440,6 +459,14 @@ func sensitiveFields(prev, m *Manifest, changes []Change) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// emailSMTP is the SMTP section of an email section, nil without one.
+func emailSMTP(e *Email) *SMTP {
+	if e == nil {
+		return nil
+	}
+	return &e.SMTP
 }
 
 // jsonEqual compares two manifest values by their JSON form, so a nil and an
@@ -530,8 +557,14 @@ func resolveSecrets(ctx context.Context, r secrets.Resolver, m *Manifest) (resol
 			refs = append(refs, p.ClientSecretRef)
 		}
 	}
-	if m.Billing.PaymentPlugin != nil {
-		refs = append(refs, m.Billing.PaymentPlugin.ConfigRef)
+	for _, pp := range m.Billing.Plugins() {
+		refs = append(refs, pp.ConfigRef)
+	}
+	if ip := m.Billing.InvoicePlugin; ip != nil {
+		refs = append(refs, ip.ConfigRef)
+	}
+	if e := m.Billing.Email; e != nil && e.SMTP.UsernameRef != "" {
+		refs = append(refs, e.SMTP.UsernameRef, e.SMTP.PasswordRef)
 	}
 	out := resolved{}
 	for _, ref := range refs {
@@ -559,10 +592,30 @@ const maxReferencedFileBytes = 4 << 20
 
 func readFiles(root fs.FS, prefix string, m *Manifest) (files, error) {
 	out := files{}
-	for _, f := range []struct{ field, path string }{
-		{"/billing/catalogue", m.Billing.Catalogue},
-		{"/billing/overdue", m.Billing.Overdue},
-	} {
+	type ref struct {
+		field, path string
+		optional    bool
+		text        bool
+	}
+	refs := []ref{
+		{field: "/billing/catalogue", path: m.Billing.Catalogue},
+		{field: "/billing/overdue", path: m.Billing.Overdue},
+	}
+	if t := m.Billing.InvoiceTemplates; t != nil {
+		refs = append(refs, ref{field: "/billing/invoice_templates/template", path: t.Template, text: true},
+			ref{field: "/billing/invoice_templates/manual_pay_template", path: t.ManualPayTemplate, text: true})
+		for _, l := range sortedLocales(t.Translations) {
+			refs = append(refs, ref{field: "/billing/invoice_templates/translations/" + l, path: t.Translations[l], text: true})
+		}
+		for _, l := range sortedLocales(t.CatalogueTranslations) {
+			refs = append(refs, ref{field: "/billing/invoice_templates/catalogue_translations/" + l, path: t.CatalogueTranslations[l], text: true})
+		}
+	}
+	emailFiles := m.emailTemplatePaths()
+	for _, field := range sortedLocales(emailFiles) {
+		refs = append(refs, ref{field: field, path: emailFiles[field], optional: true, text: true})
+	}
+	for _, f := range refs {
 		if f.path == "" {
 			continue
 		}
@@ -578,6 +631,9 @@ func readFiles(root fs.FS, prefix string, m *Manifest) (files, error) {
 			name = rest
 		}
 		fh, err := root.Open(name)
+		if f.optional && errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return nil, invalid([]string{f.field + ": cannot open " + f.path})
 		}
@@ -585,6 +641,9 @@ func readFiles(root fs.FS, prefix string, m *Manifest) (files, error) {
 		_ = fh.Close()
 		if err != nil || len(data) > maxReferencedFileBytes {
 			return nil, invalid([]string{f.field + ": cannot read " + f.path + " or it is larger than 4 MiB"})
+		}
+		if f.text && !utf8.Valid(data) {
+			return nil, invalid([]string{f.field + ": " + f.path + " is not UTF-8 text"})
 		}
 		out[f.path] = data
 	}
@@ -664,6 +723,10 @@ var auditActions = map[string]string{
 	TargetPluginConfig:         "brand.killbill.plugin_config",
 	TargetPlugin:               "brand.killbill.plugin",
 	TargetNotificationCallback: "brand.killbill.notification_callback",
+	TargetInvoiceTemplate:      "brand.killbill.invoice_template",
+	TargetInvoiceTranslation:   "brand.killbill.invoice_translation",
+	TargetCatalogueTranslation: "brand.killbill.catalogue_translation",
+	TargetEmailTemplate:        "brand.killbill.email_template",
 	TargetMeters:               "brand.meters",
 	TargetQuotas:               "brand.quotas",
 }

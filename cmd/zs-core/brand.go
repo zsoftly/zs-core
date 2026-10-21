@@ -95,19 +95,18 @@ func runBrand(args, environ []string, stdout, stderr io.Writer) int {
 	if m.Identity.SSLRequired == "none" {
 		fmt.Fprintln(stderr, "warning: identity.ssl_required is none; Keycloak accepts plain http from any address. Use it only for the loopback reference stack. POST /v1/brands/{id}/apply refuses it.")
 	}
-	var plugins []components.Plugin
-	var repository string
-	if m.Billing.PaymentPlugin != nil {
-		pins, err := components.Load(*componentsFile)
+	var pins *components.Manifest
+	if len(m.Billing.Plugins()) > 0 || m.Billing.InvoicePlugin != nil || m.Billing.Email != nil {
+		loaded, err := components.Load(*componentsFile)
 		if err != nil {
-			fmt.Fprintln(stderr, "brand "+sub+": the manifest names a payment plugin, which needs components.yaml:", err)
+			fmt.Fprintln(stderr, "brand "+sub+": the manifest names a plugin, which needs components.yaml:", err)
 			return 2
 		}
-		if err := brand.CheckPluginRepository(pins.KillBillPlugins.Repository); err != nil {
+		if err := brand.CheckPluginRepository(loaded.KillBillPlugins.Repository); err != nil {
 			fmt.Fprintln(stderr, "brand "+sub+": "+*componentsFile+":", err)
 			return 2
 		}
-		plugins, repository = pins.KillBillPlugins.ApprovedPaymentPlugins, pins.KillBillPlugins.Repository
+		pins = &loaded
 	}
 	root, err := os.OpenRoot(filepath.Dir(file))
 	if err != nil {
@@ -127,9 +126,23 @@ func runBrand(args, environ []string, stdout, stderr io.Writer) int {
 	}
 	defer pool.Close()
 
-	deps := brand.Deps{DB: pool, Keycloak: kc, KillBill: kb, Secrets: secrets.Default{LookupEnv: envLookup(environ), Dir: cfg.SecretsDir}, Files: root.FS(),
+	resolver := secrets.Default{LookupEnv: envLookup(environ), Dir: cfg.SecretsDir}
+	deps := brand.Deps{DB: pool, Keycloak: kc, KillBill: kb, Secrets: resolver, Files: root.FS(),
 		WebhookBaseURL: cfg.KillBillCallbackURL, WebhookSecret: []byte(cfg.KillBillWebhookSecret)}
-	deps.PaymentPlugins, deps.PluginRepository = plugins, repository
+	if pins != nil {
+		setPluginDeps(&deps, *pins, cfg)
+	}
+	// The command line checks the plugin tables as doctor does when it can
+	// read the Kill Bill database. serve never reads it.
+	if cfg.KillBillDatabaseURL != "" {
+		kbPool, err := database.Open(ctx, database.Options{URL: cfg.KillBillDatabaseURL, MaxConns: 2})
+		if err != nil {
+			fmt.Fprintln(stderr, "open the Kill Bill database of ZS_KILLBILL_DATABASE_URL:", err)
+			return 1
+		}
+		defer kbPool.Close()
+		deps.PluginTables = tablesIn(kbPool)
+	}
 	opts := brand.Options{Actor: operatorActor(*operator), Reason: *reason, CreatedBy: "zs-core-cli:" + *operator}
 	var diff brand.Diff
 	if sub == "apply" {
@@ -150,6 +163,18 @@ func runBrand(args, environ []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// setPluginDeps gives brand apply the pinned plugins and mirror settings.
+// New installs require the mirror URL and secret; starts need no download.
+func setPluginDeps(deps *brand.Deps, pins components.Manifest, cfg config.Config) {
+	deps.PaymentPlugins = pins.KillBillPlugins.ApprovedPaymentPlugins
+	deps.InvoicePlugins = pins.KillBillPlugins.ApprovedInvoicePlugins
+	deps.InstallablePlugins = pins.KillBillPlugins.Installable
+	deps.PluginRepository = pins.KillBillPlugins.Repository
+	if cfg.PluginMirrorURL != "" {
+		deps.PluginMirrorURL, deps.PluginMirrorSecret = cfg.PluginMirrorURL, []byte(cfg.PluginMirrorSecret)
+	}
 }
 
 // envLookup resolves env:// references against the command's environment.

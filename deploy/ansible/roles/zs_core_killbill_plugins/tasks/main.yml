@@ -1,0 +1,120 @@
+---
+- name: Validate the plugin command execution contract
+  ansible.builtin.assert:
+    that:
+      - zs_core_killbill_plugins_execution_mode in ['native', 'container']
+      - zs_core_killbill_plugins_environment is mapping
+      - >-
+        zs_core_killbill_plugins_environment | dict2items
+        | map(attribute='key')
+        | reject('match', '^[A-Za-z_][A-Za-z0-9_]*$')
+        | list | length == 0
+      - >-
+        zs_core_killbill_plugins_execution_mode != 'native'
+        or not zs_core_killbill_plugins_container_command_prefix
+      - >-
+        zs_core_killbill_plugins_execution_mode != 'container'
+        or zs_core_killbill_plugins_environment | length == 0
+    fail_msg: >-
+      Container execution requires its variables to be preconfigured in the
+      container. zs_core_killbill_plugins_environment is supported only in
+      native execution mode. Docker and Docker Compose command prefixes require
+      zs_core_killbill_plugins_execution_mode: container.
+    quiet: true
+  vars:
+    zs_core_killbill_plugins_container_command_prefix: >-
+      {{
+        (zs_core_killbill_plugins_command | length > 0)
+        and (
+          zs_core_killbill_plugins_command[0] | basename
+          in ['docker', 'docker-compose']
+        )
+      }}
+  no_log: true
+  tags: [always, zs_core_killbill_plugins_preflight]
+
+- name: Wait for Kill Bill to be healthy
+  ansible.builtin.uri:
+    url: "{{ zs_core_killbill_plugins_killbill_url }}/1.0/healthcheck"
+    status_code: 200
+  register: zs_core_killbill_plugins_health
+  until: zs_core_killbill_plugins_health.status == 200
+  retries: 60
+  delay: 5
+
+- name: Run plugin commands with the configured environment
+  block:
+    - name: Create a temporary plugin command environment file
+      ansible.builtin.tempfile:
+        state: file
+        prefix: zs-core-killbill-plugins-
+      register: zs_core_killbill_plugins_environment_file
+      changed_when: false
+      no_log: true
+
+    - name: Write the temporary plugin command environment file
+      ansible.builtin.copy:
+        content: |-
+          # zs-core plugin command environment
+          {% for item in zs_core_killbill_plugins_environment | dictsort %}
+          export {{ item[0] }}={{ item[1] | quote }}
+          {% endfor %}
+        dest: "{{ zs_core_killbill_plugins_environment_file.path }}"
+        mode: "0600"
+      changed_when: false
+      no_log: true
+
+    - name: Sync the plugin mirror with the pinned jars
+      ansible.builtin.command:
+        argv: >-
+          {{
+            ['/bin/sh', '-c', 'set -ae; . "$1"; shift; set +a; exec "$@"',
+             'zs-core-killbill-plugins']
+            + [zs_core_killbill_plugins_environment_file.path]
+            + zs_core_killbill_plugins_command
+            + ['plugin', 'mirror', 'sync']
+          }}
+        chdir: "{{ zs_core_killbill_plugins_workdir }}"
+      register: zs_core_killbill_plugins_sync
+      changed_when: "' downloaded ' in zs_core_killbill_plugins_sync.stdout"
+      when: zs_core_killbill_plugins_sync_mirror | bool
+      no_log: true
+
+    - name: Apply the DDL of every pinned plugin to the Kill Bill database
+      ansible.builtin.command:
+        argv: >-
+          {{
+            ['/bin/sh', '-c', 'set -ae; . "$1"; shift; set +a; exec "$@"',
+             'zs-core-killbill-plugins']
+            + [zs_core_killbill_plugins_environment_file.path]
+            + zs_core_killbill_plugins_command
+            + [
+              'plugin', 'ddl', 'apply', '--all', '--operator',
+              zs_core_killbill_plugins_operator
+            ]
+          }}
+        chdir: "{{ zs_core_killbill_plugins_workdir }}"
+      register: zs_core_killbill_plugins_ddl
+      changed_when: >-
+        (
+          zs_core_killbill_plugins_ddl.stdout_lines
+          | map('from_json') | selectattr('created_tables', 'defined')
+          | selectattr('created_tables') | list | length > 0
+        ) or (
+          zs_core_killbill_plugins_ddl.stdout_lines
+          | map('from_json') | selectattr('created_domains', 'defined')
+          | selectattr('created_domains') | list | length > 0
+        )
+      no_log: true
+  always:
+    - name: Remove the temporary plugin command environment file
+      ansible.builtin.file:
+        path: "{{ zs_core_killbill_plugins_environment_file.path }}"
+        state: absent
+      when: >-
+        zs_core_killbill_plugins_environment_file is defined
+        and zs_core_killbill_plugins_environment_file.path is defined
+      changed_when: false
+      no_log: true
+  when: not ansible_check_mode
+  tags: [zs_core_killbill_plugins_commands]

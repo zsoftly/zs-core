@@ -1,0 +1,25 @@
+---
+# The zs-core binary, or a command that runs it, such as
+# ["docker", "exec", "zs-core", "zs-core"]. Every task appends its arguments.
+zs_core_killbill_plugins_command: ["/usr/local/bin/zs-core"]
+# Native commands receive zs_core_killbill_plugins_environment. Docker and
+# Docker Compose prefixes require container mode and all variables to be
+# configured in the container already.
+zs_core_killbill_plugins_execution_mode: native
+# Working directory that holds the components.yaml of the deployed Core
+# release on the Ansible target. It is not forwarded into a container.
+zs_core_killbill_plugins_workdir: /opt/zs-core
+# Kill Bill's base URL, polled until it is healthy before any DDL runs.
+zs_core_killbill_plugins_killbill_url: http://127.0.0.1:8080
+# Environment of the zs-core commands. Set ZS_DATABASE_URL and
+# ZS_KILLBILL_DATABASE_URL, and ZS_PLUGIN_MIRROR_DIR and
+# ZS_PLUGIN_MIRROR_SECRET when this host keeps the plugin mirror. The brand
+# apply process also needs ZS_PLUGIN_MIRROR_URL and ZS_PLUGIN_MIRROR_SECRET
+# for new installs; KPM has no repository fallback. The URL must reach Core
+# from Kill Bill. Keep secret values in the vault.
+zs_core_killbill_plugins_environment: {}
+# Sync the plugin mirror before the DDL step. The DDL step then reads the
+# jars from the mirror instead of the repository.
+zs_core_killbill_plugins_sync_mirror: true
+# Recorded with each applied DDL in Core's killbill_plugin_ddl table.
+zs_core_killbill_plugins_operator: ansible

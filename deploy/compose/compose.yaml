@@ -42,6 +42,33 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # Optional PDF renderer for invoice PDFs. JavaScript, LibreOffice routes,
+  # webhooks and API downloadFrom are disabled. Chromium rejects public and
+  # non-public IP destinations for HTTP, HTTPS, WS and WSS. HTML file access
+  # is limited to the current request's temporary directory.
+  gotenberg:
+    image: ${GOTENBERG_IMAGE:-gotenberg/gotenberg@sha256:aa552cc115db488e0f0bcb07446aac13071ad51505b642c84bb894500907b42b}  # gotenberg/gotenberg:8.38.1
+    command:
+      - gotenberg
+      - --chromium-disable-javascript=true
+      - --chromium-allow-list=^file:///tmp/.*
+      - --chromium-deny-public-ips=true
+      - --chromium-deny-private-ips=true
+      - --libreoffice-disable-routes=true
+      - --webhook-disable=true
+      - --api-disable-download-from=true
+      - --api-download-from-deny-public-ips=true
+      - --api-download-from-deny-private-ips=true
+    ports:
+      - "127.0.0.1:${GOTENBERG_HOST_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
   keycloak:
     image: zs-core/keycloak:local
     build:
@@ -134,6 +161,18 @@ services:
       KB_org_killbill_billing_plugin_kpm_adminPassword: ${KILLBILL_ADMIN_PASSWORD:?set in .env}
     volumes:
       - killbill-plugins:/var/lib/killbill/bundles/plugins
+      - type: bind
+        source: ./killbill/logback.xml
+        target: /var/lib/tomcat/logback.xml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./killbill/setenv2.sh
+        target: /var/lib/tomcat/bin/setenv2.sh
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       db-init:
         condition: service_completed_successfully
@@ -200,9 +239,24 @@ services:
       # network, and the secret verifies them.
       ZS_KILLBILL_WEBHOOK_SECRET: ${ZS_KILLBILL_WEBHOOK_SECRET:-}
       ZS_KILLBILL_CALLBACK_URL: http://core:8080
-      # Tenant creation reads the Kill Bill tenant secret of
-      # brands/zs-reference.yaml through this reference.
+      # Tenant creation and brand apply read the secrets of
+      # brands/zs-reference.yaml through these references.
       BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET: ${KILLBILL_TENANT_API_SECRET:?set in .env}
+      BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET: ${ZS_STAFF_CLIENT_SECRET:?set in .env}
+      # Deployment steps only: zs-core plugin ddl apply, doctor and brand
+      # apply on the command line read the Kill Bill database. serve never
+      # does.
+      ZS_KILLBILL_DATABASE_URL: postgres://killbill:${KILLBILL_DB_PASSWORD:?set in .env}@postgres:5432/killbill?sslmode=disable
+      ZS_PDF_RENDERER_URL: http://gotenberg:3000
+      # The plugin mirror: zs-core plugin mirror sync fills it, serve
+      # serves it to KPM. New installs require the URL and secret; KPM
+      # never downloads directly from the repository.
+      ZS_PLUGIN_MIRROR_DIR: /var/lib/zs-core/plugins
+      ZS_PLUGIN_MIRROR_SECRET: ${ZS_PLUGIN_MIRROR_SECRET:?set in .env}
+      ZS_PLUGIN_MIRROR_URL: ${ZS_PLUGIN_MIRROR_URL:-http://core:8080}
+    volumes:
+      - plugin-mirror:/var/lib/zs-core/plugins
+      - ../../brands:/app/brands:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -220,3 +274,4 @@ volumes:
   postgres-data:
   killbill-plugins:
   ddl:
+  plugin-mirror:

@@ -8,7 +8,11 @@
 # the HTTP route refuses it. The meter api-calls forwards usage to the
 # catalogue unit api-call, which core-metered-monthly bills per call. The
 # quotas cap api-call per month on that plan and running jobs on every plan.
-# See docs/modules/brands.md, docs/modules/metering.md and
+# Kill Bill renders invoices with zs-reference/invoices/ in English and
+# French. Billing email goes through the email-notifications plugin to the
+# stack's Mailpit with the templates of zs-reference/email/. The seller
+# address and tax number are placeholders. See docs/modules/brands.md,
+# docs/modules/invoices.md, docs/modules/metering.md and
 # docs/modules/quotas.md.
 schema_version: 1
 slug: zs-reference
@@ -53,10 +57,29 @@ billing:
   killbill_tenant_key: zs-reference
   killbill_api_secret_ref: env://BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET
   catalogue: zs-reference/catalogue.xml
+  overdue: zs-reference/overdue.xml
   currencies: [CAD, USD]
   seller:
     name: ZSoftly Technologies Inc.
     country: CA
+    address_lines: ["100 Example Street, Suite 1", "Ottawa, Ontario"]
+    tax_registrations: ["GST/HST 000000000 RT0001"]
+  invoice_templates:
+    template: zs-reference/invoices/invoice.html
+    manual_pay_template: zs-reference/invoices/invoice-manual-pay.html
+    translations:
+      en: zs-reference/invoices/translation-en.properties
+      fr: zs-reference/invoices/translation-fr.properties
+    catalogue_translations:
+      en: zs-reference/invoices/catalogue-en.properties
+      fr: zs-reference/invoices/catalogue-fr.properties
+  email:
+    sender: billing@zs-reference.example.test
+    events: [INVOICE_CREATION, INVOICE_PAYMENT_SUCCESS, INVOICE_PAYMENT_FAILED]
+    smtp:
+      host: mailpit
+      port: 1025
+    templates: zs-reference/email
   wallet:
     overdraft_minor: 0
     low_balance_minor: 500

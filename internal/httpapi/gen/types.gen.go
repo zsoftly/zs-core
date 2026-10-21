@@ -2293,6 +2293,15 @@ type ApplyBrandParams struct {
 	Reason *string `form:"reason,omitempty" json:"reason,omitempty"`
 }
 
+// GetPluginJarParams defines parameters for GetPluginJar.
+type GetPluginJarParams struct {
+	// Sha256 Exactly one lowercase SHA-256 value, equal to the currently serving `components.yaml` pin.
+	Sha256 string `form:"sha256" json:"sha256"`
+
+	// Token The jar's HMAC-SHA256 token over the plugin, version, and sha256 digest, for KPM.
+	Token *string `form:"token,omitempty" json:"token,omitempty"`
+}
+
 // ListApiKeysParams defines parameters for ListApiKeys.
 type ListApiKeysParams struct {
 	// Limit The page size. Defaults to 50.

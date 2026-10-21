@@ -19,7 +19,7 @@ You need Go 1.26.1 or later and a Postgres server. Postgres 18 is what the stack
 | `make generate` | Regenerates `internal/httpapi/gen/types.gen.go` from `api/openapi.yaml`. |
 | `make generate-check` | Fails if the generated types do not match the OpenAPI document. |
 | `make check` | `fmt-check`, `vet`, `test` and `generate-check`. This is the merge gate. |
-| `make stack-up`, `make stack-down`, `make stack-reset`, `make stack-logs`, `make stack-bootstrap`, `make doctor` | The reference stack. They run `docker compose` in the current shell, and only where `ZS_BUILD_HOST=1` is set. Use them on a build host. See [../deploy/compose/README.md](../deploy/compose/README.md). |
+| `make stack-up`, `make stack-down`, `make stack-reset`, `make stack-logs`, `make stack-bootstrap`, `make stack-apply`, `make stack-verify`, `make doctor` | The reference stack. They run `docker compose` in the current shell, and only where `ZS_BUILD_HOST=1` is set. Use them on a build host. See [../deploy/compose/README.md](../deploy/compose/README.md). |
 
 ## Run the service
 
@@ -71,7 +71,12 @@ bin/zs-core credit-code disable --brand zs-reference --id ccd_... --reason '<why
 bin/zs-core credit sweep        # reverse the unused part of expired credits once
 bin/zs-core wallet sweep        # expire reservations past their lease and reconcile every wallet once
 bin/zs-core usage forward       # forward recorded usage to Kill Bill once
+bin/zs-core plugin ddl show stripe                    # the DDL of the pinned jar
+bin/zs-core plugin ddl apply --all --operator <you>   # create missing plugin tables in Kill Bill
+bin/zs-core plugin mirror sync                        # fill the plugin mirror and sign its manifest
 ```
+
+The `plugin` commands read `components.yaml` from the working directory unless `--components` says otherwise. `ddl apply` needs `ZS_DATABASE_URL` and `ZS_KILLBILL_DATABASE_URL`. `mirror sync` needs `ZS_PLUGIN_MIRROR_DIR` and `ZS_PLUGIN_MIRROR_SECRET`. See [modules/plugins.md](modules/plugins.md).
 
 `credit-code` needs the database only. `credit sweep`, `wallet sweep` and `usage forward` also need the Kill Bill admin settings and the brands' secret references. See [modules/billing.md](modules/billing.md), [modules/wallet.md](modules/wallet.md) and [modules/metering.md](modules/metering.md).
 
@@ -188,6 +193,12 @@ The tenant stack tests cover the Phase 3 gates with a real Keycloak and Kill Bil
 - An invoice run past the end of the first period bills the usage as a `USAGE` item that lists both tracking IDs. Kill Bill's test clock cannot move on the stack, so the run names a target date.
 - The client reads those tracking IDs, and the dates of the usage item, from Kill Bill's invoices, and the invoiced usage reconciles with no new finding.
 
+The Phase 5 tests cover plugin deployment, invoices and brand isolation:
+
+- `TestPluginDeploymentOnTheStack` uninstalls Stripe and drops its tables. Brand apply then refuses Stripe with `plugin_tables_missing`. The DDL step creates the tables, and a second run creates nothing. A jar that does not match its pin is refused and audited. Stripe is installed from the core container's mirror while the repository is unreachable, and its configuration is uploaded. Doctor is green with the table check. A dropped table makes doctor FAIL and brand apply refuse, and the DDL step repairs it. A pin other than the installed version fails doctor and brand apply. A plugin outside the approved lists is refused. The mirror route refuses a missing credential, the token of another version, and a plugin or version that is not pinned.
+- `TestInvoicesOnTheStack` applies `zs-reference` and checks its template and translations in Kill Bill. An EN user and an FR user each create a tenant, whose Kill Bill account gets their locale and email. An invoice with a charge and a TAX item renders through Core as HTML and as PDF in each locale, with the invoice number, the seller and its registration number, the tax line and the currency. The PDF text is read with `pdftotext`. Invoice numbers are unique and increase within a Kill Bill tenant.
+- `TestBrandIsolationOnTheStack` runs two brands with different default payment plugins, configurations, templates, sellers, overdue states and senders. Mailpit receives each brand's invoice email from its own sender with its own template. A change to the first brand's template, sender, plugin configuration, overdue states and tax plugin leaves every value of the second brand's Kill Bill tenant the same, byte for byte. The first brand's credentials read and write its own values only.
+
 Kill Bill reaches the test only from inside its own network. If your build host's firewall drops traffic from containers to the host, run this test in Kill Bill's network namespace, after the full suite:
 
 ```bash
@@ -219,6 +230,12 @@ The tests skip unless `ZS_TEST_KEYCLOAK_URL` is set. They change the stack. Run 
 | `BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET` | `KILLBILL_TENANT_API_SECRET` |
 | `ZS_TEST_CALLBACK_ADDR` | Optional. An address Kill Bill reaches, such as `127.0.0.1:18080` inside Kill Bill's network namespace. The billing test serves Core there. |
 | `ZS_TEST_POSTGRES_FORWARD` | Optional. `<loopback addr>=<host:port>`, a forward the stack tests open to the stack's Postgres. |
+| `ZS_TEST_KILLBILL_DATABASE_URL` | `postgres://killbill:<KILLBILL_DB_PASSWORD>@127.0.0.1:5432/killbill?sslmode=disable` |
+| `ZS_TEST_PLUGIN_MIRROR_URL` | `http://core:8080`, the mirror as Kill Bill reaches it |
+| `ZS_TEST_PLUGIN_MIRROR_SECRET` | `ZS_PLUGIN_MIRROR_SECRET` |
+| `ZS_TEST_CORE_URL` | `http://127.0.0.1:8080`, the core container as the test reaches it |
+| `ZS_TEST_PDF_RENDERER_URL` | `http://127.0.0.1:3000` |
+| `ZS_TEST_MAILPIT_URL` | `http://127.0.0.1:8025` |
 
 ```bash
 set -a; . deploy/compose/.env; set +a
@@ -226,10 +243,15 @@ ZS_TEST_POSTGRES_URL="postgres://postgres:$POSTGRES_PASSWORD@127.0.0.1:5432/zs_c
 ZS_TEST_KEYCLOAK_URL=http://127.0.0.1:8180 ZS_TEST_KEYCLOAK_ADMIN_USER="$KEYCLOAK_ADMIN_USER" \
 ZS_TEST_KEYCLOAK_ADMIN_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD" ZS_TEST_KILLBILL_URL=http://127.0.0.1:8081 \
 ZS_TEST_KILLBILL_ADMIN_PASSWORD="$KILLBILL_ADMIN_PASSWORD" \
+ZS_TEST_KILLBILL_DATABASE_URL="postgres://killbill:$KILLBILL_DB_PASSWORD@127.0.0.1:5432/killbill?sslmode=disable" \
+ZS_TEST_PLUGIN_MIRROR_URL=http://core:8080 ZS_TEST_PLUGIN_MIRROR_SECRET="$ZS_PLUGIN_MIRROR_SECRET" \
+ZS_TEST_CORE_URL=http://127.0.0.1:8080 ZS_TEST_PDF_RENDERER_URL=http://127.0.0.1:3000 ZS_TEST_MAILPIT_URL=http://127.0.0.1:8025 \
 BRAND_ZS_REFERENCE__KEYCLOAK_STAFF_CLIENT_SECRET="$ZS_STAFF_CLIENT_SECRET" \
 BRAND_ZS_REFERENCE__KILLBILL_TENANT_API_SECRET="$KILLBILL_TENANT_API_SECRET" \
   go test -tags integration -count=1 ./internal/stacktest/
 ```
+
+`TestInvoicesOnTheStack` reads the PDF's text with `pdftotext` from poppler-utils and fails without it. In the `golang:1.26` container, install it first with `apt-get update && apt-get install -y poppler-utils`.
 
 The `zs_core_test` database must exist on the stack's Postgres; the tests create and drop their own schemas in it.
 

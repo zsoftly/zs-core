@@ -25,7 +25,7 @@ func manifest() components.Manifest {
 		},
 		KillBillPlugins: components.KillBillPlugins{
 			ApprovedPaymentPlugins: []components.Plugin{
-				{Name: "stripe", Version: "6.0.1", Status: "verified_install"},
+				{Name: "stripe", Version: "6.0.1", Status: components.PluginStatusRequired},
 				{Name: "adyen", Version: "0.10.0", Status: components.PluginStatusPinnedNotInstalled},
 				{Name: "paypal-express", Status: components.PluginStatusNoJavaArtifact},
 			},
@@ -148,6 +148,11 @@ func TestKeycloakBadAdminPasswordAndUnreachable(t *testing.T) {
 
 func killBillServer(t *testing.T, kbVersion string, healthy bool, plugins []map[string]any) *httptest.Server {
 	t.Helper()
+	return killBillNodesServer(t, healthy, []map[string]any{{"kbVersion": kbVersion, "pluginsInfo": plugins}})
+}
+
+func killBillNodesServer(t *testing.T, healthy bool, nodes []map[string]any) *httptest.Server {
+	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /1.0/healthcheck", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -162,7 +167,7 @@ func killBillServer(t *testing.T, kbVersion string, healthy bool, plugins []map[
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		_ = json.NewEncoder(w).Encode([]map[string]any{{"kbVersion": kbVersion, "pluginsInfo": plugins}})
+		_ = json.NewEncoder(w).Encode(nodes)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -191,9 +196,12 @@ func TestKillBillMatchesPin(t *testing.T) {
 		}
 	}
 	for _, f := range fs {
-		if f.Status != OK {
+		if f.Status != OK && f.Check != "plugin_tables" {
 			t.Errorf("unexpected finding %v", f)
 		}
+	}
+	if f := find(t, fs, "killbill", "plugin_tables"); f.Status != Skip || !strings.Contains(f.Message, "ZS_KILLBILL_DATABASE_URL") {
+		t.Errorf("plugin tables without the database = %v", f)
 	}
 }
 
@@ -258,20 +266,205 @@ func TestKillBillMismatchedVersionAndPlugin(t *testing.T) {
 	if f := find(t, fs, "killbill", "version"); f.Status != Fail || !strings.Contains(f.Message, "0.24.21") {
 		t.Fatalf("version finding = %v", f)
 	}
-	var stripeFail, customWarn bool
+	var stripeFail, customFail bool
 	for _, f := range fs {
 		if f.Check == "plugin" && f.Status == Fail && strings.Contains(f.Message, "stripe") && strings.Contains(f.Message, "6.0.1") {
 			stripeFail = true
 		}
-		if f.Check == "plugin" && f.Status == Warn && strings.Contains(f.Message, "custom") {
-			customWarn = true
+		if f.Check == "plugin" && f.Status == Fail && strings.Contains(f.Message, "custom") && strings.Contains(f.Message, "not listed in components.yaml") {
+			customFail = true
 		}
 	}
-	if !stripeFail || !customWarn {
-		t.Fatalf("plugin findings missing (stripeFail=%v customWarn=%v): %v", stripeFail, customWarn, fs)
+	if !stripeFail || !customFail {
+		t.Fatalf("plugin findings missing (stripeFail=%v customFail=%v): %v", stripeFail, customFail, fs)
 	}
 	if len(report.Plugins) != 3 {
 		t.Fatalf("plugins = %+v", report.Plugins)
+	}
+}
+
+func TestUnlistedPluginsFailTheReleaseReport(t *testing.T) {
+	for _, tc := range []struct {
+		name, state string
+		wantFail    bool
+	}{
+		{name: "approved plugin and platform bundle"},
+		{name: "unlisted running plugin", state: "RUNNING", wantFail: true},
+		{name: "unlisted stopped plugin", state: "STOPPED", wantFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugins := []map[string]any{platformBundle, runningStripe}
+			if tc.state != "" {
+				plugins = append(plugins, map[string]any{
+					"pluginKey": "custom", "pluginName": "custom-plugin", "version": "1.0.0", "state": tc.state,
+				})
+			}
+			kb := killBillServer(t, "0.24.22", true, plugins)
+			kc := keycloakServer(t, "26.8.1", "zs-reference")
+			now := time.Now()
+			m := manifest()
+			m.KillBillPlugins.PlatformBundlesInImage = []string{"kpm 0.41.23 (KPM OSGi bundle)"}
+			report := Run(context.Background(), Options{
+				Manifest:   m,
+				Database:   fakeDB{version: "18.1", dbNow: func() time.Time { return now }},
+				Keycloak:   Target{URL: kc.URL, AdminUser: "admin", AdminPassword: "pw", Realm: "zs-reference"},
+				KillBill:   Target{URL: kb.URL, AdminUser: "admin", AdminPassword: "pw"},
+				HTTPClient: http.DefaultClient,
+				Now:        func() time.Time { return now },
+				PluginTables: func(context.Context, components.Plugin) ([]string, error) {
+					return nil, nil
+				},
+			})
+			if report.Failed() != tc.wantFail || report.OK == tc.wantFail || report.Skipped() {
+				t.Fatalf("release gate: failed=%t ok=%t skipped=%t, findings=%v", report.Failed(), report.OK, report.Skipped(), report.Findings)
+			}
+			failures := 0
+			for _, f := range report.Findings {
+				if f.Status != Fail {
+					continue
+				}
+				failures++
+				if f.Component != components.KillBill || f.Check != "plugin" ||
+					!strings.Contains(f.Message, "custom version 1.0.0 is not listed in components.yaml ("+tc.state+")") {
+					t.Fatalf("unrelated failure masked the plugin gate: %v", f)
+				}
+			}
+			if tc.wantFail && failures != 1 {
+				t.Fatalf("want exactly one unlisted-plugin failure, got %d", failures)
+			}
+			if f := find(t, report.Findings, components.KillBill, "plugins"); f.Status != OK || !strings.Contains(f.Message, "1 platform bundle(s)") {
+				t.Fatalf("platform bundle exemption changed: %v", f)
+			}
+			var output bytes.Buffer
+			if err := report.WriteJSON(&output); err != nil {
+				t.Fatal(err)
+			}
+			var decoded Report
+			if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.OK == tc.wantFail || decoded.Failed() != tc.wantFail || decoded.CoreRelease != m.CoreRelease {
+				t.Fatalf("JSON release result = %+v", decoded)
+			}
+		})
+	}
+}
+
+func TestKillBillChecksPluginsOnEveryNode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		plugins []map[string]any
+		failure string
+	}{
+		{name: "all nodes match", plugins: []map[string]any{platformBundle, runningStripe}},
+		{name: "second node has unknown running plugin", plugins: []map[string]any{platformBundle, runningStripe,
+			{"pluginKey": "custom", "version": "1.0.0", "state": "RUNNING"}}, failure: "custom version 1.0.0 is not listed"},
+		{name: "second node has unknown stopped plugin", plugins: []map[string]any{platformBundle, runningStripe,
+			{"pluginKey": "custom", "version": "1.0.0", "state": "STOPPED"}}, failure: "custom version 1.0.0 is not listed"},
+		{name: "second node lacks required plugin", plugins: []map[string]any{platformBundle}, failure: "stripe 6.0.1 is not installed"},
+		{name: "second node has wrong plugin version", plugins: []map[string]any{platformBundle,
+			{"pluginKey": "stripe", "version": "8.0.3", "state": "RUNNING"}}, failure: "stripe version 8.0.3 does not match the pin 6.0.1"},
+		{name: "second node has stopped required plugin", plugins: []map[string]any{platformBundle,
+			{"pluginKey": "stripe", "version": "6.0.1", "state": "STOPPED"}}, failure: "stripe is STOPPED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := killBillNodesServer(t, true, []map[string]any{
+				{"nodeName": "node-a", "kbVersion": "0.24.22", "pluginsInfo": []map[string]any{platformBundle, runningStripe}},
+				{"nodeName": "node-b", "kbVersion": "0.24.22", "pluginsInfo": tc.plugins},
+			})
+			m := manifest()
+			m.KillBillPlugins.PlatformBundlesInImage = []string{"kpm 0.41.23 (KPM OSGi bundle)"}
+			_, findings := checkKillBill(context.Background(), Options{
+				Manifest: m, HTTPClient: srv.Client(),
+				KillBill:     Target{URL: srv.URL, AdminUser: "admin", AdminPassword: "pw"},
+				PluginTables: func(context.Context, components.Plugin) ([]string, error) { return nil, nil },
+			})
+			report := Report{Findings: findings}
+			if report.Failed() != (tc.failure != "") || report.Skipped() {
+				t.Fatalf("node-b gate: failed=%t skipped=%t findings=%v", report.Failed(), report.Skipped(), findings)
+			}
+			var failures int
+			for _, f := range findings {
+				if f.Status == Fail {
+					failures++
+					if f.Check != "plugin" || !strings.Contains(f.Message, tc.failure) || !strings.Contains(f.Message, `node "node-b"`) {
+						t.Fatalf("unrelated failure masked the second-node defect: %v", f)
+					}
+				}
+			}
+			if tc.failure != "" && failures != 1 {
+				t.Fatalf("expected one second-node failure, got %d", failures)
+			}
+		})
+	}
+}
+
+func TestKillBillChecksTablesForOptionalPluginOnSecondNode(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		installed bool
+		missing   bool
+	}{
+		{name: "optional plugin absent"},
+		{name: "optional plugin tables present", installed: true},
+		{name: "optional plugin tables missing", installed: true, missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tablesManifest()
+			optional := m.KillBillPlugins.Installable[0]
+			if optional.Required() {
+				t.Fatal("fixture must not require the optional plugin")
+			}
+			secondPlugins := []map[string]any{platformBundle, runningStripe}
+			if tc.installed {
+				secondPlugins = append(secondPlugins, map[string]any{
+					"pluginKey": optional.Name, "version": optional.Version, "state": "RUNNING",
+				})
+			}
+			srv := killBillNodesServer(t, true, []map[string]any{
+				{"nodeName": "node-a", "kbVersion": "0.24.22", "pluginsInfo": []map[string]any{platformBundle, runningStripe}},
+				{"nodeName": "node-b", "kbVersion": "0.24.22", "pluginsInfo": secondPlugins},
+			})
+			var asked []string
+			component, findings := checkKillBill(context.Background(), Options{
+				Manifest: m, HTTPClient: srv.Client(),
+				KillBill: Target{URL: srv.URL, AdminUser: "admin", AdminPassword: "pw"},
+				PluginTables: func(_ context.Context, pin components.Plugin) ([]string, error) {
+					asked = append(asked, pin.Name)
+					if pin.Name == optional.Name && tc.missing {
+						return optional.Tables, nil
+					}
+					return nil, nil
+				},
+			})
+			wantAsked := "stripe"
+			if tc.installed {
+				wantAsked += "," + optional.Name
+			}
+			if strings.Join(asked, ",") != wantAsked {
+				t.Fatalf("table checks = %v, want %s", asked, wantAsked)
+			}
+			if len(component.Plugins) != 2 || component.Plugins[0].Key != "" || component.Plugins[1].Key != "stripe" {
+				t.Fatalf("first-node plugin summary changed: %+v", component.Plugins)
+			}
+			report := Report{Findings: findings}
+			if report.Failed() != tc.missing || report.Skipped() {
+				t.Fatalf("optional plugin table gate: failed=%t skipped=%t findings=%v", report.Failed(), report.Skipped(), findings)
+			}
+			var failures int
+			for _, f := range findings {
+				if f.Status != Fail {
+					continue
+				}
+				failures++
+				if f.Check != "plugin_tables" || !strings.Contains(f.Message, "plugin "+optional.Name+" "+optional.Version+" tables missing: "+optional.Tables[0]) {
+					t.Fatalf("unrelated failure masked the optional plugin tables: %v", f)
+				}
+			}
+			if tc.missing && failures != 1 {
+				t.Fatalf("expected one optional plugin table failure, got %d", failures)
+			}
+		})
 	}
 }
 
@@ -416,7 +609,7 @@ func TestRunAggregatesAndRenders(t *testing.T) {
 	if err := json.Unmarshal(js.Bytes(), &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.OK || decoded.CoreRelease != "1.0.0-test" || len(decoded.Components) != 5 {
+	if decoded.OK || decoded.CoreRelease != "1.0.0-test" || len(decoded.Components) != 7 {
 		t.Fatalf("decoded = %+v", decoded)
 	}
 }

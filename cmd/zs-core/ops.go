@@ -16,6 +16,7 @@ import (
 	"github.com/zsoftly/zs-core/internal/config"
 	"github.com/zsoftly/zs-core/internal/database"
 	"github.com/zsoftly/zs-core/internal/doctor"
+	"github.com/zsoftly/zs-core/internal/kbplugin"
 	"github.com/zsoftly/zs-core/internal/upgrade"
 	"github.com/zsoftly/zs-core/migrations"
 )
@@ -73,13 +74,25 @@ func runDoctor(args, environ []string, stdout, stderr io.Writer) int {
 		db = doctor.PGDatabase{DB: pool, Migrations: migrations.FS}
 	}
 
-	report := doctor.Run(ctx, doctor.Options{
-		Manifest: manifest,
-		Database: db,
-		Keycloak: doctor.Target{URL: cfg.KeycloakURL, AdminUser: cfg.KeycloakAdminUser, AdminPassword: cfg.KeycloakAdminPassword, Realm: cfg.KeycloakRealm},
-		KillBill: doctor.Target{URL: cfg.KillBillURL, AdminUser: cfg.KillBillAdminUser, AdminPassword: cfg.KillBillAdminPassword},
-		KAUI:     doctor.Target{URL: cfg.KAUIURL},
-	})
+	opts := doctor.Options{
+		Manifest:       manifest,
+		Database:       db,
+		Keycloak:       doctor.Target{URL: cfg.KeycloakURL, AdminUser: cfg.KeycloakAdminUser, AdminPassword: cfg.KeycloakAdminPassword, Realm: cfg.KeycloakRealm},
+		KillBill:       doctor.Target{URL: cfg.KillBillURL, AdminUser: cfg.KillBillAdminUser, AdminPassword: cfg.KillBillAdminPassword},
+		KAUI:           doctor.Target{URL: cfg.KAUIURL},
+		Mirror:         doctor.MirrorOptions{Dir: cfg.PluginMirrorDir, URL: cfg.PluginMirrorURL, Secret: []byte(cfg.PluginMirrorSecret)},
+		PDFRendererURL: cfg.PDFRendererURL,
+	}
+	if cfg.KillBillDatabaseURL != "" {
+		kbPool, err := database.Open(ctx, database.Options{URL: cfg.KillBillDatabaseURL, MaxConns: 2})
+		if err != nil {
+			opts.PluginTables = func(context.Context, components.Plugin) ([]string, error) { return nil, err }
+		} else {
+			defer kbPool.Close()
+			opts.PluginTables = tablesIn(kbPool)
+		}
+	}
+	report := doctor.Run(ctx, opts)
 	if *asJSON {
 		err = report.WriteJSON(stdout)
 	} else {
@@ -99,6 +112,14 @@ func doctorExitCode(report doctor.Report, allowSkips bool) int {
 		return 1
 	}
 	return 0
+}
+
+// tablesIn returns the check of a plugin's tables in the Kill Bill database
+// that doctor and brand apply run.
+func tablesIn(kb kbplugin.Querier) func(context.Context, components.Plugin) ([]string, error) {
+	return func(ctx context.Context, pin components.Plugin) ([]string, error) {
+		return kbplugin.MissingTables(ctx, kb, pin)
+	}
 }
 
 // failedDatabase reports a connection error as a doctor finding instead of

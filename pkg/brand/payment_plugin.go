@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/zsoftly/zs-core/internal/components"
+	"github.com/zsoftly/zs-core/internal/kbplugin"
 	"github.com/zsoftly/zs-core/internal/killbill"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/idgen"
@@ -50,8 +51,12 @@ const (
 	adyenEnvironmentKey   = "org.killbill.billing.plugin.adyen.enviroment"
 	adyenEnvironmentKey2  = "org.killbill.billing.plugin.adyen.environment"
 	adyenTestEnvironment  = "TEST"
+	avataxURLKey          = "org.killbill.billing.plugin.avatax.url"
+	avataxTaxRatesURLKey  = "org.killbill.billing.plugin.avatax.taxratesapi.url"
+	avataxSandboxHost     = "sandbox-rest.avatax.com"
 	pluginNameStripe      = "stripe"
 	pluginNameAdyen       = "adyen"
+	pluginNameAvaTax      = "avatax"
 	maxPluginConfigLength = 64 << 10
 )
 
@@ -59,29 +64,36 @@ func pluginUnavailable(message string) error {
 	return zserrors.New(zserrors.CodePluginUnavailable, message)
 }
 
-// approvedPlugin returns the components.yaml pin of the manifest's payment
-// plugin. A plugin that is not approved, or that has no Java artifact, is
-// plugin_unavailable. A manifest version other than the pin is refused.
+// approvedPlugin returns the components.yaml pin of a payment plugin of
+// the manifest. A plugin that is not approved, or that has no Java
+// artifact, is plugin_unavailable. A manifest version other than the pin is
+// refused.
 func approvedPlugin(approved []components.Plugin, pp *PaymentPlugin) (components.Plugin, error) {
+	return approvedPin(approved, "payment", "approved_payment_plugins", "/billing/payment_plugins", pp.Name, pp.Version)
+}
+
+// approvedPin finds a plugin in a components.yaml list. kind and list name
+// the plugin kind and the list for the messages, path the manifest field.
+func approvedPin(approved []components.Plugin, kind, list, path, name, version string) (components.Plugin, error) {
 	if approved == nil {
-		return components.Plugin{}, pluginUnavailable("The approved payment plugins are not loaded: brand apply needs components.yaml.")
+		return components.Plugin{}, pluginUnavailable("The approved " + kind + " plugins are not loaded: brand apply needs components.yaml.")
 	}
 	for _, p := range approved {
-		if p.Name != pp.Name {
+		if p.Name != name {
 			continue
 		}
 		if p.Status == components.PluginStatusNoJavaArtifact || p.Version == "" || p.Artifact == "" {
-			return components.Plugin{}, pluginUnavailable("The payment plugin " + pp.Name + " has no Java artifact that Kill Bill 0.24 can install.")
+			return components.Plugin{}, pluginUnavailable("The " + kind + " plugin " + name + " has no Java artifact that Kill Bill 0.24 can install.")
 		}
 		if p.Sha256 == "" {
-			return components.Plugin{}, pluginUnavailable("The payment plugin " + pp.Name + " has no sha256 in components.yaml, so Core cannot check its jar.")
+			return components.Plugin{}, pluginUnavailable("The " + kind + " plugin " + name + " has no sha256 in components.yaml, so Core cannot check its jar.")
 		}
-		if pp.Version != "" && pp.Version != p.Version {
-			return components.Plugin{}, invalid([]string{"/billing/payment_plugin/version: " + pp.Version + " is not the pinned version " + p.Version + " in components.yaml"})
+		if version != "" && version != p.Version {
+			return components.Plugin{}, invalid([]string{path + "/version: " + version + " is not the pinned version " + p.Version + " in components.yaml"})
 		}
 		return p, nil
 	}
-	return components.Plugin{}, pluginUnavailable("The payment plugin " + pp.Name + " is not in approved_payment_plugins in components.yaml.")
+	return components.Plugin{}, pluginUnavailable("The " + kind + " plugin " + name + " is not in " + list + " in components.yaml.")
 }
 
 // testModeRule is what Core knows about one payment plugin's test mode.
@@ -97,7 +109,11 @@ type testModeRule struct {
 var testModeRules = map[string]testModeRule{
 	pluginNameStripe: {forbid: stripeForbid, require: stripeRequire},
 	pluginNameAdyen:  {forbid: adyenForbid, require: adyenRequire},
+	pluginNameAvaTax: {forbid: avataxForbid, require: avataxRequire},
 }
+
+// testModeRuleNames are the plugins with a test-mode rule, in a fixed order.
+var testModeRuleNames = []string{pluginNameAdyen, pluginNameAvaTax, pluginNameStripe}
 
 func applyRejected(message string) error {
 	return zserrors.New(zserrors.CodeBrandApplyRejected, message)
@@ -130,6 +146,28 @@ func adyenForbid(p properties) error {
 	return nil
 }
 
+// avataxForbid refuses an AvaTax endpoint other than the AvaTax sandbox,
+// https://sandbox-rest.avatax.com, the endpoint the plugin's documentation
+// gives for tests. A production endpoint records real tax documents.
+func avataxForbid(p properties) error {
+	for _, key := range []string{avataxURLKey, avataxTaxRatesURLKey} {
+		for _, v := range p.all(key) {
+			u, err := url.Parse(strings.TrimSpace(v))
+			if err != nil || u.Scheme != "https" || u.Hostname() != avataxSandboxHost || u.User != nil {
+				return applyRejected("The configuration sets an AvaTax endpoint other than the AvaTax sandbox. v1 accepts only https://" + avataxSandboxHost + ", under any plugin.")
+			}
+		}
+	}
+	return nil
+}
+
+func avataxRequire(p properties) error {
+	if len(p.all(avataxURLKey)) == 0 {
+		return applyRejected("The AvaTax configuration must set " + avataxURLKey + " to the AvaTax sandbox, https://" + avataxSandboxHost + "/api/v2.")
+	}
+	return nil
+}
+
 func adyenRequire(p properties) error {
 	if len(p.all(adyenEnvironmentKey)) == 0 {
 		return applyRejected("The Adyen configuration must set " + adyenEnvironmentKey + " to TEST. An unset environment is not accepted.")
@@ -148,7 +186,7 @@ func adyenRequire(p properties) error {
 func CheckTestMode(plugin, config string) error {
 	rule, ok := testModeRules[plugin]
 	if !ok {
-		return pluginUnavailable("The payment plugin " + plugin + " has no test-mode rule in Core, so v1 cannot enable it.")
+		return pluginUnavailable("The plugin " + plugin + " has no test-mode rule in Core, so v1 cannot enable it.")
 	}
 	if len(config) > maxPluginConfigLength {
 		return applyRejected("The payment plugin configuration is larger than 64 KiB.")
@@ -160,7 +198,7 @@ func CheckTestMode(plugin, config string) error {
 	if err != nil {
 		return err
 	}
-	for _, name := range []string{pluginNameStripe, pluginNameAdyen} {
+	for _, name := range testModeRuleNames {
 		if err := testModeRules[name].forbid(props); err != nil {
 			return err
 		}
@@ -409,74 +447,60 @@ func continues(line string) bool {
 	return n%2 == 1
 }
 
-// ArtifactURL is the address of a plugin jar in a Maven repository: the
-// artifact group:name and the version of components.yaml under the
-// repository base URL.
+// ArtifactURL is the address of a plugin jar in a Maven repository. See
+// kbplugin.ArtifactURL.
 func ArtifactURL(repository string, p components.Plugin) (string, error) {
-	group, name, ok := strings.Cut(p.Artifact, ":")
-	if !ok || group == "" || name == "" || strings.ContainsAny(p.Artifact+p.Version, "/\\ ") || p.Version == "" {
-		return "", fmt.Errorf("plugin %s: artifact %q is not group:name", p.Name, p.Artifact)
-	}
-	if repository == "" {
-		return "", errors.New("killbill_plugins.repository is not set in components.yaml")
-	}
-	if err := CheckPluginRepository(repository); err != nil {
-		return "", err
-	}
-	return strings.TrimRight(repository, "/") + "/" + strings.ReplaceAll(group, ".", "/") + "/" + name + "/" + p.Version + "/" + name + "-" + p.Version + ".jar", nil
+	return kbplugin.ArtifactURL(repository, p)
 }
 
 // CheckPluginRepository refuses a plugin repository that is not an https
 // URL, so a plugin jar is never fetched in clear.
-func CheckPluginRepository(repository string) error {
-	u, err := url.Parse(repository)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
-		return errors.New("killbill_plugins.repository is not an https URL")
-	}
-	return nil
-}
+func CheckPluginRepository(repository string) error { return kbplugin.CheckRepository(repository) }
 
 // maxPluginJarBytes caps the download of a plugin jar.
-const maxPluginJarBytes = 512 << 20
+const maxPluginJarBytes = kbplugin.MaxJarBytes
 
-// verifyPluginJar downloads the jar at uri and compares its SHA-256 with the
-// pin of components.yaml. Core checks the jar this way and then lets KPM
-// download the same URL, because Core cannot hand KPM a file on the Kill
-// Bill node. Between the two downloads the repository could serve another
-// jar. Phase 5 closes that window with an artifact mirror that Core hosts.
+// verifyPluginJar checks access to the configured mirror and compares its
+// answer with the pin before Core asks KPM to install. KPM then downloads
+// from the same verified mirror, which hashes and serves a fresh immutable
+// snapshot for every request. A repository URL is never an install source.
 func verifyPluginJar(ctx context.Context, client *http.Client, uri string, pin components.Plugin) error {
 	if client == nil {
 		client = &http.Client{Timeout: PluginWait}
 	}
+	hc := *client
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
 	if err != nil {
-		return pluginUnavailable("The payment plugin " + pin.Name + " cannot be downloaded: its address is not valid.")
+		return pluginUnavailable("The plugin " + pin.Name + " cannot be downloaded: its address is not valid.")
 	}
-	resp, err := client.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
-		return &killbill.Unavailable{Op: "download plugin " + pin.Name, Err: err}
+		// Transport errors can include the request URL and its jar token.
+		return &killbill.Unavailable{Op: "download plugin " + pin.Name, Err: errors.New("the plugin mirror request failed")}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return &killbill.Unavailable{Op: "download plugin " + pin.Name, Status: resp.StatusCode, Err: fmt.Errorf("the repository answered HTTP %d", resp.StatusCode)}
+		return &killbill.Unavailable{Op: "download plugin " + pin.Name, Status: resp.StatusCode, Err: fmt.Errorf("the plugin mirror answered HTTP %d", resp.StatusCode)}
 	}
 	h := sha256.New()
 	n, err := io.Copy(h, io.LimitReader(resp.Body, maxPluginJarBytes+1))
 	if err != nil {
-		return &killbill.Unavailable{Op: "download plugin " + pin.Name, Err: err}
+		return &killbill.Unavailable{Op: "download plugin " + pin.Name, Err: errors.New("the plugin mirror response could not be read")}
 	}
 	if n > maxPluginJarBytes {
-		return zserrors.New(zserrors.CodeBrandApplyRejected, "The payment plugin "+pin.Name+" jar is larger than 512 MiB.")
+		return zserrors.New(zserrors.CodeBrandApplyRejected, "The plugin "+pin.Name+" jar is larger than 256 MiB.")
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); !hmac.Equal([]byte(got), []byte(pin.Sha256)) {
-		return zserrors.New(zserrors.CodeBrandApplyRejected, "The payment plugin "+pin.Name+" jar does not match the sha256 in components.yaml. Core did not install it.")
+		return zserrors.New(zserrors.CodeBrandApplyRejected, "The plugin "+pin.Name+" jar does not match the sha256 in components.yaml. Core did not install it.")
 	}
 	return nil
 }
 
-// planPlugin plans the KPM install and start of the brand's payment plugin.
-// It returns no change when the pinned version is RUNNING on every node.
-func planPlugin(ctx context.Context, deps Deps, m *Manifest, pin components.Plugin) ([]Change, error) {
+// planPlugin plans the KPM install and start of a plugin the brand uses. It
+// returns no change when the pinned version is RUNNING on every node.
+func planPlugin(ctx context.Context, deps Deps, u pluginUse) ([]Change, error) {
+	pin := u.pin
 	kb := deps.KillBill
 	nodes, err := kb.NodesInfo(ctx)
 	if err != nil {
@@ -494,7 +518,7 @@ func planPlugin(ctx context.Context, deps Deps, m *Manifest, pin components.Plug
 			install = true
 		case info.Version != pin.Version:
 			return nil, zserrors.New(zserrors.CodeBrandApplyRejected, fmt.Sprintf(
-				"Kill Bill runs payment plugin %s %s, but components.yaml pins %s. Follow docs/upgrades/killbill.md to change plugin versions.", pin.Name, info.Version, pin.Version))
+				"Kill Bill runs %s plugin %s %s, but components.yaml pins %s. Follow docs/upgrades/killbill.md to change plugin versions.", u.kind, pin.Name, info.Version, pin.Version))
 		case info.State != pluginStateRunning:
 			start = true
 			before = strings.ToLower(info.State)
@@ -503,22 +527,23 @@ func planPlugin(ctx context.Context, deps Deps, m *Manifest, pin components.Plug
 	if !install && !start {
 		return nil, nil
 	}
-	uri := ""
+	src := installSource{}
 	if install {
-		if uri, err = ArtifactURL(deps.PluginRepository, pin); err != nil {
-			return nil, pluginUnavailable("The payment plugin " + pin.Name + " cannot be installed: " + err.Error() + ".")
+		if src, err = pluginSource(deps, u); err != nil {
+			return nil, err
 		}
 	}
 	action := ActionUpdate
-	fields := []FieldChange{{Field: "billing.payment_plugin.state", Before: before, After: "running"}}
+	field := u.field
+	fields := []FieldChange{{Field: field + ".state", Before: before, After: "running"}}
 	if install {
 		action = ActionCreate
-		fields = append([]FieldChange{{Field: "billing.payment_plugin.version", After: pin.Version}}, fields...)
+		fields = append([]FieldChange{{Field: field + ".version", After: pin.Version}, {Field: field + ".source", After: src.name}}, fields...)
 	}
 	return []Change{{
 		Target: TargetPlugin, Name: pin.Name, Action: action, Fields: fields,
 		run: func(ctx context.Context, st *runState) error {
-			return installPlugin(ctx, st, pin, uri, install)
+			return installPlugin(ctx, st, pin, src, install)
 		},
 	}}, nil
 }
@@ -532,14 +557,41 @@ func findPlugin(n killbill.NodeInfo, key string) (killbill.PluginInfo, bool) {
 	return killbill.PluginInfo{}, false
 }
 
+// installSource is the verified mirror KPM downloads a jar from. name is
+// shown in the diff. The URL holds a token and is never shown.
+type installSource struct {
+	name   string
+	uri    string
+	mirror bool
+}
+
+// pluginSource requires the Core mirror so KPM only receives verified bytes.
+func pluginSource(deps Deps, u pluginUse) (installSource, error) {
+	if deps.PluginMirrorURL == "" {
+		return installSource{}, pluginUnavailable("Installing a plugin requires ZS_PLUGIN_MIRROR_URL and ZS_PLUGIN_MIRROR_SECRET for Core's verified mirror. Sync the mirror before applying the brand.")
+	}
+	uri, err := kbplugin.MirrorURL(deps.PluginMirrorURL, deps.PluginMirrorSecret, u.pin)
+	if err != nil {
+		return installSource{}, pluginUnavailable("The " + u.kind + " plugin " + u.pin.Name + " cannot be installed from the mirror: " + err.Error() + ".")
+	}
+	return installSource{name: "mirror", uri: uri, mirror: true}, nil
+}
+
 // installPlugin sends the KPM commands, waits for the plugin to run on every
 // node and records it in killbill_plugin_installs.
-func installPlugin(ctx context.Context, st *runState, pin components.Plugin, uri string, install bool) error {
+func installPlugin(ctx context.Context, st *runState, pin components.Plugin, src installSource, install bool) error {
 	kb := st.deps.KillBill
 	cc := st.callContext()
 	installedAt := time.Now().UTC()
 	if install {
-		if err := verifyPluginJar(ctx, st.deps.PluginHTTP, uri, pin); err != nil {
+		want, err := pluginSource(st.deps, pluginUse{pin: pin})
+		if err != nil {
+			return err
+		}
+		if !src.mirror || !secretEqual(src.uri, want.uri) {
+			return pluginUnavailable("The plugin install source must be Core's configured verified mirror.")
+		}
+		if err := verifyPluginJar(ctx, st.deps.PluginHTTP, src.uri, pin); err != nil {
 			return err
 		}
 		// The bundle builds the download address with a doubled slash
@@ -547,7 +599,7 @@ func installPlugin(ctx context.Context, st *runState, pin components.Plugin, uri
 		if err := kb.SendNodeCommand(ctx, cc, killbill.NodeCommand{
 			NodeCommandType: killbill.NodeCommandInstallPlugin, IsSystemCommandType: true,
 			NodeCommandProperties: []killbill.NodeCommandProperty{
-				{Key: "pluginKey", Value: pin.Name}, {Key: "pluginVersion", Value: pin.Version}, {Key: "pluginUri", Value: uri},
+				{Key: "pluginKey", Value: pin.Name}, {Key: "pluginVersion", Value: pin.Version}, {Key: "pluginUri", Value: src.uri},
 			},
 		}); err != nil {
 			return err
@@ -585,14 +637,32 @@ ON CONFLICT (plugin, version, node) DO UPDATE SET started_at = EXCLUDED.started_
 // waitForPlugin polls the nodes until the plugin is on every node and ok
 // holds for it, and returns the node names.
 func waitForPlugin(ctx context.Context, kb *killbill.Client, pin components.Plugin, ok func(killbill.PluginInfo) bool) ([]string, error) {
+	return waitForPluginNodes(ctx, kb, pin, nil, func(_ string, p killbill.PluginInfo) bool { return ok(p) })
+}
+
+// waitForPluginNodes optionally fixes the node set for an operation, so a
+// disappearing node cannot turn an incomplete restart into a success.
+func waitForPluginNodes(ctx context.Context, kb *killbill.Client, pin components.Plugin, expected map[string]bool, ok func(string, killbill.PluginInfo) bool) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, PluginWait)
 	defer cancel()
 	for {
 		nodes, err := kb.NodesInfo(ctx)
+		if err == nil && expected != nil {
+			seen := map[string]bool{}
+			for _, n := range nodes {
+				if !expected[n.NodeName] || seen[n.NodeName] {
+					return nil, &killbill.Unavailable{Op: "wait for plugin " + pin.Name, Err: errors.New("the Kill Bill node set changed during the operation")}
+				}
+				seen[n.NodeName] = true
+			}
+			if len(seen) != len(expected) {
+				return nil, &killbill.Unavailable{Op: "wait for plugin " + pin.Name, Err: errors.New("a target Kill Bill node disappeared during the operation")}
+			}
+		}
 		if err == nil && len(nodes) > 0 {
 			var names []string
 			for _, n := range nodes {
-				if p, found := findPlugin(n, pin.Name); found && p.Version == pin.Version && ok(p) {
+				if p, found := findPlugin(n, pin.Name); found && p.Version == pin.Version && ok(n.NodeName, p) {
 					names = append(names, n.NodeName)
 				}
 			}

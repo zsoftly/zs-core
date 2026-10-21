@@ -157,6 +157,7 @@ type request struct {
 	tenant      *TenantCredentials
 	call        *CallContext
 	contentType string
+	accept      string
 	body        []byte
 }
 
@@ -170,7 +171,11 @@ func (c *Client) do(ctx context.Context, r request) (upstream.Response, error) {
 		return upstream.Response{}, err
 	}
 	req.SetBasicAuth(c.cfg.AdminUser, c.cfg.AdminPassword)
-	req.Header.Set("Accept", "application/json")
+	accept := r.accept
+	if accept == "" {
+		accept = "application/json"
+	}
+	req.Header.Set("Accept", accept)
 	if r.contentType != "" {
 		req.Header.Set("Content-Type", r.contentType)
 	}

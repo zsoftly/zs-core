@@ -125,6 +125,9 @@ type Principal struct {
 	EmailVerified bool
 	Name          string
 	Username      string
+	// Locale is the user's locale from the token's locale claim, such as
+	// fr, when Keycloak sends one.
+	Locale string
 	// AuthTime is when the user last authenticated interactively. Zero when
 	// the token does not say.
 	AuthTime  time.Time
@@ -174,6 +177,7 @@ type claims struct {
 	EmailVerified json.RawMessage `json:"email_verified"`
 	Name          string          `json:"name"`
 	Username      string          `json:"preferred_username"`
+	Locale        string          `json:"locale"`
 	AMR           []string        `json:"amr"`
 	ACR           string          `json:"acr"`
 }
@@ -289,6 +293,7 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Principal, error) {
 		Email:     c.Email,
 		Name:      c.Name,
 		Username:  c.Username,
+		Locale:    c.Locale,
 		ExpiresAt: exp,
 		MFA:       mfaFrom(c.AMR, c.ACR, brand.MFAACRValues),
 	}

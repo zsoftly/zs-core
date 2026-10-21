@@ -19,6 +19,8 @@ type Account struct {
 	Name           string      `json:"name"`
 	Currency       string      `json:"currency"`
 	Country        string      `json:"country,omitempty"`
+	Email          string      `json:"email,omitempty"`
+	Locale         string      `json:"locale,omitempty"`
 	AccountBalance json.Number `json:"accountBalance,omitempty"`
 	AccountCBA     json.Number `json:"accountCBA,omitempty"`
 }

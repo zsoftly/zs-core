@@ -221,7 +221,7 @@ func (s *server) ensurePersonalTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, created, err := tenant.EnsurePersonal(ctx, db, s.tenants, tenant.CreateRequest{
-		Brand: p.Brand.ID, Creator: ident.ID, Name: ident.DisplayName,
+		Brand: p.Brand.ID, Creator: ident.ID, Name: ident.DisplayName, Locale: p.Locale,
 		Actor: events.Actor{Type: events.ActorUser, ID: ident.PublicID()}, CorrelationID: RequestID(ctx),
 	})
 	if err != nil {
@@ -253,7 +253,7 @@ func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req := tenant.CreateRequest{
-		Brand: p.Brand.ID, Creator: ident.ID, Name: body.Name, IdempotencyKey: body.IdempotencyKey,
+		Brand: p.Brand.ID, Creator: ident.ID, Name: body.Name, IdempotencyKey: body.IdempotencyKey, Locale: p.Locale,
 		Actor: events.Actor{Type: events.ActorUser, ID: ident.PublicID()}, CorrelationID: RequestID(ctx),
 	}
 	if body.BillingCountry != nil {

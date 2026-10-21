@@ -524,10 +524,13 @@ func (c *Client) NodesInfo(ctx context.Context) ([]NodeInfo, error) {
 	return out, nil
 }
 
-// Node command types Core sends to the KPM bundle.
+// Node command types Core sends through Kill Bill. KPM handles installation;
+// the OSGi listener handles plugin lifecycle commands.
 const (
 	NodeCommandInstallPlugin = "INSTALL_PLUGIN"
+	NodeCommandStopPlugin    = "STOP_PLUGIN"
 	NodeCommandStartPlugin   = "START_PLUGIN"
+	NodeCommandRestartPlugin = "RESTART_PLUGIN"
 )
 
 // NodeCommandProperty is a key and value of a node command.
@@ -536,8 +539,7 @@ type NodeCommandProperty struct {
 	Value string `json:"value"`
 }
 
-// NodeCommand is a command for the KPM bundle. INSTALL_PLUGIN is a system
-// command that every node runs.
+// NodeCommand is a command broadcast through the Kill Bill nodesInfo API.
 type NodeCommand struct {
 	NodeCommandType       string                `json:"nodeCommandType"`
 	IsSystemCommandType   bool                  `json:"isSystemCommandType"`

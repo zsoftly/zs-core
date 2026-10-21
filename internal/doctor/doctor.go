@@ -133,6 +133,15 @@ type Options struct {
 	HTTPClient   *http.Client
 	Now          func() time.Time
 	MaxClockSkew time.Duration
+	// PluginTables returns the tables of a plugin that the Kill Bill
+	// database lacks. It reads the database of ZS_KILLBILL_DATABASE_URL.
+	// Without it the plugin tables are not checked and doctor reports a
+	// skip.
+	PluginTables func(ctx context.Context, pin components.Plugin) ([]string, error)
+	// Mirror is the plugin mirror of the deployment.
+	Mirror MirrorOptions
+	// PDFRendererURL is ZS_PDF_RENDERER_URL.
+	PDFRendererURL string
 }
 
 // Run performs every check and returns the report. Checks of different
@@ -159,6 +168,8 @@ func Run(ctx context.Context, opts Options) Report {
 	add(one(checkKeycloak(ctx, opts)))
 	add(one(checkKillBill(ctx, opts)))
 	add(one(checkKAUI(ctx, opts)))
+	add(one(checkMirror(opts)))
+	add(one(checkPDFRenderer(ctx, opts)))
 	r.OK = !r.Failed() && !r.Skipped()
 	return r
 }

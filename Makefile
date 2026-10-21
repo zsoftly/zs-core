@@ -12,7 +12,7 @@ COMPOSE_DIR := deploy/compose
 COMPOSE     := docker compose --project-directory $(COMPOSE_DIR) -f $(COMPOSE_DIR)/compose.yaml
 
 .PHONY: fmt fmt-check vet lint test test-race test-integration build generate generate-check check clean \
-	stack-up stack-down stack-reset stack-logs stack-bootstrap doctor stack-guard
+	stack-up stack-down stack-reset stack-logs stack-bootstrap stack-apply stack-verify doctor stack-guard
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -97,3 +97,17 @@ stack-bootstrap: stack-guard
 # Runs zs-core doctor inside the running core container.
 doctor: stack-guard
 	$(COMPOSE) exec core zs-core doctor
+
+# Applies brands/zs-reference.yaml with zs-core brand apply in the core
+# container.
+stack-apply: stack-guard
+	$(COMPOSE) exec -T core zs-core brand apply --operator stack-apply --reason 'reference stack' brands/zs-reference.yaml > /dev/null
+
+# The configuration-as-code check: from a clean stack (make stack-reset
+# first), these steps alone must reach a green doctor. No console action and
+# no manual database change is part of it.
+stack-verify: stack-guard
+	$(MAKE) stack-up
+	$(MAKE) stack-bootstrap
+	$(MAKE) stack-apply
+	$(COMPOSE) exec -T core zs-core doctor

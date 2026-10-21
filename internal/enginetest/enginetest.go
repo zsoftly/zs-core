@@ -53,8 +53,12 @@ type Account struct {
 	Name        string
 	Currency    string
 	Country     string
-	Blocking    []killbill.BlockingState
-	Closed      bool
+	Email       string
+	Locale      string
+	// AdditionalEmails are unmanaged fixture CCs, not the primary email.
+	AdditionalEmails []string
+	Blocking         []killbill.BlockingState
+	Closed           bool
 }
 
 type organization struct {
@@ -262,7 +266,22 @@ func (f *Fake) Account(apiKey, externalKey string) (Account, bool) {
 	if !ok {
 		return Account{}, false
 	}
-	return *a, true
+	copy := *a
+	copy.AdditionalEmails = append([]string(nil), a.AdditionalEmails...)
+	return copy, true
+}
+
+// SetAdditionalAccountEmails seeds unmanaged CCs behind Core for read-only
+// inspection tests. It adds no HTTP mutation endpoint to the fake.
+func (f *Fake) SetAdditionalAccountEmails(apiKey, externalKey string, emails []string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.accounts[apiKey][externalKey]
+	if !ok {
+		return false
+	}
+	a.AdditionalEmails = append([]string(nil), emails...)
+	return true
 }
 
 func reply(w http.ResponseWriter, status int, v any) {
@@ -469,7 +488,7 @@ func (f *Fake) serveKillBill(w http.ResponseWriter, r *http.Request, path string
 			reply(w, http.StatusNotFound, map[string]any{"code": 3003})
 			return
 		}
-		reply(w, http.StatusOK, killbill.Account{AccountID: a.ID, ExternalKey: a.ExternalKey, Name: a.Name, Currency: a.Currency, Country: a.Country})
+		reply(w, http.StatusOK, killbill.Account{AccountID: a.ID, ExternalKey: a.ExternalKey, Name: a.Name, Currency: a.Currency, Country: a.Country, Email: a.Email, Locale: a.Locale})
 	case rest == "" && r.Method == http.MethodPost:
 		var in killbill.Account
 		_ = json.Unmarshal(body, &in)
@@ -484,7 +503,7 @@ func (f *Fake) serveKillBill(w http.ResponseWriter, r *http.Request, path string
 			reply(w, http.StatusConflict, map[string]any{"code": 3000})
 			return
 		}
-		a := &Account{ID: idgen.MustNewV7().String(), ExternalKey: in.ExternalKey, Name: in.Name, Currency: in.Currency, Country: in.Country}
+		a := &Account{ID: idgen.MustNewV7().String(), ExternalKey: in.ExternalKey, Name: in.Name, Currency: in.Currency, Country: in.Country, Email: in.Email, Locale: in.Locale}
 		accounts[in.ExternalKey] = a
 		w.Header().Set("Location", "http://fake/1.0/kb/accounts/"+a.ID)
 		w.WriteHeader(http.StatusCreated)

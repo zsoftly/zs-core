@@ -9,7 +9,7 @@ Kill Bill is the billing engine and the financial authority. Core holds no balan
 | Core | Kill Bill | Notes |
 | --- | --- | --- |
 | Brand | Tenant | Every call carries `X-Killbill-ApiKey` and `X-Killbill-ApiSecret` of the brand. Core resolves the secret from the brand's secret reference at each call and never stores it. |
-| Tenant | Account | External key is the `tnt_` ID. Currency is the brand's first currency. |
+| Tenant | Account | External key is the `tnt_` ID. Currency is the brand's first currency. The primary email follows the [eligible owner projection](tenants.md#billing-recipient-projection). |
 | Catalogue summary | `GET /1.0/kb/catalog` | The last version is in force. Prices become minor units. |
 | Billing summary | `GET /1.0/kb/accounts/{id}?accountWithBalanceAndCBA=true`, `/overdue`, `/block` | Balance and credit come from Kill Bill on every read. |
 | Subscription | Subscription | Kill Bill subscription ID. Created with an external key derived from the idempotency key. |
@@ -25,6 +25,8 @@ Kill Bill is the billing engine and the financial authority. Core holds no balan
 | Push notification | `POST /1.0/kb/tenants/registerNotificationCallback?cb=` | One callback per Kill Bill tenant. Registering replaces the previous one. |
 | Plugin install | `POST /1.0/kb/nodesInfo` with `INSTALL_PLUGIN` and `START_PLUGIN` | KPM, from Core's verified plugin mirror. See [plugins.md](plugins.md). |
 
+The managed primary billing email converges after Core membership commits. Reconciliation compares the scoped account, sends only a changed primary email and checks readback. An unavailable engine leaves the projection pending and never rolls back access reduction. Additional account emails remain unmanaged. Doctor reads them and warns with the account ID, never an address, when any exist. A failed read fails inspection rather than claiming there are no additional recipients. Core never adds or deletes those entries. Already queued or sent mail is not recalled. See [tenants.md](tenants.md#billing-recipient-projection) for selection, status and retry limits. Final invoice on tenant closure remains an open owner decision.
+
 Objects that live in Kill Bill only, such as subscriptions, invoices, payments and payment methods, are named by their Kill Bill ID. Core never maps them to Core IDs.
 
 ## What Core stores
@@ -35,6 +37,7 @@ Objects that live in Kill Bill only, such as subscriptions, invoices, payments a
 | `credit_code_redemptions` | Tenant, a code of the same brand, Kill Bill credit and invoice IDs, amount, expiry of the credit, the part reversed, the sweeper's failed attempts | A balance |
 | `staff_credits` | Tenant, idempotency key, Kill Bill credit and invoice IDs, amount, reason, expiry, the part reversed, the sweeper's failed attempts | A balance |
 | `tenant_billing_standing` | Overdue state name, whether it blocks changes or entitlement, last Kill Bill event | Amounts |
+| `tenant_billing_recipients` | Scoped owner membership binding, observed projection status and retry/check metadata | Recipient address, mail-delivery receipt or amount |
 | `killbill_notifications` | Digest of each push notification and of the state Core read for it, its type, tenant, object and that state, for seven days | The notification body |
 | `killbill_plugin_installs` | Plugin, version, Kill Bill node, the brand whose apply installed it, times | Configuration |
 | `killbill_plugin_ddl` | Plugin, version, SHA-256 of the DDL, its tables, the tables the last apply created, the operator | The DDL text |

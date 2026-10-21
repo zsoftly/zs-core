@@ -532,6 +532,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8, $9) RETURNING `+tenantColumns, arg
 	if err != nil {
 		return Tenant{}, err
 	}
+	if err := scheduleBillingRecipient(ctx, tx, s, owner.ID, Caller{Actor: actor, CorrelationID: correlationID}); err != nil {
+		return Tenant{}, err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE tenant_provisioning SET status = 'completed', completed_at = now(), updated_at = now(),
        claim_token = NULL, claimed_until = NULL, last_error = NULL WHERE tenant_id = $1`, p.TenantID); err != nil {
 		return Tenant{}, unavailable(err)

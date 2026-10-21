@@ -133,7 +133,7 @@ Phase 5a adds [plugin operations](docs/modules/plugins.md), [invoice rendering](
 
 ### Known Phase 5a deviations
 
-- Tenant creation copies the creator's verified email to the Kill Bill account. Membership and ownership changes do not reconcile that recipient, so former members may continue receiving billing mail. This disclosure risk remains unresolved.
+- The [billing recipient projection](docs/modules/tenants.md#billing-recipient-projection) eventually reconciles the account's primary email to an eligible current owner, or clears it when none is eligible. Membership and ownership changes commit first; pending work and failed checks retry with bounded backoff. There is no instant recipient cutoff or recall of queued or sent mail. Additional CC recipients remain unmanaged: doctor warns with the account ID, without printing addresses or deleting entries.
 - Invoice numbers are server-wide unique and increasing, with per-tenant gaps. Owner review is pending; numbering is not gapless.
 - V1 remains incomplete. Keycloak event ingestion, guide acceptance, and theme claims are not part of this candidate.
 

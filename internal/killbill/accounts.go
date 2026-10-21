@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
 )
 
 // Account is a Kill Bill account. Core creates one per tenant with the tenant
@@ -77,6 +78,45 @@ func (c *Client) AccountWithBalance(ctx context.Context, creds TenantCredentials
 		return Account{}, fmt.Errorf("killbill get account: unexpected response")
 	}
 	return a, nil
+}
+
+// SetAccountEmail sets only an account's primary email. An empty email is
+// sent explicitly to clear it. Kill Bill 0.24.22 merges omitted account
+// fields when treatNullAsReset is false; additional account emails are
+// unchanged. Callers verify the result with a scoped account read.
+func (c *Client) SetAccountEmail(ctx context.Context, creds TenantCredentials, cc CallContext, accountID, email string) error {
+	q := url.Values{"treatNullAsReset": {"false"}}
+	_, err := c.sendJSON(ctx, "set account email", http.MethodPut,
+		"/1.0/kb/accounts/"+url.PathEscape(accountID)+"?"+q.Encode(), creds, cc, struct {
+			Email string `json:"email"`
+		}{Email: email})
+	return err
+}
+
+// AccountEmail is one unmanaged additional account email, separate from the
+// primary Account.Email. Core only reads this collection; it never changes it.
+type AccountEmail struct {
+	AccountID string `json:"accountId"`
+	Email     string `json:"email"`
+}
+
+// AccountEmails reads the additional-email collection of the scoped account.
+// The pinned API returns an array, including [] for absence. Null, malformed
+// entries or an entry from another account are failures, never proof of no CC.
+func (c *Client) AccountEmails(ctx context.Context, creds TenantCredentials, accountID string) ([]AccountEmail, error) {
+	var emails []AccountEmail
+	if err := c.getJSON(ctx, "get account emails", "/1.0/kb/accounts/"+url.PathEscape(accountID)+"/emails", creds, &emails); err != nil {
+		return nil, err
+	}
+	if emails == nil {
+		return nil, fmt.Errorf("killbill get account emails: unexpected response")
+	}
+	for _, email := range emails {
+		if email.AccountID != accountID || strings.TrimSpace(email.Email) == "" {
+			return nil, fmt.Errorf("killbill get account emails: unexpected response")
+		}
+	}
+	return emails, nil
 }
 
 // BlockingState is an entitlement blocking state of an account.

@@ -54,6 +54,11 @@ const (
 	EnvWalletCreditCacheTTL    = "ZS_WALLET_CREDIT_CACHE_TTL"
 	EnvQuotaSweepInterval      = "ZS_QUOTA_SWEEP_INTERVAL"
 	EnvUsagePartitionInterval  = "ZS_USAGE_PARTITION_INTERVAL"
+	EnvKillBillDatabaseURL     = "ZS_KILLBILL_DATABASE_URL"
+	EnvPDFRendererURL          = "ZS_PDF_RENDERER_URL"
+	EnvPluginMirrorDir         = "ZS_PLUGIN_MIRROR_DIR"
+	EnvPluginMirrorSecret      = "ZS_PLUGIN_MIRROR_SECRET"
+	EnvPluginMirrorURL         = "ZS_PLUGIN_MIRROR_URL"
 	reservedTestVariablePrefix = "ZS_TEST_"
 )
 
@@ -81,7 +86,8 @@ const (
 	// date.
 	maxWalletCreditCacheTTL = time.Minute
 	maxDatabaseMaxConns     = 1000
-	// minWebhookSecretLength is the shortest ZS_KILLBILL_WEBHOOK_SECRET.
+	// minWebhookSecretLength is the shortest ZS_KILLBILL_WEBHOOK_SECRET
+	// and ZS_PLUGIN_MIRROR_SECRET.
 	minWebhookSecretLength = 32
 )
 
@@ -97,6 +103,8 @@ var known = map[string]bool{
 	EnvTenantSweepInterval: true, EnvKillBillWebhookSecret: true, EnvKillBillCallbackURL: true, EnvCreditSweepInterval: true,
 	EnvWalletSweepInterval: true, EnvMeteringForwardInterval: true, EnvWalletCreditCacheTTL: true,
 	EnvQuotaSweepInterval: true, EnvUsagePartitionInterval: true,
+	EnvKillBillDatabaseURL: true, EnvPDFRendererURL: true, EnvPluginMirrorDir: true,
+	EnvPluginMirrorSecret: true, EnvPluginMirrorURL: true,
 }
 
 // Config is the validated service configuration.
@@ -176,6 +184,31 @@ type Config struct {
 	// WalletCreditCacheTTL is how long a reservation may rely on the Kill
 	// Bill account credit it last read. At most one minute.
 	WalletCreditCacheTTL time.Duration
+
+	// KillBillDatabaseURL is the Kill Bill database, for deployment steps
+	// only: zs-core plugin ddl apply creates plugin tables there, doctor
+	// checks them, and brand apply on the command line refuses a plugin
+	// whose tables are missing. serve never uses it.
+	KillBillDatabaseURL string
+
+	// PDFRendererURL is the PDF renderer, such as http://gotenberg:3000.
+	// Without it invoice PDFs answer 404 invoice_pdf_unavailable.
+	PDFRendererURL string
+
+	// PluginMirrorDir holds the pinned plugin jars, synced by zs-core
+	// plugin mirror sync. With PluginMirrorSecret, serve serves them at
+	// GET /v1/plugins/{name}/{version}.jar.
+	PluginMirrorDir string
+
+	// PluginMirrorSecret protects the mirror route. At least 32
+	// characters.
+	PluginMirrorSecret string
+
+	// PluginMirrorURL is Core's base URL as Kill Bill reaches the mirror.
+	// New plugin installs require it and PluginMirrorSecret; KPM downloads
+	// only from the verified mirror. Starting an already-installed plugin
+	// does not download a jar.
+	PluginMirrorURL string
 }
 
 // Load reads the configuration from environ, a list of KEY=value strings as
@@ -325,12 +358,35 @@ func Load(environ []string) (Config, error) {
 	parseURL(EnvKillBillURL, &cfg.KillBillURL)
 	parseURL(EnvKAUIURL, &cfg.KAUIURL)
 	parseURL(EnvKillBillCallbackURL, &cfg.KillBillCallbackURL)
-	if v, ok := env[EnvKillBillWebhookSecret]; ok && v != "" {
-		if len(v) < minWebhookSecretLength {
-			fail("%s must be at least %d characters", EnvKillBillWebhookSecret, minWebhookSecretLength)
-		} else {
-			cfg.KillBillWebhookSecret = v
+	parseURL(EnvPDFRendererURL, &cfg.PDFRendererURL)
+	parseURL(EnvPluginMirrorURL, &cfg.PluginMirrorURL)
+	parseSecret := func(name string, target *string) {
+		if v, ok := env[name]; ok && v != "" {
+			if len(v) < minWebhookSecretLength {
+				fail("%s must be at least %d characters", name, minWebhookSecretLength)
+			} else {
+				*target = v
+			}
 		}
+	}
+	parseSecret(EnvKillBillWebhookSecret, &cfg.KillBillWebhookSecret)
+	parseSecret(EnvPluginMirrorSecret, &cfg.PluginMirrorSecret)
+	if v := env[EnvKillBillDatabaseURL]; strings.TrimSpace(v) != "" {
+		if err := validateDatabaseURL(v); err != nil {
+			fail("%s %s", EnvKillBillDatabaseURL, err)
+		} else {
+			cfg.KillBillDatabaseURL = v
+		}
+	}
+	if v := env[EnvPluginMirrorDir]; v != "" {
+		if strings.ContainsRune(v, 0) || !filepath.IsAbs(v) {
+			fail("%s must be an absolute directory path", EnvPluginMirrorDir)
+		} else {
+			cfg.PluginMirrorDir = filepath.Clean(v)
+		}
+	}
+	if env[EnvPluginMirrorURL] != "" && env[EnvPluginMirrorSecret] == "" {
+		fail("%s needs %s", EnvPluginMirrorURL, EnvPluginMirrorSecret)
 	}
 	cfg.KeycloakRealm = env[EnvKeycloakRealm]
 	cfg.KeycloakAdminUser = env[EnvKeycloakAdminUser]

@@ -115,6 +115,7 @@ func tenantBody(t tenant.Tenant) gen.Tenant {
 		Id: t.PublicID(), BrandId: idgen.Format(idgen.Brand, t.BrandID), Kind: gen.TenantKind(t.Kind),
 		Slug: t.Slug, Name: t.Name, Status: gen.TenantStatus(t.Status), Activation: gen.TenantActivation(t.Activation),
 		BillingCountry: optional(t.BillingCountry), CreatedAt: t.CreatedAt.UTC(), UpdatedAt: t.UpdatedAt.UTC(),
+		BillingRecipientStatus: gen.TenantBillingRecipientStatus(t.BillingRecipientStatus),
 	}
 }
 
@@ -221,7 +222,7 @@ func (s *server) ensurePersonalTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t, created, err := tenant.EnsurePersonal(ctx, db, s.tenants, tenant.CreateRequest{
-		Brand: p.Brand.ID, Creator: ident.ID, Name: ident.DisplayName,
+		Brand: p.Brand.ID, Creator: ident.ID, Name: ident.DisplayName, Locale: p.Locale,
 		Actor: events.Actor{Type: events.ActorUser, ID: ident.PublicID()}, CorrelationID: RequestID(ctx),
 	})
 	if err != nil {
@@ -253,7 +254,7 @@ func (s *server) createTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req := tenant.CreateRequest{
-		Brand: p.Brand.ID, Creator: ident.ID, Name: body.Name, IdempotencyKey: body.IdempotencyKey,
+		Brand: p.Brand.ID, Creator: ident.ID, Name: body.Name, IdempotencyKey: body.IdempotencyKey, Locale: p.Locale,
 		Actor: events.Actor{Type: events.ActorUser, ID: ident.PublicID()}, CorrelationID: RequestID(ctx),
 	}
 	if body.BillingCountry != nil {
@@ -377,7 +378,7 @@ func (s *server) updateMember(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		return s.mirror(ctx, tx, sc, caller.Actor)
+		return nil
 	})
 	if err != nil {
 		s.writeError(w, r, err)
@@ -407,7 +408,7 @@ func (s *server) removeMember(w http.ResponseWriter, r *http.Request) {
 		if _, err := tenant.RemoveMember(ctx, tx, sc, caller, id); err != nil {
 			return err
 		}
-		return s.mirror(ctx, tx, sc, caller.Actor)
+		return nil
 	})
 	if err != nil {
 		s.writeError(w, r, err)

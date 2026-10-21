@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ZSoftly Core API
-  version: 0.5.0
+  version: 0.6.0
   summary: The /v1 HTTP surface of ZSoftly Core.
   description: |
     ZSoftly Core serves tenants, wallets, metering, catalogue, payments,
@@ -63,6 +63,8 @@ tags:
     description: Usage events with caller event IDs, forwarded to Kill Bill as usage records.
   - name: quotas
     description: Quotas and entitlements per plan and feature, with staff overrides and counters.
+  - name: plugins
+    description: The plugin mirror Kill Bill installs pinned plugin jars from. A deployment route, not a brand route.
 paths:
   /healthz:
     get:
@@ -1222,16 +1224,50 @@ paths:
         "403": {$ref: "#/components/responses/Forbidden"}
         "404": {$ref: "#/components/responses/NotFound"}
         "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/tenants/{id}/invoices/{inv}/html:
+    get:
+      tags: [billing]
+      operationId: getInvoiceHtml
+      summary: Return Kill Bill's HTML rendering of an invoice.
+      description: |
+        Needs `billing:read`. Kill Bill renders the invoice with the brand's
+        invoice template and translations, in the locale of the tenant's
+        Kill Bill account. Core sets that locale when it creates the account:
+        the creator's locale when the brand offers it, otherwise the brand's
+        default locale. The page carries a `Content-Security-Policy` that
+        allows no script, no fetch and no form. An invoice of another tenant
+        answers `404 not_found`. A template Kill Bill cannot render answers
+        `503 billing_unavailable`.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/InvoiceIdPath"
+      responses:
+        "200":
+          description: The invoice as HTML.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            text/html:
+              schema: {type: string}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
   /v1/tenants/{id}/invoices/{inv}/pdf:
     get:
       tags: [billing]
       operationId: getInvoicePdf
       summary: Return an invoice as PDF.
       description: |
-        Needs `billing:read`. PDF rendering needs an invoice template plugin.
-        `components.yaml` pins none in this release, so an invoice of the
-        tenant answers `404 invoice_pdf_unavailable`. An invoice of another
-        tenant answers `404 not_found`.
+        Needs `billing:read`. Core renders Kill Bill's HTML of the invoice,
+        as `GET .../html` returns it, through the PDF renderer of
+        `ZS_PDF_RENDERER_URL` and streams the PDF. Without a renderer an
+        invoice of the tenant answers `404 invoice_pdf_unavailable`. A
+        renderer that fails, or answers with something other than a PDF,
+        answers `503 pdf_renderer_unavailable`. An invoice of another tenant
+        answers `404 not_found`.
       security: [{bearer: []}]
       parameters:
         - $ref: "#/components/parameters/TenantIdPath"
@@ -1239,6 +1275,9 @@ paths:
       responses:
         "200":
           description: The PDF.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
           content:
             application/pdf:
               schema: {type: string, format: binary}
@@ -1588,6 +1627,75 @@ paths:
         "404": {$ref: "#/components/responses/NotFound"}
         "422": {$ref: "#/components/responses/Unprocessable"}
         "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/plugins/{name}/{file}:
+    get:
+      tags: [plugins]
+      operationId: getPluginJar
+      summary: Serve a pinned plugin jar from the plugin mirror.
+      description: |
+        KPM downloads plugin jars here when `ZS_PLUGIN_MIRROR_URL` is set.
+        `file` is `<version>.jar`. The request needs the deployment's
+        `ZS_PLUGIN_MIRROR_SECRET` as a bearer credential or a `token`,
+        because KPM sends no headers. The token is an HMAC-SHA256 value over
+        the plugin, version, and `sha256` digest under the secret. It
+        authorizes only that exact jar.
+
+        Every request, including one with bearer credentials, carries exactly
+        one lowercase `sha256` query value. It must equal the
+        `components.yaml` pin Core is currently serving. Before serving a jar,
+        Core verifies the signed mirror manifest, the current pin, and the jar
+        SHA-256, then serves a freshly verified snapshot of those exact bytes.
+        It does not use a metadata checksum cache.
+
+        An unconfigured mirror returns `404 not_found` before authentication.
+        A `Bearer` authorization header takes precedence over the query token;
+        a failed bearer check never falls back to the token. Without a bearer
+        header, Core checks the digest-bound token. Missing or invalid selected
+        credentials return `401 unauthenticated`. After valid bearer or
+        digest-bound token authentication, a missing, duplicate, wrong, or
+        stale serving-pin digest returns `404 not_found`.
+        A failed jar digest or manifest signature check returns `500
+        internal_error`, and Core logs the failure.
+      security: [{mirrorSecret: []}, {}]
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: {type: string, pattern: "^[a-z0-9][a-z0-9-]{0,63}$"}
+        - name: file
+          in: path
+          required: true
+          description: The version followed by `.jar`, such as `8.0.3.jar`.
+          schema: {type: string, pattern: "^[0-9A-Za-z.+-]{1,50}\\.jar$"}
+        - name: sha256
+          in: query
+          required: true
+          description: Exactly one lowercase SHA-256 value, equal to the currently serving `components.yaml` pin.
+          schema: {type: string, pattern: "^[0-9a-f]{64}$"}
+        - name: token
+          in: query
+          required: false
+          description: The jar's HMAC-SHA256 token over the plugin, version, and sha256 digest, for KPM.
+          schema: {type: string, pattern: "^[0-9a-f]{64}$"}
+      responses:
+        "200":
+          description: The jar.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/java-archive:
+              schema: {type: string, format: binary}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "500":
+          description: The mirror jar or signed manifest failed verification.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorEnvelope"}
   /v1/billing/webhooks/killbill/{brand}/{token}:
     post:
       tags: [billing]
@@ -2487,6 +2595,10 @@ components:
       type: http
       scheme: bearer
       description: A Keycloak access token from the brand's realm, signed with RS256, or a tenant API key `zs_<brand slug>_<random>`.
+    mirrorSecret:
+      type: http
+      scheme: bearer
+      description: The deployment's `ZS_PLUGIN_MIRROR_SECRET`, for the plugin mirror only.
     billingCredential:
       type: http
       scheme: bearer
@@ -2921,7 +3033,7 @@ components:
       pattern: "^[A-Z]{2}$"
     Tenant:
       type: object
-      required: [id, brand_id, kind, slug, name, status, activation, billing_country, created_at, updated_at]
+      required: [id, brand_id, kind, slug, name, status, activation, billing_country, billing_recipient_status, created_at, updated_at]
       additionalProperties: false
       properties:
         id: {$ref: "#/components/schemas/TenantId"}
@@ -2935,6 +3047,16 @@ components:
           enum: [active, suspended, closed]
         activation: {type: string, enum: [pending, approved, rejected]}
         billing_country: {type: [string, "null"]}
+        billing_recipient_status:
+          type: string
+          enum: [pending, ready, no_eligible_owner]
+          description: >-
+            Last observed projection of the managed primary billing email. Pending
+            includes scheduled work or a failed upstream check. Ready means the
+            scoped account matched an eligible owner at its last successful check.
+            No eligible owner means the primary email was observed explicitly
+            cleared. This status exposes no recipient address and promises no
+            immediate revocation, delivery or recall of already queued mail.
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
     TenantCreate:

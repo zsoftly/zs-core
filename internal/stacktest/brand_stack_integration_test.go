@@ -97,8 +97,14 @@ func (s stack) deps(t *testing.T, db *postgrestest.DB) brand.Deps {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return brand.Deps{DB: db.Pool, Keycloak: s.kc, KillBill: s.kb, Secrets: secrets.Default{}, Files: root.FS(),
-		PaymentPlugins: pins.KillBillPlugins.ApprovedPaymentPlugins, PluginRepository: pins.KillBillPlugins.Repository}
+	deps := brand.Deps{DB: db.Pool, Keycloak: s.kc, KillBill: s.kb, Secrets: secrets.Default{}, Files: root.FS(),
+		PaymentPlugins: pins.KillBillPlugins.ApprovedPaymentPlugins, InvoicePlugins: pins.KillBillPlugins.ApprovedInvoicePlugins,
+		InstallablePlugins: pins.KillBillPlugins.Installable, PluginRepository: pins.KillBillPlugins.Repository}
+	if mirror := os.Getenv(envMirrorURL); mirror != "" {
+		deps.PluginMirrorURL, deps.PluginMirrorSecret = mirror, []byte(env(t, envMirrorSecret))
+		deps.PluginHTTP = mirrorPreflightClient(t, mirror, env(t, envCoreURL))
+	}
+	return deps
 }
 
 var cli = brand.Options{Actor: events.Actor{Type: events.ActorService, ID: "zs-core-cli:stack-test"}, CreatedBy: "zs-core-cli:stack-test", Reason: "stack test"}

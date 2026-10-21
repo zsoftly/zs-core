@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{{text.invoiceCreationSubject}}</title>
+</head>
+<body style="font-family:Helvetica,Arial,sans-serif;color:#1f2933;font-size:14px">
+<p>{{text.brandName}}</p>
+<p>{{text.invoiceCreationAdditionalMessage}}</p>
+<p>{{text.invoiceTitle}} {{text.invoicePrefix}}{{invoice.invoiceNumber}}<br>{{text.invoiceDate}}{{invoice.formattedInvoiceDate}}</p>
+<table cellpadding="4" cellspacing="0">
+  <tr><th align="left">{{text.invoiceItemServicePeriod}}</th><th align="left">{{text.invoiceItemDescription}}</th><th align="right">{{text.invoiceItemAmount}}</th></tr>
+  {{#invoice.invoiceItems}}
+  <tr><td>{{formattedStartDate}}{{#formattedEndDate}} - {{formattedEndDate}}{{/formattedEndDate}}</td><td><div>{{description}}</div><div>{{prettyPlanName}}</div></td><td align="right">{{formattedAmount}}</td></tr>
+  {{/invoice.invoiceItems}}
+</table>
+<p>{{text.invoiceAmount}}{{invoice.formattedChargedAmount}}<br>{{text.invoiceAmountPaid}}{{invoice.formattedPaidAmount}}<br>{{text.invoiceBalance}}{{invoice.formattedBalance}}</p>
+<p>{{text.sellerName}}<br>{{text.sellerAddress}}<br>{{text.countryName}}<br>{{text.sellerTaxRegistrations}}</p>
+<p style="color:#9aa5b1;font-size:11px">zs-reference email template, en</p>
+</body>
+</html>

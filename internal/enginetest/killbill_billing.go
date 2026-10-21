@@ -398,13 +398,39 @@ func (f *Fake) serveBilling(w http.ResponseWriter, r *http.Request, apiKey, path
 				owed += in.balance()
 			}
 		}
-		out := killbill.Account{AccountID: a.ID, ExternalKey: a.ExternalKey, Name: a.Name, Currency: a.Currency, Country: a.Country}
+		out := killbill.Account{AccountID: a.ID, ExternalKey: a.ExternalKey, Name: a.Name, Currency: a.Currency, Country: a.Country, Email: a.Email, Locale: a.Locale}
 		if q.Get("accountWithBalanceAndCBA") == "true" {
 			out.AccountBalance, out.AccountCBA = money(owed-t.cba[a.ID]), money(t.cba[a.ID])
 		}
 		reply(w, http.StatusOK, out)
+	case len(parts) == 2 && parts[0] == "accounts" && r.Method == http.MethodPut:
+		a := f.account(apiKey, parts[1])
+		if a == nil {
+			kbError(w, http.StatusNotFound, 3003)
+			return true
+		}
+		// Reproduce the primary-email update with default merge semantics.
+		// A non-null empty string clears email; omitted/null email preserves it.
+		var in struct {
+			Email *string `json:"email"`
+		}
+		if err := json.Unmarshal(body, &in); err != nil || q.Get("treatNullAsReset") == "true" {
+			kbError(w, http.StatusBadRequest, 2)
+			return true
+		}
+		if in.Email != nil {
+			a.Email = *in.Email
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case len(parts) == 3 && parts[0] == "accounts" && f.account(apiKey, parts[1]) == nil:
 		kbError(w, http.StatusNotFound, 3003)
+	case len(parts) == 3 && parts[0] == "accounts" && parts[2] == "emails" && r.Method == http.MethodGet:
+		a := f.account(apiKey, parts[1])
+		emails := make([]killbill.AccountEmail, 0, len(a.AdditionalEmails))
+		for _, email := range a.AdditionalEmails {
+			emails = append(emails, killbill.AccountEmail{AccountID: a.ID, Email: email})
+		}
+		reply(w, http.StatusOK, emails)
 	case len(parts) == 3 && parts[0] == "accounts" && parts[2] == "block" && r.Method == http.MethodGet:
 		a := f.account(apiKey, parts[1])
 		out := []killbill.BlockingState{}

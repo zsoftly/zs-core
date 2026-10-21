@@ -46,11 +46,23 @@ type brandEngines struct {
 	realm    string
 	creds    killbill.TenantCredentials
 	currency string
+	// locales and defaultLocale are the brand's locales.
+	locales       []string
+	defaultLocale string
 }
 
 func (e Engines) forBrand(ctx context.Context, q Querier, id idgen.UUID) (brandEngines, error) {
 	if !e.Ready() {
 		return brandEngines{}, zserrors.New(zserrors.CodeNotReady, "Tenant engines need the Keycloak and Kill Bill admin settings.")
+	}
+	return e.forBillingBrand(ctx, q, id)
+}
+
+// forBillingBrand needs only billing credentials, so a failed or unavailable
+// identity engine does not prevent recipient correction or drift inspection.
+func (e Engines) forBillingBrand(ctx context.Context, q Querier, id idgen.UUID) (brandEngines, error) {
+	if e.KillBill == nil || e.Secrets == nil {
+		return brandEngines{}, zserrors.New(zserrors.CodeNotReady, "Billing recipient reconciliation needs the Kill Bill admin settings.")
 	}
 	rec, err := brand.Get(ctx, q, id)
 	if err != nil {
@@ -67,6 +79,7 @@ func (e Engines) forBrand(ctx context.Context, q Querier, id idgen.UUID) (brandE
 		brandID: rec.ID, slug: rec.Slug, realm: rec.KeycloakRealm,
 		creds:    killbill.TenantCredentials{APIKey: rec.KillBillAPIKey, APISecret: secret},
 		currency: rec.Manifest.Billing.Currencies[0],
+		locales:  rec.Manifest.Identity.Locales, defaultLocale: rec.Manifest.Identity.DefaultLocale,
 	}, nil
 }
 

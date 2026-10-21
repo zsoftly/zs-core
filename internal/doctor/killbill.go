@@ -56,10 +56,11 @@ func checkKillBill(ctx context.Context, opts Options) (ComponentReport, []Findin
 
 	if t.AdminUser == "" || t.AdminPassword == "" {
 		add("version", Skip, "version not checked (no admin credentials): set ZS_KILLBILL_ADMIN_USER and ZS_KILLBILL_ADMIN_PASSWORD; plugins not checked either (pin is %s)", pin.Version)
-		return report, findings
+		return report, append(findings, checkPluginTables(ctx, opts, nil)...)
 	}
 
 	var nodes []struct {
+		NodeName    string `json:"nodeName"`
 		KBVersion   string `json:"kbVersion"`
 		PluginsInfo []struct {
 			BundleSymbolicName string `json:"bundleSymbolicName"`
@@ -95,46 +96,56 @@ func checkKillBill(ctx context.Context, opts Options) (ComponentReport, []Findin
 		findings = append(findings, f)
 	}
 
-	installed := map[string]bool{}
-	for _, p := range nodes[0].PluginsInfo {
-		info := PluginInfo{Key: p.PluginKey, Name: p.PluginName, Version: p.Version, State: p.State}
-		report.Plugins = append(report.Plugins, info)
-		if p.PluginKey == "" {
-			continue // platform bundle, versioned with Kill Bill itself
+	allInstalled := map[string]bool{}
+	for i, node := range nodes {
+		label := fmt.Sprintf("node %d", i+1)
+		if node.NodeName != "" {
+			label = fmt.Sprintf("node %q", node.NodeName)
 		}
-		installed[p.PluginKey] = true
-		label := p.PluginKey
-		pinned, ok := opts.Manifest.PinnedPlugin(p.PluginKey)
-		if ok {
-			if p.Version != pinned.Version {
-				add("plugin", Fail, "plugin %s version %s does not match the pin %s in components.yaml", label, p.Version, pinned.Version)
-			} else {
-				add("plugin", OK, "plugin %s version %s matches the pin (%s)", label, p.Version, p.State)
+		nodeAdd := func(check string, status Status, format string, args ...any) {
+			add(check, status, "%s (%s)", fmt.Sprintf(format, args...), label)
+		}
+		installed := map[string]bool{}
+		platform := 0
+		for _, p := range node.PluginsInfo {
+			// Preserve the existing report inventory shape. Findings cover
+			// every node; the summary list still describes the first node.
+			if i == 0 {
+				info := PluginInfo{Key: p.PluginKey, Name: p.PluginName, Version: p.Version, State: p.State}
+				report.Plugins = append(report.Plugins, info)
 			}
-		} else {
-			add("plugin", Warn, "plugin %s version %s is not listed in components.yaml (%s)", label, p.Version, p.State)
-		}
-		if p.State != "RUNNING" {
-			if ok && pinned.Required() {
-				add("plugin", Fail, "plugin %s is %s; components.yaml marks it %s, so it must be RUNNING", label, p.State, pinned.Status)
+			if p.PluginKey == "" {
+				platform++
+				continue // platform bundle, versioned with Kill Bill itself
+			}
+			installed[p.PluginKey] = true
+			allInstalled[p.PluginKey] = true
+			pinned, ok := opts.Manifest.PinnedPlugin(p.PluginKey)
+			if ok {
+				if p.Version != pinned.Version {
+					nodeAdd("plugin", Fail, "plugin %s version %s does not match the pin %s in components.yaml", p.PluginKey, p.Version, pinned.Version)
+				} else {
+					nodeAdd("plugin", OK, "plugin %s version %s matches the pin (%s)", p.PluginKey, p.Version, p.State)
+				}
 			} else {
-				add("plugin", Warn, "plugin %s is %s", label, p.State)
+				nodeAdd("plugin", Fail, "plugin %s version %s is not listed in components.yaml (%s)", p.PluginKey, p.Version, p.State)
+			}
+			if p.State != "RUNNING" {
+				if ok && pinned.Required() {
+					nodeAdd("plugin", Fail, "plugin %s is %s; components.yaml marks it %s, so it must be RUNNING", p.PluginKey, p.State, pinned.Status)
+				} else {
+					nodeAdd("plugin", Warn, "plugin %s is %s", p.PluginKey, p.State)
+				}
 			}
 		}
-	}
-	for _, pinned := range opts.Manifest.RequiredPlugins() {
-		if !installed[pinned.Name] {
-			add("plugin", Fail, "plugin %s %s is not installed; components.yaml marks it %s", pinned.Name, pinned.Version, pinned.Status)
+		for _, pinned := range opts.Manifest.RequiredPlugins() {
+			if !installed[pinned.Name] {
+				nodeAdd("plugin", Fail, "plugin %s %s is not installed; components.yaml marks it %s", pinned.Name, pinned.Version, pinned.Status)
+			}
 		}
+		nodeAdd("plugins", OK, "%d platform bundle(s), %d plugin(s) installed", platform, len(node.PluginsInfo)-platform)
 	}
-	platform := 0
-	for _, p := range report.Plugins {
-		if p.Key == "" {
-			platform++
-		}
-	}
-	add("plugins", OK, "%d platform bundle(s), %d plugin(s) installed", platform, len(report.Plugins)-platform)
-	return report, findings
+	return report, append(findings, checkPluginTables(ctx, opts, allInstalled)...)
 }
 
 func joinKeys(m map[string]bool) string {

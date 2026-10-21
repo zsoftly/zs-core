@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- Kill Bill's invoice text has getters for its own keys, such as text.invoiceTitle. Any other key of the translation is read through the text.properties section, with the key as the section's content. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>{{text.invoiceTitle}} {{invoice.invoiceNumber}}</title>
+<style>
+body{font-family:Helvetica,Arial,sans-serif;color:#1f2933;font-size:13px;margin:0}
+.invoice{max-width:760px;margin:24px auto;padding:32px;border:1px solid #d9e2ec}
+header{border-bottom:2px solid #102a43;padding-bottom:16px}
+h1{font-size:22px;margin:0 0 8px 0;color:#102a43}
+table{width:100%;border-collapse:collapse;margin-top:24px}
+th{text-align:left;background:#f0f4f8;border-bottom:1px solid #bcccdc;padding:6px}
+td{border-bottom:1px solid #e4e7eb;padding:6px;vertical-align:top}
+td.amount,th.amount{text-align:right}
+.pay{margin-top:24px;padding:12px;border:1px solid #bcccdc;background:#f0f4f8}
+</style>
+</head>
+<body>
+<main class="invoice">
+  <header>
+    <h1>{{#text.properties}}brandName{{/text.properties}}</h1>
+    <p class="seller">{{#text.properties}}sellerName{{/text.properties}}<br>{{#text.properties}}sellerAddress{{/text.properties}}<br>{{#text.properties}}countryName{{/text.properties}}<br>{{#text.properties}}sellerTaxRegistrations{{/text.properties}}</p>
+    <p><strong>{{text.invoiceTitle}}</strong> {{text.invoiceNumber}}{{invoice.invoiceNumber}}<br>{{text.invoiceDate}} {{invoice.formattedInvoiceDate}}<br>{{#text.properties}}currency{{/text.properties}} {{invoice.currency}}</p>
+  </header>
+  <table>
+    <thead>
+      <tr>
+        <th>{{text.invoiceItemServicePeriod}}</th>
+        <th>{{text.invoiceItemDescription}}</th>
+        <th>{{#text.properties}}invoiceItemType{{/text.properties}}</th>
+        <th class="amount">{{text.invoiceItemAmount}}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#invoice.invoiceItems}}
+      <tr>
+        <td>{{formattedStartDate}}{{#formattedEndDate}} - {{formattedEndDate}}{{/formattedEndDate}}</td>
+        <td><div>{{description}}</div><div>{{prettyPlanName}}</div></td>
+        <td>{{invoiceItemType}}</td>
+        <td class="amount">{{formattedAmount}}</td>
+      </tr>
+      {{/invoice.invoiceItems}}
+    </tbody>
+  </table>
+  <p><strong>{{text.invoiceBalance}} {{invoice.formattedBalance}}</strong></p>
+  <div class="pay">{{#text.properties}}manualPayInstructions{{/text.properties}}</div>
+  <p>{{#text.properties}}taxNote{{/text.properties}}</p>
+</main>
+</body>
+</html>

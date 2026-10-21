@@ -137,17 +137,23 @@ func (p IdentityProvider) IsEnabled() bool { return p.Enabled == nil || *p.Enabl
 
 // Billing is the Kill Bill side of a brand.
 type Billing struct {
-	KillBillTenantKey    string         `json:"killbill_tenant_key"`
-	KillBillAPISecretRef string         `json:"killbill_api_secret_ref"`
-	Catalogue            string         `json:"catalogue,omitempty"`
-	Overdue              string         `json:"overdue,omitempty"`
-	Currencies           []string       `json:"currencies"`
-	Seller               Seller         `json:"seller"`
-	PaymentPlugin        *PaymentPlugin `json:"payment_plugin,omitempty"`
-	InvoicePlugin        *InvoicePlugin `json:"invoice_plugin,omitempty"`
-	Templates            string         `json:"templates,omitempty"`
-	Wallet               *WalletPolicy  `json:"wallet,omitempty"`
-	UsageWindow          *UsageWindow   `json:"usage_window,omitempty"`
+	KillBillTenantKey    string   `json:"killbill_tenant_key"`
+	KillBillAPISecretRef string   `json:"killbill_api_secret_ref"`
+	Catalogue            string   `json:"catalogue,omitempty"`
+	Overdue              string   `json:"overdue,omitempty"`
+	Currencies           []string `json:"currencies"`
+	Seller               Seller   `json:"seller"`
+	// PaymentPlugin is the one-plugin form of PaymentPlugins, kept as an
+	// alias: it is a list of that plugin, the default. A manifest sets one
+	// of the two. Plugins returns the list either way.
+	PaymentPlugin    *PaymentPlugin    `json:"payment_plugin,omitempty"`
+	PaymentPlugins   []PaymentPlugin   `json:"payment_plugins,omitempty"`
+	InvoicePlugin    *InvoicePlugin    `json:"invoice_plugin,omitempty"`
+	InvoiceTemplates *InvoiceTemplates `json:"invoice_templates,omitempty"`
+	Email            *Email            `json:"email,omitempty"`
+	Templates        string            `json:"templates,omitempty"`
+	Wallet           *WalletPolicy     `json:"wallet,omitempty"`
+	UsageWindow      *UsageWindow      `json:"usage_window,omitempty"`
 	// Meters are the brand's meters. Nil leaves the meters to the HTTP
 	// route; a list, even empty, is what apply converges to.
 	Meters *[]Meter `json:"meters,omitempty"`
@@ -240,21 +246,69 @@ type Entitlement struct {
 	Meter   string `json:"meter,omitempty"`
 }
 
-// Seller is the legal seller of a brand.
+// Seller is the legal seller of a brand. Address is the one-line form of
+// AddressLines. TaxRegistrations are the seller's tax registration numbers,
+// such as "GST/HST 123456789 RT0001". Apply puts them on every invoice and
+// email through the translations it uploads.
 type Seller struct {
-	Name    string `json:"name"`
-	Country string `json:"country"`
-	Address string `json:"address,omitempty"`
+	Name             string   `json:"name"`
+	Country          string   `json:"country"`
+	Address          string   `json:"address,omitempty"`
+	AddressLines     []string `json:"address_lines,omitempty"`
+	TaxRegistrations []string `json:"tax_registrations,omitempty"`
 }
 
-// PaymentPlugin names the brand's payment plugin and its configuration.
-// Mode is test, the only mode v1 accepts.
+// Lines returns the seller's address lines: address_lines, or address.
+func (s Seller) Lines() []string {
+	if len(s.AddressLines) > 0 {
+		return s.AddressLines
+	}
+	if s.Address != "" {
+		return []string{s.Address}
+	}
+	return nil
+}
+
+// PaymentPlugin names a payment plugin of the brand and its configuration.
+// Mode is test, the only mode v1 accepts. Default marks the plugin of the
+// brand's payment methods; a list has exactly one.
 type PaymentPlugin struct {
 	Name      string `json:"name"`
 	Version   string `json:"version,omitempty"`
 	Mode      string `json:"mode"`
 	ConfigKey string `json:"config_key,omitempty"`
 	ConfigRef string `json:"config_ref"`
+	Default   bool   `json:"default,omitempty"`
+}
+
+// Plugins returns the brand's payment plugins: payment_plugins, or the one
+// plugin of payment_plugin as the default.
+func (b Billing) Plugins() []PaymentPlugin {
+	if b.PaymentPlugin != nil {
+		p := *b.PaymentPlugin
+		p.Default = true
+		return []PaymentPlugin{p}
+	}
+	return b.PaymentPlugins
+}
+
+// DefaultPaymentPlugin returns the plugin marked default, nil when the brand
+// has no payment plugin.
+func (b Billing) DefaultPaymentPlugin() *PaymentPlugin {
+	for _, p := range b.Plugins() {
+		if p.Default {
+			return &p
+		}
+	}
+	return nil
+}
+
+// pluginsPath is the manifest path of the payment plugin list.
+func (b Billing) pluginsPath(i int) string {
+	if b.PaymentPlugin != nil {
+		return "/billing/payment_plugin"
+	}
+	return fmt.Sprintf("/billing/payment_plugins/%d", i)
 }
 
 // Payment plugin modes. v1 refuses live: no payment plugin may take real
@@ -272,10 +326,11 @@ const ExternalPaymentPlugin = "__EXTERNAL_PAYMENT__"
 // PaymentPluginName is the Kill Bill plugin name of the brand's payment
 // methods: the payment plugin's service name, or ExternalPaymentPlugin.
 func (b Billing) PaymentPluginName() string {
-	if b.PaymentPlugin == nil {
+	p := b.DefaultPaymentPlugin()
+	if p == nil {
 		return ExternalPaymentPlugin
 	}
-	return b.PaymentPlugin.Key()
+	return p.Key()
 }
 
 // Key is the plugin service name its per-tenant configuration is stored
@@ -284,10 +339,63 @@ func (p PaymentPlugin) Key() string {
 	return "killbill-" + p.Name
 }
 
-// InvoicePlugin names an invoice plugin, for tax.
+// InvoicePlugin names an invoice plugin, for tax, and its configuration.
+// Mode is test, the only mode v1 accepts.
 type InvoicePlugin struct {
-	Name    string `json:"name"`
-	Version string `json:"version,omitempty"`
+	Name      string `json:"name"`
+	Version   string `json:"version,omitempty"`
+	Mode      string `json:"mode"`
+	ConfigKey string `json:"config_key,omitempty"`
+	ConfigRef string `json:"config_ref"`
+}
+
+// Key is the service name the plugin's per-tenant configuration is stored
+// under: killbill-<name>.
+func (p InvoicePlugin) Key() string { return "killbill-" + p.Name }
+
+// InvoiceTemplates are the files Kill Bill renders invoices with. Template
+// and ManualPayTemplate are HTML Mustache templates. Translations and
+// CatalogueTranslations are Java properties per locale of the brand.
+type InvoiceTemplates struct {
+	Template              string            `json:"template,omitempty"`
+	ManualPayTemplate     string            `json:"manual_pay_template,omitempty"`
+	Translations          map[string]string `json:"translations,omitempty"`
+	CatalogueTranslations map[string]string `json:"catalogue_translations,omitempty"`
+}
+
+// Email is the brand's billing email through the email-notifications
+// plugin: the sender, the Kill Bill events that send email, the SMTP server
+// and the directory of templates, <templates>/<locale>/<file>.
+type Email struct {
+	Sender    string   `json:"sender"`
+	Events    []string `json:"events,omitempty"`
+	SMTP      SMTP     `json:"smtp"`
+	Templates string   `json:"templates,omitempty"`
+}
+
+// SMTP is the SMTP server of the brand's billing email. The user name and
+// password are secret references.
+type SMTP struct {
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	UseSSL      bool   `json:"use_ssl,omitempty"`
+	UsernameRef string `json:"username_ref,omitempty"`
+	PasswordRef string `json:"password_ref,omitempty"`
+}
+
+// EmailEvents are the Kill Bill events the email-notifications plugin 0.8.1
+// sends email for.
+var EmailEvents = []string{"INVOICE_CREATION", "INVOICE_NOTIFICATION", "INVOICE_PAYMENT_SUCCESS", "INVOICE_PAYMENT_FAILED", "SUBSCRIPTION_CANCEL"}
+
+// DefaultEmailEvents is the event list of an email section without events.
+var DefaultEmailEvents = []string{"INVOICE_CREATION"}
+
+// EventsOrDefault returns the events, or DefaultEmailEvents.
+func (e Email) EventsOrDefault() []string {
+	if len(e.Events) == 0 {
+		return DefaultEmailEvents
+	}
+	return e.Events
 }
 
 // Notifications declares the sender identity and webhook endpoints.
@@ -532,24 +640,12 @@ func (m *Manifest) Validate() error {
 		}
 		aliases[p.Alias] = true
 	}
-	for path, file := range map[string]string{
-		"/billing/catalogue": m.Billing.Catalogue,
-		"/billing/overdue":   m.Billing.Overdue,
-		"/billing/templates": m.Billing.Templates,
-	} {
+	for path, file := range m.Billing.filePaths() {
 		if file != "" && !filepath.IsLocal(filepath.FromSlash(file)) {
 			fail("%s: must be a relative path inside the manifest directory", path)
 		}
 	}
-	if pp := m.Billing.PaymentPlugin; pp != nil && pp.Mode != PaymentModeTest {
-		fail("/billing/payment_plugin/mode: must be test, because v1 refuses live and no payment plugin may take real money")
-	}
-	// Kill Bill hands a plugin the configuration stored under its own
-	// service name. Another key would upload a configuration that another
-	// plugin reads, past that plugin's test-mode rule.
-	if pp := m.Billing.PaymentPlugin; pp != nil && pp.ConfigKey != "" && pp.ConfigKey != "killbill-"+pp.Name {
-		fail("/billing/payment_plugin/config_key: must be empty or killbill-%s, the service name of the plugin", pp.Name)
-	}
+	problems = append(problems, m.billingPluginProblems()...)
 	if id.Realm == "master" || !realmName.MatchString(id.Realm) {
 		fail("/identity/realm: must match %s and must not be master", realmName)
 	}
@@ -633,8 +729,19 @@ func (m *Manifest) secretRefs() []secretRefAt {
 			refs = append(refs, secretRefAt{fmt.Sprintf("/identity/identity_providers/%d/client_secret_ref", i), p.ClientSecretRef})
 		}
 	}
-	if m.Billing.PaymentPlugin != nil {
-		refs = append(refs, secretRefAt{"/billing/payment_plugin/config_ref", m.Billing.PaymentPlugin.ConfigRef})
+	for i, pp := range m.Billing.Plugins() {
+		refs = append(refs, secretRefAt{m.Billing.pluginsPath(i) + "/config_ref", pp.ConfigRef})
+	}
+	if ip := m.Billing.InvoicePlugin; ip != nil {
+		refs = append(refs, secretRefAt{"/billing/invoice_plugin/config_ref", ip.ConfigRef})
+	}
+	if e := m.Billing.Email; e != nil {
+		if e.SMTP.UsernameRef != "" {
+			refs = append(refs, secretRefAt{"/billing/email/smtp/username_ref", e.SMTP.UsernameRef})
+		}
+		if e.SMTP.PasswordRef != "" {
+			refs = append(refs, secretRefAt{"/billing/email/smtp/password_ref", e.SMTP.PasswordRef})
+		}
 	}
 	if m.Notifications != nil {
 		for i, w := range m.Notifications.Webhooks {

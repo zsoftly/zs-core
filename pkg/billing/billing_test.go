@@ -191,7 +191,13 @@ func TestWebhookToken(t *testing.T) {
 	if len(tok) != 64 || !s.VerifyWebhookToken(b, tok) {
 		t.Fatalf("token %q not verified", tok)
 	}
-	if s.VerifyWebhookToken(idgen.MustNewV7(), tok) || s.VerifyWebhookToken(b, tok[:63]+"0") || (&Service{}).VerifyWebhookToken(b, tok) {
+	// Change the last hex digit to another one: a fixed digit equals the
+	// token's own last digit one time in 16.
+	last := "0"
+	if tok[63] == '0' {
+		last = "1"
+	}
+	if s.VerifyWebhookToken(idgen.MustNewV7(), tok) || s.VerifyWebhookToken(b, tok[:63]+last) || (&Service{}).VerifyWebhookToken(b, tok) {
 		t.Fatal("a wrong brand, token or secret verified")
 	}
 	if !strings.HasPrefix(brand.WebhookPath(s.WebhookSecret, b), "/v1/billing/webhooks/killbill/brd_") {

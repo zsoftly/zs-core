@@ -22,6 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/zsoftly/zs-core/internal/kbplugin"
 	"github.com/zsoftly/zs-core/pkg/billing"
 	"github.com/zsoftly/zs-core/pkg/brand"
 	"github.com/zsoftly/zs-core/pkg/identity"
@@ -77,6 +78,11 @@ type Options struct {
 	// the billing one, and consume, release and overrides answer 503
 	// not_ready.
 	Quota *quota.Service
+	// PluginMirror serves the pinned plugin jars of ZS_PLUGIN_MIRROR_DIR at
+	// GET /v1/plugins/{name}/{version}.jar, behind PluginMirrorSecret,
+	// ZS_PLUGIN_MIRROR_SECRET. Without both the route answers 404.
+	PluginMirror       *kbplugin.Mirror
+	PluginMirrorSecret []byte
 	// Now defaults to time.Now.
 	Now func() time.Time
 }
@@ -95,6 +101,9 @@ type server struct {
 	metering   *metering.Service
 	quota      *quota.Service
 	now        func() time.Time
+
+	pluginMirror       *kbplugin.Mirror
+	pluginMirrorSecret []byte
 }
 
 // New returns the API handler.
@@ -117,6 +126,9 @@ func New(opts Options) http.Handler {
 		metering:   opts.Metering,
 		quota:      opts.Quota,
 		now:        opts.Now,
+
+		pluginMirror:       opts.PluginMirror,
+		pluginMirrorSecret: opts.PluginMirrorSecret,
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -125,6 +137,7 @@ func New(opts Options) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
+	mux.HandleFunc("GET /v1/plugins/{name}/{file}", s.getPluginJar)
 	mux.Handle("GET /v1/me", s.authenticate(http.HandlerFunc(s.getMe)))
 	mux.Handle("GET /v1/brands/{id}", s.authenticate(http.HandlerFunc(s.getBrand)))
 	mux.Handle("POST /v1/brands/{id}/apply", s.authenticate(http.HandlerFunc(s.applyBrand)))
@@ -165,6 +178,7 @@ func New(opts Options) http.Handler {
 	mux.Handle("GET /v1/tenants/{id}/entitlements/{feature}", s.member(s.checkEntitlement))
 	mux.Handle("GET /v1/tenants/{id}/invoices", s.member(s.listInvoices))
 	mux.Handle("GET /v1/tenants/{id}/invoices/{inv}", s.member(s.getInvoice))
+	mux.Handle("GET /v1/tenants/{id}/invoices/{inv}/html", s.member(s.getInvoiceHTML))
 	mux.Handle("GET /v1/tenants/{id}/invoices/{inv}/pdf", s.member(s.getInvoicePDF))
 	mux.Handle("GET /v1/tenants/{id}/payments", s.member(s.listPayments))
 	mux.Handle("POST /v1/tenants/{id}/payments/{pay}/refund", s.authenticate(http.HandlerFunc(s.refundPayment)))

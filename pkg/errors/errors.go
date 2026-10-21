@@ -95,13 +95,15 @@ const (
 	CodeAPIKeyInvalid      Code = "ZS-1700"
 	CodeAPIKeyOwnerRemoved Code = "ZS-1701"
 
-	CodeBillingRejected       Code = "ZS-1800"
-	CodeInvoicePDFUnavailable Code = "ZS-1801"
-	CodePluginUnavailable     Code = "ZS-1802"
-	CodeCreditCodeInvalid     Code = "ZS-1803"
-	CodeCreditCodeExhausted   Code = "ZS-1804"
-	CodeWalletOnHold          Code = "ZS-1805"
-	CodeBillingTokenInvalid   Code = "ZS-1806"
+	CodeBillingRejected        Code = "ZS-1800"
+	CodeInvoicePDFUnavailable  Code = "ZS-1801"
+	CodePluginUnavailable      Code = "ZS-1802"
+	CodeCreditCodeInvalid      Code = "ZS-1803"
+	CodeCreditCodeExhausted    Code = "ZS-1804"
+	CodeWalletOnHold           Code = "ZS-1805"
+	CodeBillingTokenInvalid    Code = "ZS-1806"
+	CodePluginTablesMissing    Code = "ZS-1807"
+	CodePDFRendererUnavailable Code = "ZS-1808"
 
 	CodeInsufficientCredit           Code = "ZS-1900"
 	CodeReservationNotFound          Code = "ZS-1901"
@@ -171,12 +173,14 @@ var definitions = []Definition{
 	{CodeAPIKeyInvalid, "api_key_invalid", http.StatusUnauthorized, false, "The API key is invalid, expired or revoked."},
 	{CodeAPIKeyOwnerRemoved, "api_key_owner_removed", http.StatusUnauthorized, false, "The member who created this API key is no longer active."},
 	{CodeBillingRejected, "billing_rejected", http.StatusUnprocessableEntity, false, "The billing engine rejected the request."},
-	{CodeInvoicePDFUnavailable, "invoice_pdf_unavailable", http.StatusNotFound, false, "No invoice template plugin renders PDF invoices for this brand."},
+	{CodeInvoicePDFUnavailable, "invoice_pdf_unavailable", http.StatusNotFound, false, "No PDF renderer is configured for invoice PDFs."},
 	{CodePluginUnavailable, "plugin_unavailable", http.StatusUnprocessableEntity, false, "The payment plugin cannot be installed or used."},
 	{CodeCreditCodeInvalid, "credit_code_invalid", http.StatusNotFound, false, "The code is unknown, disabled or expired."},
 	{CodeCreditCodeExhausted, "credit_code_exhausted", http.StatusConflict, false, "The code has no redemptions left."},
 	{CodeWalletOnHold, "wallet_on_hold", http.StatusConflict, false, "Billing changes are on hold for this tenant."},
 	{CodeBillingTokenInvalid, "billing_token_invalid", http.StatusUnauthorized, false, "The billing credential is invalid or expired."},
+	{CodePluginTablesMissing, "plugin_tables_missing", http.StatusUnprocessableEntity, false, "The Kill Bill database lacks the tables of a plugin."},
+	{CodePDFRendererUnavailable, "pdf_renderer_unavailable", http.StatusServiceUnavailable, true, "The PDF renderer is unavailable."},
 	{CodeInsufficientCredit, "insufficient_credit", http.StatusConflict, false, "The tenant does not have enough available credit."},
 	{CodeReservationNotFound, "reservation_not_found", http.StatusNotFound, false, "The reservation was not found."},
 	{CodeReservationNotHeld, "reservation_not_held", http.StatusConflict, false, "The reservation is no longer held."},

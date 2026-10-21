@@ -1,0 +1,72 @@
+<!doctype html>
+<!-- Kill Bill's invoice text has getters for its own keys, such as text.invoiceTitle. Any other key of the translation is read through the text.properties section, with the key as the section's content. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>{{text.invoiceTitle}} {{invoice.invoiceNumber}}</title>
+<style>
+body{font-family:Helvetica,Arial,sans-serif;color:#1f2933;font-size:13px;margin:0}
+.invoice{max-width:760px;margin:24px auto;padding:32px;border:1px solid #d9e2ec}
+header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:2px solid #102a43;padding-bottom:16px}
+h1{font-size:22px;margin:0 0 8px 0;color:#102a43}
+.meta{text-align:right}
+.parties{display:flex;justify-content:space-between;margin:24px 0}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;background:#f0f4f8;border-bottom:1px solid #bcccdc;padding:6px}
+td{border-bottom:1px solid #e4e7eb;padding:6px;vertical-align:top}
+td.amount,th.amount{text-align:right}
+.totals{margin-top:16px;text-align:right}
+.totals p{margin:4px 0}
+.note{margin-top:24px;color:#52606d;font-size:11px}
+</style>
+</head>
+<body>
+<main class="invoice">
+  <header>
+    <div>
+      <h1>{{#text.properties}}brandName{{/text.properties}}</h1>
+      <p class="seller">{{#text.properties}}sellerName{{/text.properties}}<br>{{#text.properties}}sellerAddress{{/text.properties}}<br>{{#text.properties}}countryName{{/text.properties}}<br>{{#text.properties}}sellerTaxRegistrations{{/text.properties}}</p>
+    </div>
+    <div class="meta">
+      <p><strong>{{text.invoiceTitle}}</strong><br>{{text.invoiceNumber}}{{invoice.invoiceNumber}}<br>{{text.invoiceDate}} {{invoice.formattedInvoiceDate}}<br>{{#text.properties}}currency{{/text.properties}} {{invoice.currency}}</p>
+    </div>
+  </header>
+  <section class="parties">
+    <div>
+      <strong>{{#text.properties}}billTo{{/text.properties}}</strong><br>
+      {{#account.name}}{{account.name}}<br>{{/account.name}}
+      {{#account.companyName}}{{account.companyName}}<br>{{/account.companyName}}
+      {{#account.address1}}{{account.address1}}<br>{{/account.address1}}
+      {{#account.city}}{{account.city}}{{#account.stateOrProvince}}, {{account.stateOrProvince}}{{/account.stateOrProvince}} {{account.postalCode}}<br>{{/account.city}}
+      {{account.country}}
+    </div>
+  </section>
+  <table>
+    <thead>
+      <tr>
+        <th>{{text.invoiceItemServicePeriod}}</th>
+        <th>{{text.invoiceItemDescription}}</th>
+        <th>{{#text.properties}}invoiceItemType{{/text.properties}}</th>
+        <th class="amount">{{text.invoiceItemAmount}}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{#invoice.invoiceItems}}
+      <tr class="item item-{{invoiceItemType}}">
+        <td>{{formattedStartDate}}{{#formattedEndDate}} - {{formattedEndDate}}{{/formattedEndDate}}</td>
+        <td><div>{{description}}</div><div>{{prettyPlanName}}</div></td>
+        <td>{{invoiceItemType}}</td>
+        <td class="amount">{{formattedAmount}}</td>
+      </tr>
+      {{/invoice.invoiceItems}}
+    </tbody>
+  </table>
+  <div class="totals">
+    <p>{{text.invoiceAmount}} {{invoice.formattedChargedAmount}}</p>
+    <p>{{text.invoiceAmountPaid}} {{invoice.formattedPaidAmount}}</p>
+    <p><strong>{{text.invoiceBalance}} {{invoice.formattedBalance}}</strong></p>
+  </div>
+  <p class="note">{{#text.properties}}taxNote{{/text.properties}}</p>
+</main>
+</body>
+</html>

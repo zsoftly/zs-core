@@ -13,7 +13,9 @@
 // scope.Bind. Functions that change one tenant inside Core take a pgx.Tx, so
 // a library caller can run them in its own transaction. Functions that also
 // call Keycloak or Kill Bill take a DB, because a database transaction cannot
-// span the engines: they commit Core rows only after the engines succeed.
+// span the engines: provisioning and lifecycle changes commit Core rows
+// after the engines succeed. Membership changes commit first and reconcile
+// their billing recipient and Organization projections after commit.
 package tenant
 
 import (
@@ -69,6 +71,7 @@ type Tenant struct {
 	KeycloakOrganizationID string
 	KillBillAccountID      string
 	BillingCountry         string
+	BillingRecipientStatus BillingRecipientStatus
 	CreatedByIdentityID    idgen.UUID
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
@@ -107,9 +110,14 @@ func unavailable(err error) error {
 // tenantColumnsOf lists the tenant columns scanTenant reads, qualified with
 // the table alias a, such as "t.", or unqualified when a is empty.
 func tenantColumnsOf(a string) string {
+	ref := a
+	if ref == "" {
+		ref = "tenants."
+	}
 	return a + "id, " + a + "brand_id, " + a + "kind, " + a + "slug, " + a + "name, " + a + "status, " + a + "activation, " +
 		a + "keycloak_organization_id, " + a + "killbill_account_id::text, coalesce(" + a + "billing_country, ''), " +
-		a + "created_by_identity_id, " + a + "created_at, " + a + "updated_at"
+		a + "created_by_identity_id, " + a + "created_at, " + a + "updated_at, " +
+		"coalesce((SELECT r.status FROM tenant_billing_recipients r WHERE r.brand_id = " + ref + "brand_id AND r.tenant_id = " + ref + "id), 'pending')"
 }
 
 var tenantColumns = tenantColumnsOf("")
@@ -118,7 +126,7 @@ func scanTenant(row pgx.Row) (Tenant, error) {
 	var t Tenant
 	var kind, status string
 	err := row.Scan(&t.ID, &t.BrandID, &kind, &t.Slug, &t.Name, &status, &t.Activation, &t.KeycloakOrganizationID,
-		&t.KillBillAccountID, &t.BillingCountry, &t.CreatedByIdentityID, &t.CreatedAt, &t.UpdatedAt)
+		&t.KillBillAccountID, &t.BillingCountry, &t.CreatedByIdentityID, &t.CreatedAt, &t.UpdatedAt, &t.BillingRecipientStatus)
 	t.Kind, t.Status = Kind(kind), Status(status)
 	return t, err
 }

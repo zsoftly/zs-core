@@ -7,7 +7,8 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/zs-core ./cmd/zs-core
 
 FROM alpine:3.22
-RUN addgroup -S -g 10001 zs && adduser -S -u 10001 -G zs -H -h /app zs
+RUN addgroup -S -g 10001 zs && adduser -S -u 10001 -G zs -H -h /app zs \
+    && mkdir -p /var/lib/zs-core/plugins && chown 10001:10001 /var/lib/zs-core/plugins
 WORKDIR /app
 COPY --from=build /out/zs-core /usr/local/bin/zs-core
 COPY components.yaml /app/components.yaml

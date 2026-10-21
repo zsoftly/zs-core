@@ -76,8 +76,8 @@ func EnqueueMirror(ctx context.Context, tx pgx.Tx, s scope.Scope, actor events.A
 }
 
 // MirrorHandler returns the outbox handler of MirrorEventType events. It
-// reads the tenant and runs SyncOrganization. A tenant that no longer exists
-// needs nothing. Without the engines the event waits.
+// reads the tenant and independently runs both engine projections. A tenant
+// that no longer exists needs nothing. Without the engines the event waits.
 func MirrorHandler(db DB, eng Engines) outbox.Handler {
 	return outbox.HandlerFunc(func(ctx context.Context, env events.Envelope) error {
 		if env.Type != MirrorEventType {
@@ -86,8 +86,6 @@ func MirrorHandler(db DB, eng Engines) outbox.Handler {
 		if !eng.Ready() {
 			return outbox.ErrDeliveryDeferred
 		}
-		ctx, cancel := context.WithTimeout(ctx, mirrorTimeout)
-		defer cancel()
 		t, err := Get(ctx, db, scope.Scope{Brand: env.Brand(), Tenant: env.Tenant()})
 		if errors.Is(err, ErrNotFound) {
 			return nil
@@ -95,8 +93,18 @@ func MirrorHandler(db DB, eng Engines) outbox.Handler {
 		if err != nil {
 			return err
 		}
-		_, err = SyncOrganization(ctx, db, eng, t, env.CorrelationID)
-		return err
+		// Try both projections even when one engine is unavailable. Each reads
+		// current Core state after the membership transaction has committed.
+		organizationCtx, cancelOrganization := context.WithTimeout(ctx, mirrorTimeout)
+		_, organizationErr := SyncOrganization(organizationCtx, db, eng, t, env.CorrelationID)
+		cancelOrganization()
+		recipientCtx, cancelRecipient := context.WithTimeout(ctx, mirrorTimeout)
+		recipient, recipientErr := ReconcileBillingRecipient(recipientCtx, db, eng, t.Scope(), env.CorrelationID)
+		cancelRecipient()
+		if recipient.Deferred && recipientErr == nil && organizationErr == nil {
+			recipientErr = outbox.ErrDeliveryDeferred
+		}
+		return errors.Join(organizationErr, recipientErr)
 	})
 }
 

@@ -33,6 +33,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/zsoftly/zs-core/internal/killbill"
+	"github.com/zsoftly/zs-core/internal/pdfrender"
 	"github.com/zsoftly/zs-core/internal/secrets"
 	"github.com/zsoftly/zs-core/pkg/audit"
 	"github.com/zsoftly/zs-core/pkg/brand"
@@ -60,7 +61,10 @@ type Service struct {
 	KillBill      *killbill.Client
 	Secrets       secrets.Resolver
 	WebhookSecret []byte
-	Log           *slog.Logger
+	// PDF renders invoice PDFs, from ZS_PDF_RENDERER_URL. Without it
+	// invoice PDFs answer invoice_pdf_unavailable.
+	PDF *pdfrender.Client
+	Log *slog.Logger
 	// Now defaults to time.Now.
 	Now func() time.Time
 }

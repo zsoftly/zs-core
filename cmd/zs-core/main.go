@@ -15,6 +15,8 @@
 //	zs-core credit sweep   run one pass of the credit expiry sweeper
 //	zs-core wallet sweep   expire reservations past their lease and reconcile wallets once
 //	zs-core usage forward  forward recorded usage to Kill Bill once
+//	zs-core plugin ddl show|apply  print or apply a pinned plugin's DDL
+//	zs-core plugin mirror sync     download the pinned plugin jars into the mirror
 //
 // Configuration comes from the environment only; see docs/configuration.md.
 package main
@@ -76,6 +78,14 @@ Commands:
   credit sweep   expire the credits Core issued that are past their expiry, once
   wallet sweep   expire reservations past their lease and reconcile every wallet with Kill Bill, once
   usage forward  forward recorded usage to Kill Bill as usage records, once
+  plugin ddl show <name>   print the DDL of a pinned plugin's jar, read from the mirror or the repository
+                   --components <file>    components file (default components.yaml)
+  plugin ddl apply <name>|--all  create the plugin's missing tables in the Kill Bill database
+                   --operator <name>      who applies, recorded with the DDL (required)
+                   --force                apply a DDL that differs from one recorded for the same version
+                   --components <file>    components file (default components.yaml)
+  plugin mirror sync       download every pinned plugin jar into ZS_PLUGIN_MIRROR_DIR and check it
+                   --components <file>    components file (default components.yaml)
 
 Configuration is read from ZS_* environment variables; see docs/configuration.md.
 `
@@ -114,6 +124,8 @@ func run(args, environ []string, stdout, stderr io.Writer) int {
 		return runWalletSweep(args[1:], environ, stdout, stderr)
 	case "usage":
 		return runUsageForward(args[1:], environ, stdout, stderr)
+	case "plugin":
+		return runPlugin(args[1:], environ, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0

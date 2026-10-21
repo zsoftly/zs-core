@@ -634,6 +634,27 @@ func (e TenantActivation) Valid() bool {
 	}
 }
 
+// Defines values for TenantBillingRecipientStatus.
+const (
+	TenantBillingRecipientStatusNoEligibleOwner TenantBillingRecipientStatus = "no_eligible_owner"
+	TenantBillingRecipientStatusPending         TenantBillingRecipientStatus = "pending"
+	TenantBillingRecipientStatusReady           TenantBillingRecipientStatus = "ready"
+)
+
+// Valid indicates whether the value is a known member of the TenantBillingRecipientStatus enum.
+func (e TenantBillingRecipientStatus) Valid() bool {
+	switch e {
+	case TenantBillingRecipientStatusNoEligibleOwner:
+		return true
+	case TenantBillingRecipientStatusPending:
+		return true
+	case TenantBillingRecipientStatusReady:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for TenantKind.
 const (
 	TenantKindOrganization TenantKind = "organization"
@@ -1937,6 +1958,9 @@ type Tenant struct {
 	Activation     TenantActivation `json:"activation"`
 	BillingCountry *string          `json:"billing_country"`
 
+	// BillingRecipientStatus Last observed projection of the managed primary billing email. Pending includes scheduled work or a failed upstream check. Ready means the scoped account matched an eligible owner at its last successful check. No eligible owner means the primary email was observed explicitly cleared. This status exposes no recipient address and promises no immediate revocation, delivery or recall of already queued mail.
+	BillingRecipientStatus TenantBillingRecipientStatus `json:"billing_recipient_status"`
+
 	// BrandId A brand ID.
 	BrandId   BrandId   `json:"brand_id"`
 	CreatedAt time.Time `json:"created_at"`
@@ -1954,6 +1978,9 @@ type Tenant struct {
 
 // TenantActivation defines model for Tenant.Activation.
 type TenantActivation string
+
+// TenantBillingRecipientStatus Last observed projection of the managed primary billing email. Pending includes scheduled work or a failed upstream check. Ready means the scoped account matched an eligible owner at its last successful check. No eligible owner means the primary email was observed explicitly cleared. This status exposes no recipient address and promises no immediate revocation, delivery or recall of already queued mail.
+type TenantBillingRecipientStatus string
 
 // TenantKind defines model for Tenant.Kind.
 type TenantKind string
@@ -2291,6 +2318,15 @@ type ListAuditEventsParams struct {
 type ApplyBrandParams struct {
 	// Reason Why the brand is applied. Recorded in audit and in Kill Bill. Required for a sensitive change.
 	Reason *string `form:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// GetPluginJarParams defines parameters for GetPluginJar.
+type GetPluginJarParams struct {
+	// Sha256 Exactly one lowercase SHA-256 value, equal to the currently serving `components.yaml` pin.
+	Sha256 string `form:"sha256" json:"sha256"`
+
+	// Token The jar's HMAC-SHA256 token over the plugin, version, and sha256 digest, for KPM.
+	Token *string `form:"token,omitempty" json:"token,omitempty"`
 }
 
 // ListApiKeysParams defines parameters for ListApiKeys.

@@ -2,28 +2,30 @@
 
 ## TL;DR
 
-Kill Bill is the billing engine and the financial authority. Core holds no balance, no invoice and no payment. Each brand is a Kill Bill tenant. Each Core tenant is a Kill Bill account keyed by the tenant ID. Billing routes read and write Kill Bill with the brand's credentials and Core's audit headers. Core keeps promo codes, credit expiry, a cache of billing standing, push notification receipts and plugin installs. Payment plugins run in test mode only, and brand apply refuses real-money mode. Products get a 15-minute Core credential and call Kill Bill through a proxy for the tenant's own account. Kill Bill push notifications become Core events in the outbox. The code is `pkg/billing` and `internal/httpapi/billing.go`.
+Kill Bill is the billing engine and the financial authority. Core holds no balance, no invoice and no payment. Each brand is a Kill Bill tenant. Each Core tenant is a Kill Bill account keyed by the tenant ID. Billing routes read and write Kill Bill with the brand's credentials and Core's audit headers. Core keeps promo codes, credit expiry, a cache of billing standing, push notification receipts, plugin installs and the plugin DDLs it applied. Payment and invoice plugins run in test mode only, and brand apply refuses real-money mode. A brand can run several payment plugins with one default. Products get a 15-minute Core credential and call Kill Bill through a proxy for the tenant's own account. Kill Bill push notifications become Core events in the outbox. Outbound webhook delivery is deferred for this candidate. The code is `pkg/billing` and `internal/httpapi/billing.go`.
 
 ## Mapping
 
 | Core | Kill Bill | Notes |
 | --- | --- | --- |
 | Brand | Tenant | Every call carries `X-Killbill-ApiKey` and `X-Killbill-ApiSecret` of the brand. Core resolves the secret from the brand's secret reference at each call and never stores it. |
-| Tenant | Account | External key is the `tnt_` ID. Currency is the brand's first currency. |
+| Tenant | Account | External key is the `tnt_` ID. Currency is the brand's first currency. The primary email follows the [eligible owner projection](tenants.md#billing-recipient-projection). |
 | Catalogue summary | `GET /1.0/kb/catalog` | The last version is in force. Prices become minor units. |
 | Billing summary | `GET /1.0/kb/accounts/{id}?accountWithBalanceAndCBA=true`, `/overdue`, `/block` | Balance and credit come from Kill Bill on every read. |
 | Subscription | Subscription | Kill Bill subscription ID. Created with an external key derived from the idempotency key. |
 | Plan change | `PUT /1.0/kb/subscriptions/{id}?billingPolicy=` | `immediate` is `IMMEDIATE`, `end_of_term` is `END_OF_TERM`. |
 | Cancellation | `DELETE /1.0/kb/subscriptions/{id}` | The policy applies to entitlement and billing. |
-| Invoice | Invoice | Read only. Lines on a single invoice. |
+| Invoice | Invoice | Read only. Lines on a single invoice. HTML and PDF are Kill Bill's rendering. See [invoices.md](invoices.md). |
 | Payment, refund | Payment, `POST /1.0/kb/payments/{id}/refunds` | Refunds by staff with a `billing` grant. The refund's transaction external key is derived from the idempotency key. |
-| Payment method | Payment method of the brand's plugin | `__EXTERNAL_PAYMENT__` when the brand names no plugin. |
+| Payment method | Payment method of the brand's default plugin | `__EXTERNAL_PAYMENT__` when the brand names no plugin. |
 | Hosted payment page | `POST /1.0/kb/paymentGateways/hosted/form` | Kill Bill adds a payment method of the plugin and asks it for its form. |
 | Credit | `POST /1.0/kb/credits?autoCommit=true` | A `CREDIT_ADJ` item. Kill Bill refuses zero and negative amounts with error code 4009. |
 | Credit expiry | `POST /1.0/kb/invoices/charges/{accountId}?autoCommit=true` | An external charge, which Kill Bill pays from the account credit. |
 | Standing | Overdue state and blocking states | Cached in `tenant_billing_standing`. Kill Bill stays the authority. |
 | Push notification | `POST /1.0/kb/tenants/registerNotificationCallback?cb=` | One callback per Kill Bill tenant. Registering replaces the previous one. |
-| Plugin install | `POST /1.0/kb/nodesInfo` with `INSTALL_PLUGIN` and `START_PLUGIN` | KPM, as `deploy/compose/killbill/bootstrap.sh` does. |
+| Plugin install | `POST /1.0/kb/nodesInfo` with `INSTALL_PLUGIN` and `START_PLUGIN` | KPM, from Core's verified plugin mirror. See [plugins.md](plugins.md). |
+
+The managed primary billing email converges after Core membership commits. Reconciliation compares the scoped account, sends only a changed primary email and checks readback. An unavailable engine leaves the projection pending and never rolls back access reduction. Additional account emails remain unmanaged. Doctor reads them and warns with the account ID, never an address, when any exist. A failed read fails inspection rather than claiming there are no additional recipients. Core never adds or deletes those entries. Already queued or sent mail is not recalled. See [tenants.md](tenants.md#billing-recipient-projection) for selection, status and retry limits. Final invoice on tenant closure remains an open owner decision.
 
 Objects that live in Kill Bill only, such as subscriptions, invoices, payments and payment methods, are named by their Kill Bill ID. Core never maps them to Core IDs.
 
@@ -35,10 +37,12 @@ Objects that live in Kill Bill only, such as subscriptions, invoices, payments a
 | `credit_code_redemptions` | Tenant, a code of the same brand, Kill Bill credit and invoice IDs, amount, expiry of the credit, the part reversed, the sweeper's failed attempts | A balance |
 | `staff_credits` | Tenant, idempotency key, Kill Bill credit and invoice IDs, amount, reason, expiry, the part reversed, the sweeper's failed attempts | A balance |
 | `tenant_billing_standing` | Overdue state name, whether it blocks changes or entitlement, last Kill Bill event | Amounts |
+| `tenant_billing_recipients` | Scoped owner membership binding, observed projection status and retry/check metadata | Recipient address, mail-delivery receipt or amount |
 | `killbill_notifications` | Digest of each push notification and of the state Core read for it, its type, tenant, object and that state, for seven days | The notification body |
 | `killbill_plugin_installs` | Plugin, version, Kill Bill node, the brand whose apply installed it, times | Configuration |
+| `killbill_plugin_ddl` | Plugin, version, SHA-256 of the DDL, its tables, the tables the last apply created, the operator | The DDL text |
 
-Core never stores a balance, an invoice, a payment, card data or a payment method reference. It never logs card data, payment method references, plugin properties, plugin configuration or Kill Bill secrets. Every amount in the tables above names the Kill Bill object it produced.
+Core never stores a balance, an invoice, a payment, card data or a payment method reference. Core's redaction controls do not cover upstream Kill Bill or plugin logging. The selected [reference Compose controls](../../deploy/compose/README.md) suppress the upstream email-handler, KPM and Beatrix event-dispatch categories, including errors, at the cost of diagnostic detail and event-dispatch diagnostics. Other deployments must configure equivalent controls. Treat suppression as unproven until the effective JVM configuration, selected configuration and every enabled sink have been checked with synthetic values. Every amount in the tables above names the Kill Bill object it produced.
 
 ## Routes
 
@@ -49,7 +53,7 @@ Core never stores a balance, an invoice, a payment, card data or a payment metho
 | `GET, POST /v1/tenants/{id}/subscriptions` | `billing:read`, `billing:manage` |
 | `POST /v1/tenants/{id}/subscriptions/{sub}/change`, `DELETE /v1/tenants/{id}/subscriptions/{sub}` | `billing:manage` |
 | `GET /v1/tenants/{id}/entitlements/{feature}` | `tenant:read` |
-| `GET /v1/tenants/{id}/invoices`, `.../invoices/{inv}`, `.../invoices/{inv}/pdf` | `billing:read` |
+| `GET /v1/tenants/{id}/invoices`, `.../invoices/{inv}`, `.../invoices/{inv}/html`, `.../invoices/{inv}/pdf` | `billing:read` |
 | `GET /v1/tenants/{id}/payments` | `billing:read` |
 | `POST /v1/tenants/{id}/payments/{pay}/refund` | Staff `billing` grant |
 | `GET, POST /v1/tenants/{id}/payment-methods`, `PUT .../payment-methods/{pm}/default`, `DELETE .../payment-methods/{pm}` | `billing:read`, `billing:manage` |
@@ -145,9 +149,9 @@ A pass holds a database advisory lock on its own connection. It keeps no transac
 - `hosted_page: true`: Kill Bill adds a payment method of the plugin and asks the plugin for the form of its hosted payment page. The answer carries the form's URL, method and fields. The fields include the provider's client-side token when the plugin sets one. The customer completes the page with the provider. The external payment plugin returns an empty form.
 - `external_payment_method_id`: the token the provider's own client library made in the browser, such as a Stripe payment method ID. The Stripe plugin 8.0.3 refuses a payment method without it or a `sessionId` property.
 
-`plugin_properties` and `hosted_page_fields` pass keys and values to the plugin. They are never logged. The external payment plugin takes one payment method per account, and Kill Bill refuses to delete the default payment method. Both refusals are `422 billing_rejected`.
+`plugin_properties` and `hosted_page_fields` pass keys and values to the plugin. Core redaction does not establish upstream plugin log safety. The external payment plugin takes one payment method per account, and Kill Bill refuses to delete the default payment method. Both refusals are `422 billing_rejected`.
 
-Invoice PDFs need an invoice template plugin. `components.yaml` pins none in this release, so `GET .../invoices/{inv}/pdf` answers `404 invoice_pdf_unavailable` for an invoice of the tenant.
+`GET .../invoices/{inv}/html` returns Kill Bill's rendering of the invoice with the brand's template, in the locale of the tenant's account. `GET .../invoices/{inv}/pdf` renders that HTML through the PDF renderer of `ZS_PDF_RENDERER_URL`. Without a renderer it answers `404 invoice_pdf_unavailable` for an invoice of the tenant. See [invoices.md](invoices.md).
 
 ## Billing credentials and the proxy
 
@@ -175,25 +179,25 @@ So the proxy never writes blocking states, payments, refunds, credits, usage or 
 
 No payment plugin takes real money in this release.
 
-- `billing.payment_plugin.mode` is required. `test` is the only accepted value. `live` is refused with `400 brand_manifest_invalid`: "must be test, because v1 refuses live and no payment plugin may take real money".
-- The plugin must be in `approved_payment_plugins` of `components.yaml`. A plugin with status `no_java_artifact`, such as `paypal-express`, or any other plugin, is `422 plugin_unavailable`. A plugin with no test-mode rule is also `422 plugin_unavailable`. A manifest `version` other than the pin is refused.
-- `billing.payment_plugin.config_key` is empty or `killbill-<name>`. Kill Bill hands a plugin the configuration stored under its own service name. Any other key would upload a configuration that another plugin reads, so it is `400 brand_manifest_invalid`.
+- `mode` is required on each plugin of `billing.payment_plugins`, on `billing.payment_plugin`, its one-plugin form, and on `billing.invoice_plugin`. `test` is the only accepted value. `live` is refused with `400 brand_manifest_invalid`: "must be test, because v1 refuses live and no payment plugin may take real money".
+- `billing.payment_plugins` has exactly one plugin with `default: true`. It is the plugin of the brand's payment methods and of the billing proxy. A plugin listed twice, or both forms at once, is `400 brand_manifest_invalid`.
+- A payment plugin must be in `approved_payment_plugins` of `components.yaml`, and an invoice plugin in `approved_invoice_plugins`. A plugin with status `no_java_artifact`, such as `paypal-express`, or any other plugin, is `422 plugin_unavailable`. A plugin with no test-mode rule is also `422 plugin_unavailable`. A manifest `version` other than the pin is refused.
+- `config_key` is empty or `killbill-<name>`. Kill Bill hands a plugin the configuration stored under its own service name. Any other key would upload a configuration that another plugin reads, so it is `400 brand_manifest_invalid`.
 - Core reads the configuration as Kill Bill does, as a Java properties text read by Java 11, Kill Bill's runtime. `pkg/brand/testdata/java_properties.json` records how Kill Bill's own JVM reads a set of texts, and the parser must match it.
 - Core also refuses parts of the format that a reader other than Java's could misread. A configuration with a `\u` escape, a carriage return that does not end a line, a line that ends with a continuation backslash, or a byte that is not ASCII is `422 brand_apply_rejected`. The message names the rule.
-- Every known plugin's rule runs against every configuration, whatever the plugin. A Stripe key that does not start with `sk_test_` is refused under any plugin, and so is an Adyen environment other than `TEST`.
+- Every known plugin's rule runs against every configuration, whatever the plugin. A Stripe key that does not start with `sk_test_` is refused under any plugin, and so is an Adyen environment other than `TEST` or an AvaTax endpoint other than the sandbox.
 - Stripe: the configuration must set `org.killbill.billing.plugin.stripe.apiKey`, and every value it gets must start with `sk_test_`. A configuration without the key is refused, because Core cannot see a key the Kill Bill node takes from its environment.
 - Adyen: the configuration must set `org.killbill.billing.plugin.adyen.enviroment`, as the plugin 0.10.0 spells it, to `TEST`. Unset is refused. `org.killbill.billing.plugin.adyen.environment` must be `TEST` too when it is set.
-- A refused Stripe key or Adyen environment is `422 brand_apply_rejected`.
+- AvaTax: the configuration must set `org.killbill.billing.plugin.avatax.url` to an `https` URL on `sandbox-rest.avatax.com`, the sandbox the plugin's documentation names. Every value of it and of `org.killbill.billing.plugin.avatax.taxratesapi.url` must be on that host.
+- A refused Stripe key, Adyen environment or AvaTax endpoint is `422 brand_apply_rejected`.
 
-Apply checks the configuration before anything changes, and its error never holds a configuration value. A change of plugin, version, mode, configuration key or reference, or of the configuration in Kill Bill, is a payment plugin change and needs a reason. Over HTTP it also needs recent MFA. The Adyen plugin also reads an `ADYEN_ENVIROMENT` environment variable on the Kill Bill node. Keep it unset.
+Apply checks the configuration before anything changes, and its error never holds a configuration value. A change of a plugin, its version, mode, default, configuration key or reference, or of any plugin configuration in Kill Bill, is a plugin change and needs a reason. Over HTTP it also needs recent MFA. The Adyen plugin also reads an `ADYEN_ENVIROMENT` environment variable on the Kill Bill node. Keep it unset.
 
 ## Plugin install
 
-When the manifest names an approved plugin, apply makes sure the pinned version runs on every Kill Bill node. A missing plugin is installed with an `INSTALL_PLUGIN` node command whose `pluginUri` is the jar in `killbill_plugins.repository` of `components.yaml`. A stopped plugin is started with `START_PLUGIN`. Apply waits up to five minutes for `RUNNING` on every node and records each node in `killbill_plugin_installs`. Another installed version is refused with `422 brand_apply_rejected`, and the upgrade runbook applies. The diff shows the install as the target `killbill.plugin`, and audit as `brand.killbill.plugin.created` or `.updated`. Apply then uploads the per-tenant configuration from the secret reference, as before.
+When the manifest names an approved plugin, apply makes sure the pinned version runs on every Kill Bill node, and uploads the plugin's per-tenant configuration when it differs. Every payment plugin, the invoice plugin and, for `billing.email`, the email-notifications plugin go through the same path. Another installed version is refused with `422 brand_apply_rejected`, and the upgrade runbook applies.
 
-`killbill_plugins.repository` in `components.yaml` must be an `https` URL. Each plugin artifact there carries `sha256`, the SHA-256 of its jar, read from Maven Central. Before `INSTALL_PLUGIN`, Core downloads the jar, at most 512 MiB, and compares its SHA-256 with the pin. A mismatch is `422 brand_apply_rejected`, and nothing is installed. KPM then downloads the same URL itself, because Core cannot hand KPM a file on the Kill Bill node. Between the two downloads the repository could serve another jar. Phase 5 closes that window with an artifact mirror that Core hosts.
-
-A plugin's own tables are not created by Kill Bill or by Core. Core has no access to Kill Bill's database. The Stripe plugin 8.0.3 reaches `RUNNING` without them, but payments through it fail until its `ddl.sql` is loaded. On the reference stack, `deploy/compose/killbill/bootstrap.sh` loads it when `STRIPE_TEST_SECRET_KEY` is set. Elsewhere it is a deployment step.
+New KPM installs require Core's verified plugin mirror, configured with `ZS_PLUGIN_MIRROR_URL` and `ZS_PLUGIN_MIRROR_SECRET`. Core checks each mirror response against the SHA-256 in `components.yaml`, then the mirror serves KPM a fresh verified snapshot. A plugin's own tables are a deployment step, `zs-core plugin ddl apply`. Brand apply on the command line with `ZS_KILLBILL_DATABASE_URL` refuses a plugin whose tables are missing with `422 plugin_tables_missing`. See [plugins.md](plugins.md).
 
 ## Push notifications
 
@@ -245,8 +249,8 @@ Every Kill Bill write also carries `X-Killbill-CreatedBy` (the Core principal, s
 
 - Credit expiry assumes Core credits are used oldest first and other credit last. Kill Bill does not report usage per credit.
 - A tenant's expired credits wait while it has a pending credit. A pending credit completes only when its request is retried.
-- Core checks a plugin jar's digest, and then KPM downloads the jar again. Phase 5 moves to a Core-hosted artifact mirror.
+- New plugin installs require Core's verified mirror URL and secret. Without them, apply refuses the install before making changes. See [plugins.md](plugins.md#the-mirror).
 - The proxy accepts the small set of requests above. A product that needs more calls Core's routes or asks for a wider rule.
-- Invoice PDFs wait for an approved invoice template plugin.
-- Payment plugin tables are a deployment step.
-- `billing.*` events wait in the outbox until the Phase 5 webhook relay delivers them.
+- Invoice numbers come from one Kill Bill sequence for the whole server. They have gaps within a brand. See [invoices.md](invoices.md#invoice-numbers).
+- Plugin tables are a deployment step, `zs-core plugin ddl apply`. `serve` never checks them, doctor does.
+- `billing.*` events remain in the existing outbox; outbound delivery is deferred for this candidate.

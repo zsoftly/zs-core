@@ -236,6 +236,26 @@ func (s *server) getInvoice(w http.ResponseWriter, r *http.Request) {
 	s.writeAs(w, r, http.StatusOK, inv, &gen.Invoice{})
 }
 
+// invoiceHTMLPolicy keeps an invoice page inert in a browser: no script,
+// no fetch, no form, inline styles and data images only.
+const invoiceHTMLPolicy = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; sandbox"
+
+func (s *server) getInvoiceHTML(w http.ResponseWriter, r *http.Request) {
+	svc, sc, _, ok := s.tenantBilling(w, r, "billing:read")
+	if !ok {
+		return
+	}
+	html, err := svc.InvoiceHTML(r.Context(), sc, r.PathValue("inv"))
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", invoiceHTMLPolicy)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(html)
+}
+
 func (s *server) getInvoicePDF(w http.ResponseWriter, r *http.Request) {
 	svc, sc, _, ok := s.tenantBilling(w, r, "billing:read")
 	if !ok {
@@ -246,9 +266,11 @@ func (s *server) getInvoicePDF(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	defer pdf.Body.Close()
 	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition", `inline; filename="invoice.pdf"`)
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(pdf)
+	_, _ = io.Copy(w, pdf.Body)
 }
 
 func (s *server) listPayments(w http.ResponseWriter, r *http.Request) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/zsoftly/zs-core/internal/keycloak"
 	"github.com/zsoftly/zs-core/internal/killbill"
 	"github.com/zsoftly/zs-core/pkg/audit"
+	"github.com/zsoftly/zs-core/pkg/brand"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/events"
 	"github.com/zsoftly/zs-core/pkg/idempotency"
@@ -38,8 +40,13 @@ type CreateRequest struct {
 	// IdempotencyKey is required for an organization and ignored for a
 	// personal tenant, which is unique per identity.
 	IdempotencyKey string
-	Actor          events.Actor
-	CorrelationID  string
+	// Locale is the creator's locale, such as fr or fr-CA, from the token.
+	// The Kill Bill account gets it when the brand offers it, and the
+	// brand's default locale otherwise. Kill Bill renders the tenant's
+	// invoices and email in the account's locale.
+	Locale        string
+	Actor         events.Actor
+	CorrelationID string
 }
 
 // provisioning is a row of tenant_provisioning.
@@ -58,6 +65,9 @@ type provisioning struct {
 	AccountID      string
 	Attempts       int
 	Claim          []byte
+	// BillingLocale is the creator's locale in Kill Bill's form, such as
+	// fr_CA, or "".
+	BillingLocale string
 }
 
 func (p provisioning) scope() scope.Scope { return scope.Scope{Brand: p.BrandID, Tenant: p.TenantID} }
@@ -66,13 +76,13 @@ func (p provisioning) publicID() string { return idgen.Format(idgen.Tenant, p.Te
 
 const provisioningColumns = `tenant_id, brand_id, kind, slug, name, coalesce(billing_country, ''), created_by_identity_id,
        coalesce(idempotency_key, ''), fingerprint, status, coalesce(keycloak_organization_id, ''),
-       coalesce(killbill_account_id::text, ''), attempts, claim_token`
+       coalesce(killbill_account_id::text, ''), attempts, claim_token, coalesce(billing_locale, '')`
 
 func scanProvisioning(row pgx.Row) (provisioning, error) {
 	var p provisioning
 	var kind string
 	err := row.Scan(&p.TenantID, &p.BrandID, &kind, &p.Slug, &p.Name, &p.BillingCountry, &p.CreatedBy,
-		&p.IdempotencyKey, &p.Fingerprint, &p.Status, &p.OrgID, &p.AccountID, &p.Attempts, &p.Claim)
+		&p.IdempotencyKey, &p.Fingerprint, &p.Status, &p.OrgID, &p.AccountID, &p.Attempts, &p.Claim, &p.BillingLocale)
 	p.Kind = Kind(kind)
 	return p, err
 }
@@ -218,9 +228,10 @@ func begin(ctx context.Context, db DB, req CreateRequest, kind Kind, name, finge
 		key = req.IdempotencyKey
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO tenant_provisioning
-    (tenant_id, brand_id, kind, slug, name, billing_country, created_by_identity_id, idempotency_key, fingerprint)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING`,
-		id, req.Brand, string(kind), deriveSlug(name, id), name, nullable(req.BillingCountry), req.Creator, key, fingerprint); err != nil {
+    (tenant_id, brand_id, kind, slug, name, billing_country, created_by_identity_id, idempotency_key, fingerprint, billing_locale)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING`,
+		id, req.Brand, string(kind), deriveSlug(name, id), name, nullable(req.BillingCountry), req.Creator, key, fingerprint,
+		nullable(billingLocale(req.Locale))); err != nil {
 		return provisioning{}, nil, unavailable(err)
 	}
 	where := `brand_id = $1 AND created_by_identity_id = $2 AND idempotency_key = $3`
@@ -297,9 +308,10 @@ func provision(ctx context.Context, db DB, eng Engines, p provisioning, actor ev
 	if err != nil {
 		return Tenant{}, failProvisioning(ctx, db, p, "engines", err, actor, correlationID)
 	}
-	var keycloakUser string
-	if err := db.QueryRow(ctx, `SELECT coalesce(keycloak_user_id, '') FROM identities WHERE brand_id = $1 AND id = $2`,
-		p.BrandID, p.CreatedBy).Scan(&keycloakUser); err != nil {
+	var keycloakUser, email string
+	if err := db.QueryRow(ctx, `SELECT coalesce(keycloak_user_id, ''), CASE WHEN email_verified THEN coalesce(email, '') ELSE '' END
+FROM identities WHERE brand_id = $1 AND id = $2`,
+		p.BrandID, p.CreatedBy).Scan(&keycloakUser, &email); err != nil {
 		return Tenant{}, failProvisioning(ctx, db, p, "identity", unavailable(err), actor, correlationID)
 	}
 	if p.OrgID == "" {
@@ -318,7 +330,7 @@ func provision(ctx context.Context, db DB, eng Engines, p provisioning, actor ev
 		}
 	}
 	if p.AccountID == "" {
-		account, err := ensureAccount(ctx, eng.KillBill, be, p, correlationID)
+		account, err := ensureAccount(ctx, eng.KillBill, be, p, email, correlationID)
 		if err != nil {
 			return Tenant{}, failProvisioning(ctx, db, p, "killbill.account", engineError(err), actor, correlationID)
 		}
@@ -365,7 +377,34 @@ func ensureOrganization(ctx context.Context, kc *keycloak.Client, realm string, 
 
 func fallbackOrganizationName(name, tenantID string) string { return name + " (" + tenantID + ")" }
 
-func ensureAccount(ctx context.Context, kb *killbill.Client, be brandEngines, p provisioning, correlationID string) (string, error) {
+// billingLocale turns a locale from a token, such as fr or fr-CA, into Kill
+// Bill's form, fr or fr_CA, or "" when it is not one.
+func billingLocale(locale string) string {
+	l := brand.KillBillLocale(locale)
+	if !killBillLocale.MatchString(l) {
+		return ""
+	}
+	return l
+}
+
+var killBillLocale = regexp.MustCompile(`^[a-z]{2}(_[A-Z]{2})?$`)
+
+// accountLocale is the locale of a new Kill Bill account: the creator's
+// locale when the brand offers it, otherwise the brand's default locale.
+func accountLocale(be brandEngines, requested string) string {
+	for _, l := range be.locales {
+		if brand.KillBillLocale(l) == requested && requested != "" {
+			return requested
+		}
+	}
+	return brand.KillBillLocale(be.defaultLocale)
+}
+
+// ensureAccount finds or creates the tenant's Kill Bill account. A new
+// account gets the tenant's locale and the creator's verified email, which
+// Kill Bill renders invoices in and the email-notifications plugin writes
+// to.
+func ensureAccount(ctx context.Context, kb *killbill.Client, be brandEngines, p provisioning, email, correlationID string) (string, error) {
 	tid := p.publicID()
 	found, err := kb.AccountByExternalKey(ctx, be.creds, tid)
 	if err == nil {
@@ -376,6 +415,7 @@ func ensureAccount(ctx context.Context, kb *killbill.Client, be brandEngines, p 
 	}
 	id, err := kb.CreateAccount(ctx, be.creds, callContext(correlationID, "tenant created"), killbill.Account{
 		Name: p.Name, ExternalKey: tid, Currency: be.currency, Country: p.BillingCountry,
+		Locale: accountLocale(be, p.BillingLocale), Email: email,
 	})
 	if errors.Is(err, killbill.ErrConflict) {
 		found, ferr := kb.AccountByExternalKey(ctx, be.creds, tid)
@@ -490,6 +530,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8, $9) RETURNING `+tenantColumns, arg
 	}
 	owner, err := addMembership(ctx, tx, s, p.CreatedBy, RoleOwner)
 	if err != nil {
+		return Tenant{}, err
+	}
+	if err := scheduleBillingRecipient(ctx, tx, s, owner.ID, Caller{Actor: actor, CorrelationID: correlationID}); err != nil {
 		return Tenant{}, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE tenant_provisioning SET status = 'completed', completed_at = now(), updated_at = now(),

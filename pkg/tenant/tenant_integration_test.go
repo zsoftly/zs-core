@@ -241,8 +241,9 @@ WHERE status = 'pending' AND last_error LIKE 'killbill.account:%'`).Scan(&tenant
 	if a, ok := e.fake.Account(e.brand.Slug, tn.PublicID()); !ok || a.ID != tn.KillBillAccountID {
 		t.Fatalf("account = %+v %v", a, ok)
 	}
-	if got := actions(t, e.db, sc); got[0] != "tenant.created:success" {
-		t.Fatalf("audit after sweep = %v", got)
+	wantAudit := []string{"tenant.billing_recipient.reconciled:success", "tenant.created:success", "tenant.created:failure"}
+	if got := actions(t, e.db, sc); !slices.Equal(got, wantAudit) {
+		t.Fatalf("audit after sweep = %v, want %v", got, wantAudit)
 	}
 	// The client's retry with the same key now returns the tenant.
 	if again, err := e.createOrg(owner, "Rollback Ltd", "rollback-key"); err != nil || again.ID != tenantID {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -357,7 +358,16 @@ func TestSensitiveFields(t *testing.T) {
 		"provider": {func(m *Manifest) { m.Identity.IdentityProviders = []IdentityProvider{{Alias: "corp", Type: "oidc"}} }, nil, "identity.identity_providers"},
 		"payment plugin": {func(m *Manifest) {
 			m.Billing.PaymentPlugin = &PaymentPlugin{Name: "stripe", ConfigRef: "env://BRAND_ZS_REFERENCE__P"}
-		}, nil, "billing.payment_plugin"},
+		}, nil, "billing.payment_plugins"},
+		"default payment plugin": {func(m *Manifest) {
+			m.Billing.PaymentPlugins = []PaymentPlugin{{Name: "stripe", ConfigRef: "env://BRAND_ZS_REFERENCE__P"}, {Name: "adyen", ConfigRef: "env://BRAND_ZS_REFERENCE__A", Default: true}}
+		}, nil, "billing.payment_plugins"},
+		"invoice plugin": {func(m *Manifest) {
+			m.Billing.InvoicePlugin = &InvoicePlugin{Name: "avatax", Mode: PaymentModeTest, ConfigRef: "env://BRAND_ZS_REFERENCE__T"}
+		}, nil, "billing.invoice_plugin"},
+		"email smtp": {func(m *Manifest) {
+			m.Billing.Email = &Email{Sender: "billing@example.test", SMTP: SMTP{Host: "smtp.example.test", Port: 25}}
+		}, nil, "billing.email.smtp"},
 		// Drift in Keycloak with an unchanged manifest still counts.
 		"client drift": {func(*Manifest) {}, []Change{{Target: TargetClient, Name: "zs-staff", Fields: []FieldChange{{Field: "identity.staff_client.secret", Redacted: true}}}}, "identity.staff_client.secret"},
 		"flow drift":   {func(*Manifest) {}, []Change{{Target: TargetFlow, Name: FlowMFA, Fields: []FieldChange{{Field: "executions.auth-otp-form.requirement"}}}}, "executions.auth-otp-form.requirement"},
@@ -429,11 +439,22 @@ func TestRequireRealmSSLOverHTTP(t *testing.T) {
 // An HTTP apply of one brand may read only files under that brand's
 // directory; the command line reads the manifest's directory.
 func TestReadFilesIsBrandScoped(t *testing.T) {
-	brandRoot := fstest.MapFS{"catalogue.xml": {Data: []byte("<catalog/>")}}
+	brandRoot := os.DirFS(filepath.Join("..", "..", "brands", "zs-reference"))
 	m := reference(t) // catalogue: zs-reference/catalogue.xml
 	got, err := readFiles(brandRoot, "zs-reference/", m)
-	if err != nil || string(got["zs-reference/catalogue.xml"]) != "<catalog/>" {
+	if err != nil || !strings.Contains(string(got["zs-reference/catalogue.xml"]), "<catalog") {
 		t.Fatalf("own file: %v", err)
+	}
+	// The email templates directory is read per locale. Files the brand
+	// does not override are absent and skipped.
+	if _, ok := got["zs-reference/email/fr/InvoiceCreation.mustache"]; !ok {
+		t.Fatalf("email template not read: %v", keysOf(got))
+	}
+	if _, ok := got["zs-reference/email/en/UpcomingInvoice.mustache"]; ok {
+		t.Fatal("an absent email template was read")
+	}
+	if !strings.Contains(string(got["zs-reference/invoices/translation-fr.properties"]), "Facture") {
+		t.Fatalf("invoice translation not read: %v", keysOf(got))
 	}
 	m.Billing.Catalogue = "zs-second/catalogue.xml"
 	if _, err := readFiles(brandRoot, "zs-reference/", m); codeOf(err) != "brand_manifest_invalid" || !strings.Contains(messageOf(err), "zs-reference/") {
@@ -446,10 +467,32 @@ func TestReadFilesIsBrandScoped(t *testing.T) {
 	if _, err := readFiles(nil, "zs-reference/", reference(t)); codeOf(err) != "brand_manifest_invalid" {
 		t.Fatalf("no brand directory: %v", err)
 	}
-	cliRoot := fstest.MapFS{"zs-reference/catalogue.xml": {Data: []byte("<catalog/>")}}
-	if _, err := readFiles(cliRoot, "", reference(t)); err != nil {
+	if _, err := readFiles(os.DirFS(brandsDirForTest()), "", reference(t)); err != nil {
 		t.Fatalf("command line: %v", err)
 	}
+	// A required template that is missing, and a template that is not
+	// UTF-8, are refused.
+	missing := reference(t)
+	missing.Billing.InvoiceTemplates.Template = "zs-reference/invoices/none.html"
+	if _, err := readFiles(brandRoot, "zs-reference/", missing); codeOf(err) != "brand_manifest_invalid" || !strings.Contains(messageOf(err), "/billing/invoice_templates/template") {
+		t.Fatalf("missing template: %v", err)
+	}
+	latin1 := fstest.MapFS{"invoice.html": {Data: []byte("caf\xe9")}}
+	bad := &Manifest{Identity: Identity{Locales: []string{"en"}}, Billing: Billing{InvoiceTemplates: &InvoiceTemplates{Template: "invoice.html"}}}
+	if _, err := readFiles(latin1, "", bad); codeOf(err) != "brand_manifest_invalid" || !strings.Contains(messageOf(err), "not UTF-8") {
+		t.Fatalf("template that is not UTF-8: %v", err)
+	}
+}
+
+func brandsDirForTest() string { return filepath.Join("..", "..", "brands") }
+
+func keysOf(m files) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestKillBillErrorsMapToCodes(t *testing.T) {

@@ -2,17 +2,19 @@
 
 ## TL;DR
 
-A Core release is a tested bundle: pinned Keycloak, Kill Bill, KAUI and Postgres images, the Core extensions built against them, the Core API, and the upgrade notes. `components.yaml` is the single place versions live. `deploy/compose` brings the reference stack up from one command. `zs-core doctor` proves a running stack matches the release. `docs/upgrades/` holds one runbook per component, with the rehearsal record for each version step. Products upgrade by taking a Core release, never by bumping a component on their own. This is the Phase 2 contract.
+A Core release is a tested bundle: pinned Keycloak, Kill Bill, KAUI and Postgres images, the optional PDF renderer, the approved Kill Bill plugins, the Core extensions built against them, the Core API, and the upgrade notes. `components.yaml` is the single place versions live. `deploy/compose` brings the reference stack up from one command. `zs-core doctor` proves a running stack matches the release. `docs/upgrades/` holds one runbook per component, with the rehearsal record for each version step. Products upgrade by taking a Core release, never by bumping a component on their own. This is the Phase 2 contract.
 
 ## Components
 
-See `components.yaml`. Each entry pins a version, an image reference, and the upstream source. Images carry a tag and a digest in `components.yaml`. The compose file uses the tag.
+See `components.yaml`. Each entry pins a version, an image reference, and the upstream source. Images carry a tag and a digest in `components.yaml`. The compose file uses the digest, with the tag in a comment. An entry with `optional: true`, such as Gotenberg, may be left out of a deployment. `licence` records the component's licence where Core pins a component it did not have before, such as Gotenberg under MIT.
+
+Kill Bill plugins are pinned under `killbill_plugins` by Maven artifact, version, jar SHA-256 and the tables they create. See [plugins.md](plugins.md).
 
 ## Reference stack
 
-`deploy/compose/compose.yaml` runs: Postgres 18 (one instance, separate databases for Keycloak, Kill Bill, KAUI and Core), Keycloak 26.8.1 in production mode behind its own hostname settings, Kill Bill 0.24.22 with KPM and the bundled plugins, KAUI 4.0.31, and Core. Mailpit catches email. Everything binds to loopback. Run `make stack-up` to start it and `make stack-down` to stop it. `make stack-reset` wipes data.
+`deploy/compose/compose.yaml` runs: Postgres 18 (one instance, separate databases for Keycloak, Kill Bill, KAUI and Core), Keycloak 26.8.1 in production mode behind its own hostname settings, Kill Bill 0.24.22 with KPM and the bundled plugins, KAUI 4.0.31, Gotenberg 8.38.1 for invoice PDFs, and Core. Mailpit catches email. Everything binds to loopback. Run `make stack-up` to start it and `make stack-down` to stop it. `make stack-reset` wipes data.
 
-Keycloak: the stack imports a `zs-reference` realm from `deploy/compose/keycloak/`. It has the customer and staff clients and the `en` and `fr` locales, so the token tests have a real issuer. Kill Bill: the stack creates a `zs-reference` tenant with the test catalogue and the Stripe plugin in test mode when `STRIPE_TEST_SECRET_KEY` is present, otherwise with the built-in `__EXTERNAL_PAYMENT__` plugin.
+Keycloak: the stack imports a `zs-reference` realm from `deploy/compose/keycloak/`. It has the customer and staff clients and the `en` and `fr` locales, so the token tests have a real issuer. Kill Bill: the bootstrap creates a `zs-reference` tenant with the test catalogue, fills Core's plugin mirror and creates every pinned plugin's tables. `make stack-apply` then applies `brands/zs-reference.yaml`, which installs the email-notifications plugin from the mirror and uploads the brand's templates. `make stack-verify` runs all of it from a clean stack and requires a green doctor.
 
 ## Doctor
 
@@ -21,7 +23,9 @@ Keycloak: the stack imports a `zs-reference` realm from `deploy/compose/keycloak
 - Database: reachable, with the Postgres major version.
 - Migrations: applied (Core).
 - Keycloak: version and realm present.
-- Kill Bill: version, plugins installed and their versions.
+- Kill Bill: version, plugins installed and their versions, and, with `ZS_KILLBILL_DATABASE_URL`, the tables of each installed plugin. Without the URL the table check is a SKIP.
+- Plugin mirror: the signed manifest and each pinned jar against its sha256.
+- PDF renderer: reachable and at the pinned version, when `ZS_PDF_RENDERER_URL` is set.
 - KAUI: reachable. It does not expose its version.
 - Clock skew.
 - Version match for Keycloak and Kill Bill.
@@ -40,6 +44,6 @@ A Core release is a git tag `vX.Y.Z` on main whose `components.yaml` has `core_r
 
 ## Tests that gate Phase 2
 
-- `make stack-up` on a clean machine produces a stack where `zs-core doctor` is green within five minutes.
+- `make stack-up` on a clean machine produces a stack where `zs-core doctor` is green within five minutes. Since Phase 5, `make stack-verify` checks that bring-up, bootstrap and brand apply alone reach a green doctor.
 - `doctor` fails with a clear line when a component tag is changed in the compose file without changing `components.yaml`.
 - The Keycloak and Kill Bill upgrade runbooks have each been rehearsed once on the reference stack for the current pinned versions, from the previous patch release, with rows in their rehearsal tables.

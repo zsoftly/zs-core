@@ -21,34 +21,44 @@ const (
 	KillBill = "killbill"
 	KAUI     = "kaui"
 	Postgres = "postgres"
+	// Gotenberg is the optional PDF renderer of invoice PDFs.
+	Gotenberg = "gotenberg"
 )
 
-// Component is one pinned upstream component.
+// Component is one pinned upstream component. Licence is the SPDX
+// identifier of its licence. Optional marks a component a deployment may
+// leave out, such as the PDF renderer.
 type Component struct {
 	Version  string `yaml:"version"`
 	Image    string `yaml:"image"`
 	Digest   string `yaml:"digest"`
 	Released string `yaml:"released"`
 	Source   string `yaml:"source"`
+	Licence  string `yaml:"licence"`
+	Optional bool   `yaml:"optional"`
 }
 
 // Plugin is a pinned Kill Bill plugin. Sha256 is the SHA-256 of the jar in
 // the repository, in lowercase hex. Core checks it before it asks KPM to
-// install the jar.
+// install the jar. Tables are the tables the plugin's ddl.sql creates in the
+// Kill Bill database: zs-core plugin ddl apply refuses a DDL that creates
+// other tables, and doctor checks they exist.
 type Plugin struct {
-	Name     string `yaml:"name"`
-	Version  string `yaml:"version"`
-	Artifact string `yaml:"artifact"`
-	Sha256   string `yaml:"sha256"`
-	Source   string `yaml:"source"`
-	Status   string `yaml:"status"`
+	Name     string   `yaml:"name"`
+	Version  string   `yaml:"version"`
+	Artifact string   `yaml:"artifact"`
+	Sha256   string   `yaml:"sha256"`
+	Tables   []string `yaml:"tables"`
+	Source   string   `yaml:"source"`
+	Status   string   `yaml:"status"`
 }
 
-// KillBillPlugins are the plugins Core knows about. Repository is the Maven
-// repository that KPM downloads plugin jars from.
+// KillBillPlugins are the plugins Core knows about. Repository supplies Maven
+// jars to mirror sync and DDL commands. KPM installs from the verified mirror.
 type KillBillPlugins struct {
 	Repository             string   `yaml:"repository"`
 	ApprovedPaymentPlugins []Plugin `yaml:"approved_payment_plugins"`
+	ApprovedInvoicePlugins []Plugin `yaml:"approved_invoice_plugins"`
 	Installable            []Plugin `yaml:"installable"`
 	PlatformBundlesInImage []string `yaml:"platform_bundles_in_image"`
 	PluginFramework        string   `yaml:"plugin_framework"`
@@ -114,16 +124,43 @@ func (m Manifest) validate() error {
 			problems = append(problems, fmt.Sprintf("components.%s.digest %q is not sha256:<64 lowercase hex>", name, digest))
 		}
 	}
+	seenPlugins := map[string]string{}
 	for _, list := range []struct {
 		path    string
 		plugins []Plugin
-	}{{"killbill_plugins.approved_payment_plugins", m.KillBillPlugins.ApprovedPaymentPlugins}, {"killbill_plugins.installable", m.KillBillPlugins.Installable}} {
+	}{
+		{"killbill_plugins.approved_payment_plugins", m.KillBillPlugins.ApprovedPaymentPlugins},
+		{"killbill_plugins.approved_invoice_plugins", m.KillBillPlugins.ApprovedInvoicePlugins},
+		{"killbill_plugins.installable", m.KillBillPlugins.Installable},
+	} {
 		for _, p := range list.plugins {
+			switch p.Status {
+			case PluginStatusRequired, PluginStatusVerifiedInstall, PluginStatusNoJavaArtifact, PluginStatusPinnedNotInstalled:
+			case "":
+				problems = append(problems, fmt.Sprintf("%s %s.status is missing", list.path, p.Name))
+			default:
+				problems = append(problems, fmt.Sprintf("%s %s.status %q is not a known plugin status", list.path, p.Name, p.Status))
+			}
 			switch {
 			case p.Artifact == "" && p.Sha256 != "":
 				problems = append(problems, fmt.Sprintf("%s %s has a sha256 but no artifact", list.path, p.Name))
 			case p.Artifact != "" && !sha256Pattern.MatchString(p.Sha256):
 				problems = append(problems, fmt.Sprintf("%s %s.sha256 %q is not 64 lowercase hex", list.path, p.Name, p.Sha256))
+			}
+			if !pluginName.MatchString(p.Name) {
+				problems = append(problems, fmt.Sprintf("%s %q is not a plugin name of lowercase letters, digits and dashes", list.path, p.Name))
+			}
+			if prev, ok := seenPlugins[p.Name]; ok {
+				problems = append(problems, fmt.Sprintf("%s %s is also listed in %s", list.path, p.Name, prev))
+			}
+			seenPlugins[p.Name] = list.path
+			for _, t := range p.Tables {
+				if !tableName.MatchString(t) {
+					problems = append(problems, fmt.Sprintf("%s %s table %q is not a lowercase table name", list.path, p.Name, t))
+				}
+			}
+			if len(p.Tables) > 0 && p.Artifact == "" {
+				problems = append(problems, fmt.Sprintf("%s %s has tables but no artifact", list.path, p.Name))
 			}
 		}
 	}
@@ -139,6 +176,8 @@ func (m Manifest) validate() error {
 var (
 	digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	pluginName    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
+	tableName     = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 )
 
 // PinnedReference returns the image reference pinned by digest, such as
@@ -153,42 +192,69 @@ func (m Manifest) Component(name string) (Component, bool) {
 	return c, ok
 }
 
-// Plugin statuses in components.yaml that mean the plugin is not expected on
-// a running stack.
+// Plugin statuses in components.yaml. PluginStatusRequired marks a plugin a
+// running stack must have installed and running. The other three statuses are
+// informational: a plugin is installed when a brand manifest names it.
 const (
+	PluginStatusRequired           = "required"
+	PluginStatusVerifiedInstall    = "verified_install"
 	PluginStatusNoJavaArtifact     = "no_java_artifact"
 	PluginStatusPinnedNotInstalled = "pinned_not_installed"
 )
 
 // Required reports whether a running stack must have the plugin installed and
-// running: every pinned plugin except those marked no_java_artifact or
-// pinned_not_installed.
+// running: only a plugin with status required. Brand apply installs the
+// plugins a brand names, so a stack without brands needs none.
 func (p Plugin) Required() bool {
-	return p.Status != PluginStatusNoJavaArtifact && p.Status != PluginStatusPinnedNotInstalled
+	return p.Status == PluginStatusRequired
 }
 
-// RequiredPlugins returns the approved payment plugins and installable
-// plugins that a running stack must have.
+// RequiredPlugins returns the approved payment and invoice plugins and the
+// installable plugins that a running stack must have.
 func (m Manifest) RequiredPlugins() []Plugin {
 	var required []Plugin
-	for _, list := range [][]Plugin{m.KillBillPlugins.ApprovedPaymentPlugins, m.KillBillPlugins.Installable} {
-		for _, p := range list {
-			if p.Required() {
-				required = append(required, p)
-			}
+	for _, p := range m.Plugins() {
+		if p.Required() {
+			required = append(required, p)
 		}
 	}
 	return required
 }
 
+// Plugins returns every pinned plugin: the approved payment plugins, the
+// approved invoice plugins and the installable plugins, in that order.
+func (m Manifest) Plugins() []Plugin {
+	k := m.KillBillPlugins
+	out := make([]Plugin, 0, len(k.ApprovedPaymentPlugins)+len(k.ApprovedInvoicePlugins)+len(k.Installable))
+	out = append(out, k.ApprovedPaymentPlugins...)
+	out = append(out, k.ApprovedInvoicePlugins...)
+	return append(out, k.Installable...)
+}
+
+// Artifacts returns the pinned plugins that have a Java artifact, the ones
+// KPM can install and the mirror holds.
+func (m Manifest) Artifacts() []Plugin {
+	var out []Plugin
+	for _, p := range m.Plugins() {
+		if p.HasArtifact() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// HasArtifact reports whether the plugin has a Java artifact with a version
+// and a digest.
+func (p Plugin) HasArtifact() bool {
+	return p.Artifact != "" && p.Version != "" && p.Sha256 != "" && p.Status != PluginStatusNoJavaArtifact
+}
+
 // PinnedPlugin returns the pinned version of a Kill Bill plugin by name,
-// searching the approved payment plugins and the installable plugins.
+// searching every pinned plugin.
 func (m Manifest) PinnedPlugin(name string) (Plugin, bool) {
-	for _, list := range [][]Plugin{m.KillBillPlugins.ApprovedPaymentPlugins, m.KillBillPlugins.Installable} {
-		for _, p := range list {
-			if p.Name == name {
-				return p, true
-			}
+	for _, p := range m.Plugins() {
+		if p.Name == name {
+			return p, true
 		}
 	}
 	return Plugin{}, false

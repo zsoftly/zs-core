@@ -219,3 +219,44 @@ func TestWalletAndMeteringSettings(t *testing.T) {
 		t.Fatalf("invalid = %v", err)
 	}
 }
+
+func TestPluginAndRendererSettings(t *testing.T) {
+	secret := strings.Repeat("m", 32)
+	cfg, err := Load([]string{dbURL,
+		"ZS_KILLBILL_DATABASE_URL=postgres://killbill:kb-password@postgres:5432/killbill?sslmode=disable",
+		"ZS_PDF_RENDERER_URL=http://gotenberg:3000/",
+		"ZS_PLUGIN_MIRROR_DIR=/var/lib/zs-core/plugins/",
+		"ZS_PLUGIN_MIRROR_SECRET=" + secret,
+		"ZS_PLUGIN_MIRROR_URL=http://core:8080",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.KillBillDatabaseURL == "" || cfg.PDFRendererURL != "http://gotenberg:3000" || cfg.PluginMirrorDir != "/var/lib/zs-core/plugins" ||
+		cfg.PluginMirrorSecret != secret || cfg.PluginMirrorURL != "http://core:8080" {
+		t.Fatalf("settings = %+v", cfg)
+	}
+	_, err = Load([]string{dbURL,
+		"ZS_KILLBILL_DATABASE_URL=mysql://kb-password@db",
+		"ZS_PDF_RENDERER_URL=ftp://gotenberg",
+		"ZS_PLUGIN_MIRROR_DIR=relative/dir",
+		"ZS_PLUGIN_MIRROR_SECRET=short-mirror-secret",
+		"ZS_PLUGIN_MIRROR_URL=http://core:8080",
+	})
+	if err == nil {
+		t.Fatal("invalid plugin settings accepted")
+	}
+	for _, want := range []string{"ZS_KILLBILL_DATABASE_URL", "ZS_PDF_RENDERER_URL", "ZS_PLUGIN_MIRROR_DIR", "ZS_PLUGIN_MIRROR_SECRET must be at least 32"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %s: %v", want, err)
+		}
+	}
+	for _, value := range []string{"kb-password", "short-mirror-secret"} {
+		if strings.Contains(err.Error(), value) {
+			t.Errorf("error echoes a value: %v", err)
+		}
+	}
+	if _, err := Load([]string{dbURL, "ZS_PLUGIN_MIRROR_URL=http://core:8080"}); err == nil || !strings.Contains(err.Error(), "ZS_PLUGIN_MIRROR_URL needs ZS_PLUGIN_MIRROR_SECRET") {
+		t.Fatalf("mirror URL without a secret: %v", err)
+	}
+}

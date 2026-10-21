@@ -89,9 +89,9 @@ func runTenant(args, environ []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout, "another sweep is running; nothing done")
 			return 0
 		}
-		fmt.Fprintf(stdout, "completed %d, still pending %d, organizations checked %d, updated %d, members added %d, removed %d, errors %d\n",
+		fmt.Fprintf(stdout, "completed %d, still pending %d, organizations checked %d, updated %d, members added %d, removed %d, recipients checked %d, updated %d, deferred %d, errors %d\n",
 			report.Completed, report.Failed, report.OrganizationsChecked, report.OrganizationsUpdated,
-			report.MembersAdded, report.MembersRemoved, report.Errors)
+			report.MembersAdded, report.MembersRemoved, report.RecipientsChecked, report.RecipientsUpdated, report.RecipientsDeferred, report.Errors)
 		if report.Errors > 0 {
 			return 1
 		}

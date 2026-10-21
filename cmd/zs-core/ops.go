@@ -17,8 +17,10 @@ import (
 	"github.com/zsoftly/zs-core/internal/database"
 	"github.com/zsoftly/zs-core/internal/doctor"
 	"github.com/zsoftly/zs-core/internal/kbplugin"
+	"github.com/zsoftly/zs-core/internal/secrets"
 	"github.com/zsoftly/zs-core/internal/upgrade"
 	"github.com/zsoftly/zs-core/migrations"
+	"github.com/zsoftly/zs-core/pkg/tenant"
 )
 
 const defaultComponentsFile = "components.yaml"
@@ -82,6 +84,14 @@ func runDoctor(args, environ []string, stdout, stderr io.Writer) int {
 		KAUI:           doctor.Target{URL: cfg.KAUIURL},
 		Mirror:         doctor.MirrorOptions{Dir: cfg.PluginMirrorDir, URL: cfg.PluginMirrorURL, Secret: []byte(cfg.PluginMirrorSecret)},
 		PDFRendererURL: cfg.PDFRendererURL,
+	}
+	if pool != nil {
+		if kb, err := newKillBill(cfg); err == nil {
+			engines := tenant.Engines{KillBill: kb, Secrets: secrets.Default{Dir: cfg.SecretsDir}}
+			opts.BillingRecipients = func(ctx context.Context) ([]doctor.Finding, error) {
+				return doctor.BillingRecipientFindings(ctx, pool, engines)
+			}
+		}
 	}
 	if cfg.KillBillDatabaseURL != "" {
 		kbPool, err := database.Open(ctx, database.Options{URL: cfg.KillBillDatabaseURL, MaxConns: 2})

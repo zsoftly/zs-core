@@ -147,7 +147,7 @@ ORDER BY m.id LIMIT $3`, brand, identityID, MaxLimit)
 			&im.Membership.CreatedAt, &im.Membership.UpdatedAt,
 			&im.Tenant.ID, &im.Tenant.BrandID, &kind, &im.Tenant.Slug, &im.Tenant.Name, &tstatus, &im.Tenant.Activation,
 			&im.Tenant.KeycloakOrganizationID, &im.Tenant.KillBillAccountID, &im.Tenant.BillingCountry,
-			&im.Tenant.CreatedByIdentityID, &im.Tenant.CreatedAt, &im.Tenant.UpdatedAt)
+			&im.Tenant.CreatedByIdentityID, &im.Tenant.CreatedAt, &im.Tenant.UpdatedAt, &im.Tenant.BillingRecipientStatus)
 		im.Membership.Role, im.Membership.Status = Role(role), MembershipStatus(status)
 		im.Tenant.Kind, im.Tenant.Status = Kind(kind), Status(tstatus)
 		return im, err
@@ -246,6 +246,9 @@ func UpdateMember(ctx context.Context, tx pgx.Tx, s scope.Scope, caller Caller, 
 	if err := revokeStaleInvitations(ctx, tx, s, caller, target.ID, reason); err != nil {
 		return Membership{}, err
 	}
+	if err := scheduleBillingRecipient(ctx, tx, s, idgen.Nil, caller); err != nil {
+		return Membership{}, err
+	}
 	return updated, nil
 }
 
@@ -298,6 +301,9 @@ func RemoveMember(ctx context.Context, tx pgx.Tx, s scope.Scope, caller Caller, 
 	if err := revokeStaleInvitations(ctx, tx, s, caller, target.ID, InvitationRevokedInviterRemoved); err != nil {
 		return Membership{}, err
 	}
+	if err := scheduleBillingRecipient(ctx, tx, s, idgen.Nil, caller); err != nil {
+		return Membership{}, err
+	}
 	return removed, nil
 }
 
@@ -344,6 +350,9 @@ func TransferOwnership(ctx context.Context, tx pgx.Tx, s scope.Scope, caller Cal
 		return Membership{}, Membership{}, err
 	}
 	if err := revokeStaleInvitations(ctx, tx, s, caller, from.ID, InvitationRevokedInviterDemoted); err != nil {
+		return Membership{}, Membership{}, err
+	}
+	if err := scheduleBillingRecipient(ctx, tx, s, target.ID, caller); err != nil {
 		return Membership{}, Membership{}, err
 	}
 	return from, target, nil

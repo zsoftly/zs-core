@@ -314,6 +314,9 @@ func TestUnlistedPluginsFailTheReleaseReport(t *testing.T) {
 				PluginTables: func(context.Context, components.Plugin) ([]string, error) {
 					return nil, nil
 				},
+				BillingRecipients: func(context.Context) ([]Finding, error) {
+					return []Finding{{Component: "core", Check: "billing_recipients", Status: OK, Message: "fixture recipients checked"}}, nil
+				},
 			})
 			if report.Failed() != tc.wantFail || report.OK == tc.wantFail || report.Skipped() {
 				t.Fatalf("release gate: failed=%t ok=%t skipped=%t, findings=%v", report.Failed(), report.OK, report.Skipped(), report.Findings)

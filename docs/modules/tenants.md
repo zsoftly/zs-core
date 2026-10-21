@@ -96,7 +96,7 @@ Creation runs in steps, because one database transaction cannot cover both engin
 1. Core records the creation in `tenant_provisioning` with a new tenant ID and claims it for two minutes.
 2. It finds the Keycloak Organization by its `zs_tenant_id` attribute, or creates it, and records its ID. It adds the creator as a member.
 3. It finds the Kill Bill account by its external key, or creates it, and records its ID.
-4. In one transaction it inserts the tenant, the system teams and the owner membership, audits `tenant.created`, and marks the creation completed.
+4. In one transaction it inserts the tenant, the system teams and the owner membership, binds the billing recipient to that owner, queues reconciliation, audits `tenant.created`, and marks the creation completed.
 
 Step 3 sends the tenant name as the account name. Kill Bill refuses names over 100 characters, so Core checks that limit first.
 
@@ -108,18 +108,34 @@ When step 2 or 3 fails, no tenant row exists. Core releases the claim, schedules
 
 ## The sweeper
 
-`serve` runs the sweeper every `ZS_TENANT_SWEEP_INTERVAL`, one minute by default, when the Keycloak and Kill Bill admin settings are present. `zs-core tenant sweep` runs one pass by hand. One pass runs at a time across every Core instance, through a database advisory lock. A pass does two things:
+`serve` runs the sweeper every `ZS_TENANT_SWEEP_INTERVAL`, one minute by default, when the Keycloak and Kill Bill admin settings are present. `zs-core tenant sweep` runs one pass by hand. One pass runs at a time across every Core instance, through a database advisory lock. A pass does three things:
 
 - It claims due creations and runs the steps above again. A failed attempt waits 10 seconds, then twice as long each time, up to an hour.
 - It reads every tenant of every applied brand and corrects its Organization towards Core. The name follows the tenant. The Organization is enabled only while the tenant is active. Its members become exactly the identities with an active membership, or none once the tenant is closed.
 
-Each correction is audited as a system action: `tenant.keycloak.organization.updated`, `tenant.keycloak.member.added` and `tenant.keycloak.member.removed`.
+- It compares every account's primary billing email with current Core membership, including accounts previously marked ready. Failed recipient checks wait five seconds, then twice as long up to five minutes. Ready accounts stay eligible for the next periodic check, so legacy accounts, changed last-verified email and external drift are repaired. A Keycloak failure does not skip the recipient check.
+
+Each Organization correction is audited as a system action: `tenant.keycloak.organization.updated`, `tenant.keycloak.member.added` and `tenant.keycloak.member.removed`.
 
 ## The Organization mirror
 
-The sweeper corrects Organizations once a minute. Changes reach Keycloak sooner through the mirror. Each HTTP write that changes a tenant's name or its members writes a `tenant.mirror` event to the outbox, in the same transaction as the change. That covers tenant updates, member changes, removals and acceptances. No goroutine starts per write.
+The sweeper corrects Organizations and billing recipients once a minute. Changes reach the engines sooner through the mirror. Tenant-name updates and invitation acceptances queue `tenant.mirror` in the handler transaction. The tenant library itself queues that event for role/status changes, removals, ownership transfers and completed provisioning, including direct library calls. The event commits with Core state and contains no recipient address. No goroutine starts per write.
 
-`serve` runs 4 mirror relays next to the sweeper, when the engines are configured. Each claims up to 10 `tenant.mirror` events at a time and handles them one by one, so at most 4 Organization updates are in flight per Core instance. Each runs `SyncOrganization`, with the same corrections and audit actions as the sweeper. The relays claim only `tenant.mirror` events. A failed update is retried with the outbox backoff and quarantined after 10 attempts. The sweeper corrects whatever the mirror misses. Without the engines, no event is written.
+`serve` runs 4 mirror relays next to the sweeper, when the engines are configured. Each claims up to 10 `tenant.mirror` events at a time and handles them one by one, so at most 4 Organization updates are in flight per Core instance. Each independently attempts `SyncOrganization` and `ReconcileBillingRecipient`, with separate bounded timeouts, so a Keycloak error does not suppress recipient repair. The relays claim only `tenant.mirror` events. A failed update is retried with the outbox backoff and quarantined after 10 attempts. The sweeper corrects whatever the mirror misses. Library membership changes still commit their pending recipient state and event without reachable engines. Delivery waits for configured engines. A recipient deferred by its backoff keeps its event unpublished. The periodic check remains the repair path even after an event is quarantined.
+
+## Billing recipient projection
+
+Core membership selects the managed primary email on the tenant's Kill Bill account. An eligible recipient is an active owner in the same brand and tenant with a nonempty last-verified identity email. An ownership transfer binds its named new owner. Otherwise an eligible bound owner stays selected. If that binding is ineligible, Core selects the oldest eligible owner by membership `created_at`, then ID. With none, the desired primary email is empty. `created_by_identity_id` remains immutable provenance.
+
+Role/status changes, removals and transfers commit Core membership first. Kill Bill availability is never an access-reduction precondition, and reconciliation failure cannot turn that committed API success into an apparent rollback. After commit the mirror reads current eligibility, reads the exact account under the brand's credentials, compares and sends a primary-email PUT only on difference. It checks account ID and external key before writing and verifies readback before recording success. The tenant lock covers only short Core selection/status transactions, never network requests.
+
+Migration `000019_tenant_billing_recipients.up.sql` stores a scoped membership binding, status, last successful check time, retry attempts, due time and safe error code. It stores no address. Existing tenants start pending and the sweep repairs their accounts. This isolated branch uses version 19 after version 18. Do not apply it to a mixed database containing a different migration 19.
+
+Tenant responses expose `billing_recipient_status` without an email address: `pending` means scheduled work or an upstream check/write failure, `ready` means the scoped account matched an eligible owner at its last successful check, and `no_eligible_owner` means Core observed a clear primary email with no eligible owner. These are projection observations, not mail-delivery receipts. `zs-core doctor` reads current eligibility and actual account email, reports drift or missing eligibility, and never repairs either system. `zs-core tenant sweep` performs repair.
+
+Duplicate or delayed requests can temporarily restore an older address. A later pass repairs it from current membership. There is no instantaneous revocation, cancellation of accepted upstream requests or recall of sent, queued or already materialized mail. The projection manages only primary email. Kill Bill's additional account emails remain unmanaged and can be CC recipients. Doctor reads that collection under the scoped account credentials and warns with the account ID whenever any exist, without printing an address or deleting entries. An unavailable or invalid additional-email response fails inspection; it never establishes an empty collection. The reconciler writes primary email only. The pinned SMTP path rejects blank primary To before sending, rather than taking the listener's null-primary skip branch. Its SES path bypasses that SMTP validation, so clearing primary email is not proof of universal no-send behavior. Actual plugin/Mailpit acceptance must distinguish newly generated mail after convergence from earlier queued mail.
+
+Tenant closure keeps its existing behavior. It does not remove memberships or define a new recipient/final-invoice policy. Whether closure should generate a final invoice remains an open owner decision outside this change.
 
 ## Invitations
 
@@ -172,6 +188,7 @@ Every `/v1/tenants/{id}/...` route passes through the same step before its handl
 | `tenant.suspended`, `tenant.reactivated`, `tenant.closed` | Status changes, with their reason. |
 | `tenant.api_key.created`, `tenant.api_key.revoked` | API keys. A revocation Core makes itself carries the reason `creator_removed`, `creator_suspended` or `tenant_closed`. See [api-keys.md](api-keys.md). |
 | `tenant.keycloak.organization.updated`, `tenant.keycloak.member.added`, `tenant.keycloak.member.removed` | Sweeper and mirror corrections. |
+| `tenant.billing_recipient.reconciled` | An observed recipient projection status change. Contains status, never an address. |
 
 Members with `audit:read` read them with `GET /v1/tenants/{id}/audit/events`. Staff with `operator` read them with `GET /v1/audit/events?tenant_id=...`. See [audit.md](audit.md).
 

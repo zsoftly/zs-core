@@ -3033,7 +3033,7 @@ components:
       pattern: "^[A-Z]{2}$"
     Tenant:
       type: object
-      required: [id, brand_id, kind, slug, name, status, activation, billing_country, created_at, updated_at]
+      required: [id, brand_id, kind, slug, name, status, activation, billing_country, billing_recipient_status, created_at, updated_at]
       additionalProperties: false
       properties:
         id: {$ref: "#/components/schemas/TenantId"}
@@ -3047,6 +3047,16 @@ components:
           enum: [active, suspended, closed]
         activation: {type: string, enum: [pending, approved, rejected]}
         billing_country: {type: [string, "null"]}
+        billing_recipient_status:
+          type: string
+          enum: [pending, ready, no_eligible_owner]
+          description: >-
+            Last observed projection of the managed primary billing email. Pending
+            includes scheduled work or a failed upstream check. Ready means the
+            scoped account matched an eligible owner at its last successful check.
+            No eligible owner means the primary email was observed explicitly
+            cleared. This status exposes no recipient address and promises no
+            immediate revocation, delivery or recall of already queued mail.
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
     TenantCreate:

@@ -22,7 +22,8 @@ var SystemActor = events.Actor{Type: events.ActorSystem}
 
 // Sweeper completes tenant creations that an engine failure interrupted and
 // corrects Keycloak Organizations towards Core: their name, their enabled
-// state and their members. One pass runs at a time across every Core
+// state and their members. It also repairs account primary email towards
+// current eligible ownership. One pass runs at a time across every Core
 // instance, through a database advisory lock.
 type Sweeper struct {
 	DB      DB
@@ -42,6 +43,9 @@ type SweepReport struct {
 	OrganizationsUpdated int
 	MembersAdded         int
 	MembersRemoved       int
+	RecipientsChecked    int
+	RecipientsUpdated    int
+	RecipientsDeferred   int
 	Errors               int
 }
 
@@ -63,7 +67,9 @@ func (s *Sweeper) Run(ctx context.Context, interval time.Duration) {
 		} else if !report.Skipped {
 			s.log().Info("tenant sweep", "completed", report.Completed, "failed", report.Failed,
 				"organizations_checked", report.OrganizationsChecked, "organizations_updated", report.OrganizationsUpdated,
-				"members_added", report.MembersAdded, "members_removed", report.MembersRemoved, "errors", report.Errors)
+				"members_added", report.MembersAdded, "members_removed", report.MembersRemoved,
+				"recipients_checked", report.RecipientsChecked, "recipients_updated", report.RecipientsUpdated,
+				"recipients_deferred", report.RecipientsDeferred, "errors", report.Errors)
 		}
 		select {
 		case <-ctx.Done():
@@ -172,6 +178,23 @@ func (s *Sweeper) syncBrand(ctx context.Context, brandID idgen.UUID, correlation
 			if err != nil {
 				report.Errors++
 				s.log().Warn("keycloak organization not in step with Core", "tenant_id", t.PublicID(), "error", err.Error())
+			}
+			// Recipient repair is independent of the Organization outcome. Ready
+			// rows are checked too, including legacy accounts and email drift.
+			recipientCtx, cancel := context.WithTimeout(ctx, mirrorTimeout)
+			recipient, recipientErr := ReconcileBillingRecipient(recipientCtx, s.DB, s.Engines, t.Scope(), correlationID)
+			cancel()
+			if recipient.Deferred {
+				report.RecipientsDeferred++
+			} else {
+				report.RecipientsChecked++
+			}
+			if recipient.Changed {
+				report.RecipientsUpdated++
+			}
+			if recipientErr != nil {
+				report.Errors++
+				s.log().Warn("billing recipient not in step with Core", "tenant_id", t.PublicID(), "error_code", codeName(recipientErr))
 			}
 		}
 		if len(list) < s.batch() {

@@ -40,3 +40,73 @@ func TestLoadRejectsBadSets(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateAppliedMigrations(t *testing.T) {
+	loaded, err := Load(migrations.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded[len(loaded)-1].Version != 19 {
+		t.Fatalf("latest migration = %d, want 19", loaded[len(loaded)-1].Version)
+	}
+	checksums := make(map[int64]string, len(loaded))
+	for _, migration := range loaded {
+		checksums[migration.Version] = migration.Checksum
+	}
+	cases := []struct {
+		name    string
+		applied map[int64]string
+		want    string
+	}{
+		{name: "empty history", applied: map[int64]string{}},
+		{name: "contiguous partial history", applied: contiguousChecksums(checksums, 18)},
+		{name: "complete history through released migration nineteen", applied: contiguousChecksums(checksums, 19)},
+		{
+			name:    "changed embedded migration",
+			applied: map[int64]string{2: "changed"},
+			want:    "migration 000002_outbox was changed after it was applied",
+		},
+		{
+			name:    "newer database history",
+			applied: map[int64]string{1: checksums[1], 20: "future"},
+			want:    "database schema has applied migration version 000020, but this binary supports versions through 000019",
+		},
+		{
+			name:    "zero historical version",
+			applied: map[int64]string{0: "unknown", 1: checksums[1]},
+			want:    "database schema has applied migration version 000000, but this binary supports versions through 000019",
+		},
+		{
+			name:    "negative historical version",
+			applied: map[int64]string{-1: "unknown", 1: checksums[1]},
+			want:    "database schema has applied migration version -00001, but this binary supports versions through 000019",
+		},
+		{
+			name:    "noncontiguous history",
+			applied: map[int64]string{2: checksums[2]},
+			want:    "database schema history is missing migration version 000001 before applied version 000002",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAppliedMigrations(loaded, tc.applied)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("validateAppliedMigrations() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func contiguousChecksums(checksums map[int64]string, through int64) map[int64]string {
+	applied := make(map[int64]string, through)
+	for version := int64(1); version <= through; version++ {
+		applied[version] = checksums[version]
+	}
+	return applied
+}

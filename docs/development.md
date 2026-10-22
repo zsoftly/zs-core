@@ -88,7 +88,7 @@ The `tenant` commands need the Keycloak and Kill Bill admin settings and the bra
 
 ## Migrations
 
-Migrations live in `migrations/` as `NNNNNN_name.up.sql`. They are embedded in the binary and forward only. There are no down files. To correct a migration, add a new one. Never edit a released file. The runner stores a SHA-256 checksum of each applied file and refuses to start if one changes.
+Migrations live in `migrations/` as `NNNNNN_name.up.sql`. They are embedded in the binary and forward only. There are no down files. To correct a migration, add a new one. Never edit a released file. The runner stores a SHA-256 checksum for each applied file and requires a contiguous history. It refuses to start if an applied migration changes or if the database contains a version this binary does not embed.
 
 The runner takes a Postgres advisory lock per schema, so you can start several instances at once and each migration still runs once. Each migration runs in its own transaction with its history row in `schema_migrations`.
 
@@ -96,7 +96,7 @@ The runner takes a Postgres advisory lock per schema, so you can start several i
 bin/zs-core migrate     # apply pending migrations and exit
 ```
 
-`serve` runs the same step unless `ZS_MIGRATE_ON_START=false`. `/readyz` returns 503 while any embedded migration is missing from the database.
+`serve` runs the same step unless `ZS_MIGRATE_ON_START=false`. `/readyz` returns 503 while any embedded migration is missing from the database or the migration history is incompatible.
 
 Migrations use unqualified names, so they apply to the first schema on the connection's `search_path`. Library callers that embed Core run its migrations before their own.
 

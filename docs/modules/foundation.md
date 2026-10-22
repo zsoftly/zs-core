@@ -26,6 +26,12 @@ The foundation is the shared plumbing every module uses. It fixes the error enve
 | `internal/httpapi` | Router, middleware, health probes and the `/v1` routes. |
 | `internal/postgrestest` | Isolated Postgres schemas for integration tests. |
 
+## Migrations
+
+The runner validates every applied checksum and requires a contiguous history before it writes a pending migration. It refuses a database history with a migration version the binary does not embed before it executes any pending migration SQL.
+
+`serve` applies pending migrations by default. If validation or a migration fails, `serve` exits before opening the HTTP listener. With `ZS_MIGRATE_ON_START=false`, `serve` leaves the schema unchanged and `/readyz` returns 503 while migrations are pending or the history is incompatible.
+
 ## Errors
 
 Every error response has this shape and nothing else:
@@ -197,5 +203,4 @@ Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosni
 These are accepted today and scheduled for later hardening.
 
 - The audit trail is append-only because triggers reject `UPDATE`, `DELETE` and `TRUNCATE` on `audit_events`. The runtime database role owns the table, so it could drop the triggers. A separate migration-owner role, with the runtime role limited to `INSERT` and `SELECT`, is Phase 6 hardening.
-- The migration runner ignores versions in `schema_migrations` that the binary does not embed. An older binary started against a newer schema, after a downgrade, therefore reports ready. Phase 6 adds a refusal to start when the binary is older than the schema.
 - The tenant isolation proof runs only in the integration suite (`make test-integration`), which the build host runs. `make check` alone does not run it.

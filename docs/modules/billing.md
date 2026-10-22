@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-Kill Bill is the billing engine and the financial authority. Core holds no balance, no invoice and no payment. Each brand is a Kill Bill tenant. Each Core tenant is a Kill Bill account keyed by the tenant ID. Billing routes read and write Kill Bill with the brand's credentials and Core's audit headers. Core keeps promo codes, credit expiry, a cache of billing standing, push notification receipts, plugin installs and the plugin DDLs it applied. Payment and invoice plugins run in test mode only, and brand apply refuses real-money mode. A brand can run several payment plugins with one default. Products get a 15-minute Core credential and call Kill Bill through a proxy for the tenant's own account. Kill Bill push notifications become Core events in the outbox. Outbound webhook delivery is deferred for this candidate. The code is `pkg/billing` and `internal/httpapi/billing.go`.
+Kill Bill is the billing engine and the financial authority. Core holds no balance, no invoice and no payment. Each brand is a Kill Bill tenant. Each Core tenant is a Kill Bill account keyed by the tenant ID. Billing routes read and write Kill Bill with the brand's credentials and Core's audit headers. Core keeps promo codes, credit expiry, a cache of billing standing, push notification receipts, plugin installs and the plugin DDLs it applied. Payment and invoice plugins run in test mode only, and brand apply refuses real-money mode. A brand can run several payment plugins with one default. Products get a 15-minute Core credential and call Kill Bill through a proxy for the tenant's own account. Kill Bill push notifications become Core events in the outbox, which the outbound notification workers deliver under each brand's webhook policy. See [notifications.md](notifications.md). The code is `pkg/billing` and `internal/httpapi/billing.go`.
 
 ## Mapping
 
@@ -223,7 +223,7 @@ Receipts are kept seven days. Each credit sweeper pass deletes older ones.
 | `OVERDUE_CHANGE` | `billing.overdue.changed`, with the overdue state |
 | `SUBSCRIPTION_CREATION`, `_PHASE`, `_CHANGE`, `_CANCEL`, `_UNCANCEL`, `_BCD_CHANGE` | `billing.subscription.changed` |
 
-Kill Bill sends a `PAYMENT_*` event for every payment transaction, a purchase and a refund alike, and its metadata names the transaction. It also sends `INVOICE_PAYMENT_*` when a payment pays an invoice. Those refresh the standing and make no second Core event. Each event names the brand, the tenant and the Kill Bill object, with the provider actor `killbill`. When Core cannot reach Kill Bill or its database, it answers `503` and records nothing, so Kill Bill retries. The route answers `204` otherwise. Delivering these events to products as signed webhooks is Phase 5.
+Kill Bill sends a `PAYMENT_*` event for every payment transaction, a purchase and a refund alike, and its metadata names the transaction. It also sends `INVOICE_PAYMENT_*` when a payment pays an invoice. Those refresh the standing and make no second Core event. Each event names the brand, the tenant and the Kill Bill object, with the provider actor `killbill`. When Core cannot reach Kill Bill or its database, it answers `503` and records nothing, so Kill Bill retries. The route answers `204` otherwise. The notification workers deliver the resulting public Core events as signed webhooks.
 
 ## Audit
 
@@ -253,4 +253,4 @@ Every Kill Bill write also carries `X-Killbill-CreatedBy` (the Core principal, s
 - The proxy accepts the small set of requests above. A product that needs more calls Core's routes or asks for a wider rule.
 - Invoice numbers come from one Kill Bill sequence for the whole server. They have gaps within a brand. See [invoices.md](invoices.md#invoice-numbers).
 - Plugin tables are a deployment step, `zs-core plugin ddl apply`. `serve` never checks them, doctor does.
-- `billing.*` events remain in the existing outbox; outbound delivery is deferred for this candidate.
+- The relay acknowledges public `billing.*` events after it writes durable fanout receipts. Endpoint delivery then retries independently. See [notifications.md](notifications.md).

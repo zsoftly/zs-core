@@ -41,6 +41,7 @@ func newAPIOptions(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, l
 	}
 	registry := brand.NewRegistry(pool, brandRegistryTTL, log)
 	resolver := secrets.Default{Dir: cfg.SecretsDir}
+	notifier := newNotificationService(pool, resolver, log)
 	opts := httpapi.Options{
 		DB:         pool,
 		Migrations: migrations.FS,
@@ -58,6 +59,7 @@ func newAPIOptions(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, l
 	}
 	opts.Tenants = tenant.Engines{Keycloak: opts.BrandDeps.Keycloak, KillBill: opts.BrandDeps.KillBill, Secrets: resolver}
 	applyBillingDeps(&opts.BrandDeps, cfg, log)
+	opts.BrandDeps.AfterManifestRecorded = notificationReconciler(notifier)
 	if opts.BrandDeps.KillBill != nil {
 		opts.Billing = &billing.Service{DB: pool, KillBill: opts.BrandDeps.KillBill, Secrets: resolver,
 			WebhookSecret: []byte(cfg.KillBillWebhookSecret), Log: log}

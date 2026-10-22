@@ -129,6 +129,7 @@ func runBrand(args, environ []string, stdout, stderr io.Writer) int {
 	resolver := secrets.Default{LookupEnv: envLookup(environ), Dir: cfg.SecretsDir}
 	deps := brand.Deps{DB: pool, Keycloak: kc, KillBill: kb, Secrets: resolver, Files: root.FS(),
 		WebhookBaseURL: cfg.KillBillCallbackURL, WebhookSecret: []byte(cfg.KillBillWebhookSecret)}
+	deps.AfterManifestRecorded = notificationReconciler(newNotificationService(pool, resolver, nil))
 	if pins != nil {
 		setPluginDeps(&deps, *pins, cfg)
 	}

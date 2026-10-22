@@ -1,6 +1,7 @@
 package database
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -46,8 +47,9 @@ func TestValidateAppliedMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded[len(loaded)-1].Version != 19 {
-		t.Fatalf("latest migration = %d, want 19", loaded[len(loaded)-1].Version)
+	latest := loaded[len(loaded)-1].Version
+	if latest < 19 {
+		t.Fatalf("latest migration = %d, want at least 19", latest)
 	}
 	checksums := make(map[int64]string, len(loaded))
 	for _, migration := range loaded {
@@ -61,6 +63,7 @@ func TestValidateAppliedMigrations(t *testing.T) {
 		{name: "empty history", applied: map[int64]string{}},
 		{name: "contiguous partial history", applied: contiguousChecksums(checksums, 18)},
 		{name: "complete history through released migration nineteen", applied: contiguousChecksums(checksums, 19)},
+		{name: "complete current history", applied: contiguousChecksums(checksums, latest)},
 		{
 			name:    "changed embedded migration",
 			applied: map[int64]string{2: "changed"},
@@ -68,18 +71,18 @@ func TestValidateAppliedMigrations(t *testing.T) {
 		},
 		{
 			name:    "newer database history",
-			applied: map[int64]string{1: checksums[1], 20: "future"},
-			want:    "database schema has applied migration version 000020, but this binary supports versions through 000019",
+			applied: map[int64]string{1: checksums[1], latest + 1: "future"},
+			want:    fmt.Sprintf("database schema has applied migration version %06d, but this binary supports versions through %06d", latest+1, latest),
 		},
 		{
 			name:    "zero historical version",
 			applied: map[int64]string{0: "unknown", 1: checksums[1]},
-			want:    "database schema has applied migration version 000000, but this binary supports versions through 000019",
+			want:    fmt.Sprintf("database schema has applied migration version 000000, but this binary supports versions through %06d", latest),
 		},
 		{
 			name:    "negative historical version",
 			applied: map[int64]string{-1: "unknown", 1: checksums[1]},
-			want:    "database schema has applied migration version -00001, but this binary supports versions through 000019",
+			want:    fmt.Sprintf("database schema has applied migration version -00001, but this binary supports versions through %06d", latest),
 		},
 		{
 			name:    "noncontiguous history",

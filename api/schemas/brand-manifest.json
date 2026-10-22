@@ -59,6 +59,7 @@
     "locale": {"type": "string", "pattern": "^[a-z]{2}(-[A-Z]{2})?$"},
     "theme": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"},
     "httpsUrl": {"type": "string", "pattern": "^https://[^\\s]+$", "maxLength": 2000},
+    "webhookHttpsUrl": {"type": "string", "pattern": "^https://[^/?#\\s@]+(?:/[^?#\\s]*)?$", "maxLength": 2000},
     "identity": {
       "type": "object",
       "additionalProperties": false,
@@ -358,7 +359,7 @@
             "additionalProperties": false,
             "required": ["url", "secret_ref"],
             "properties": {
-              "url": {"$ref": "#/$defs/httpsUrl"},
+              "url": {"$ref": "#/$defs/webhookHttpsUrl"},
               "secret_ref": {"$ref": "#/$defs/secretRef"},
               "events": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)+$"}}
             }

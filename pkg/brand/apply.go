@@ -78,6 +78,10 @@ type Deps struct {
 	// registers the brand's push notification callback.
 	WebhookBaseURL string
 	WebhookSecret  []byte
+	// AfterManifestRecorded runs in the transaction that persisted the new
+	// manifest. It lets optional modules reconcile durable state without an
+	// import from brand back into those modules.
+	AfterManifestRecorded func(context.Context, pgx.Tx, Record, Options) error
 }
 
 // Options describe who applies and why.
@@ -259,7 +263,7 @@ func Apply(ctx context.Context, deps Deps, m *Manifest, opts Options) (Diff, err
 		}
 	}
 	if len(p.diff.Changes) > 0 || p.diff.ManifestDigestBefore != p.diff.ManifestDigest {
-		if err := recordManifest(ctx, deps.DB, st.brandID, m, p.diff, opts); err != nil {
+		if err := recordManifest(ctx, deps, st.brandID, m, p.diff, opts); err != nil {
 			return p.diff, err
 		}
 	}
@@ -770,10 +774,19 @@ func changeDetails(ch Change) map[string]any {
 	return map[string]any{"target": ch.Target, "name": ch.Name, "action": ch.Action, "fields": fields}
 }
 
-func recordManifest(ctx context.Context, db DB, brandID idgen.UUID, m *Manifest, d Diff, opts Options) error {
-	return inTx(ctx, db, func(tx pgx.Tx) error {
+func recordManifest(ctx context.Context, deps Deps, brandID idgen.UUID, m *Manifest, d Diff, opts Options) error {
+	return inTx(ctx, deps.DB, func(tx pgx.Tx) error {
 		if err := recordApplied(ctx, tx, brandID, m, d.ManifestDigest); err != nil {
 			return zserrors.Wrap(zserrors.CodeDatabaseUnavailable, "", err)
+		}
+		if deps.AfterManifestRecorded != nil {
+			record, err := Get(ctx, tx, brandID)
+			if err != nil {
+				return err
+			}
+			if err := deps.AfterManifestRecorded(ctx, tx, record, opts); err != nil {
+				return err
+			}
 		}
 		_, err := audit.WriteBrand(ctx, tx, brandID, audit.Entry{
 			Actor: opts.Actor, Action: "brand.manifest.recorded", Reason: opts.Reason, Outcome: audit.OutcomeSuccess,

@@ -180,18 +180,19 @@ func TestMigrateProgressesFromReleasedMigrationEighteenToNineteen(t *testing.T) 
 	db := postgrestest.NewEmpty(t)
 	ctx := context.Background()
 	throughEighteen := migrationFilesThrough(t, 18)
+	throughNineteen := migrationFilesThrough(t, 19)
 	if applied, err := database.Migrate(ctx, db.Pool, throughEighteen); err != nil || len(applied) != 18 {
 		t.Fatalf("Migrate() through 18 = %v, %v", applied, err)
 	}
-	pending, err := database.Pending(ctx, db.Pool, migrations.FS)
+	pending, err := database.Pending(ctx, db.Pool, throughNineteen)
 	if err != nil || len(pending) != 1 || pending[0] != 19 {
 		t.Fatalf("Pending() through 19 = %v, %v", pending, err)
 	}
-	applied, err := database.Migrate(ctx, db.Pool, migrations.FS)
+	applied, err := database.Migrate(ctx, db.Pool, throughNineteen)
 	if err != nil || len(applied) != 1 || applied[0] != 19 {
 		t.Fatalf("Migrate() through 19 = %v, %v", applied, err)
 	}
-	pending, err = database.Pending(ctx, db.Pool, migrations.FS)
+	pending, err = database.Pending(ctx, db.Pool, throughNineteen)
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("Pending() after 19 = %v, %v", pending, err)
 	}

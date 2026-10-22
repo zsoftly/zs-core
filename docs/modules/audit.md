@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-The audit module records who did what, to which tenant, and with what result. Every write in Core appends one event in the same transaction as the change, so the event exists exactly when the change does. Each event carries the actor, brand, tenant, action, reason, outcome and a correlation ID. The table refuses `UPDATE`, `DELETE` and `TRUNCATE`. A correction is a new event. Tenant queries always name one brand and one tenant. Brand events, such as a brand apply or a staff grant, belong to one brand and no tenant and are queried separately. Queries filter by actor, action and time, and page newest first with an opaque cursor. Export is Phase 6.
+The audit module records who did what, to which tenant, and with what result. Every write in Core appends one event in the same transaction as the change, so the event exists exactly when the change does. Each event carries the actor, brand, tenant, action, reason, outcome and a correlation ID. The table refuses `UPDATE`, `DELETE` and `TRUNCATE`. A correction is a new event. Tenant queries always name one brand and one tenant. Brand events, such as a brand apply or a staff grant, belong to one brand and no tenant and are queried separately. Queries filter by actor, action and time, and page newest first with an opaque cursor. Export remains Unit 7 work.
 
 ## Writing events
 
@@ -72,3 +72,34 @@ Some writes belong to a brand and no tenant. These are each change of a brand ap
 ## Storage
 
 Table `audit_events`, created by `migrations/000003_audit_events.up.sql`. `migrations/000007_brand_audit_events.up.sql` allows a NULL tenant for brand events and adds `details`. Indexes cover brand, tenant and time, with variants for actor and action. A trigger rejects every `UPDATE`, `DELETE` and `TRUNCATE`.
+
+## Keycloak identity events
+
+The pinned Keycloak 26.8.1 listener forwards LOGIN, LOGIN_ERROR, LOGOUT,
+REGISTER, UPDATE_PASSWORD, UPDATE_EMAIL and RESET_PASSWORD, plus every emitted
+admin event, only after the source transaction commits. Brand apply enables the
+native user and admin event store with seven-day expiry and adds `zs-audit`
+without removing existing realm listeners. Core authenticates each listener request for the realm with its deployment-injected HMAC key and then maps the realm to one active brand.
+There is no trusted Core tenant context in a Keycloak event, so Core records it
+as a brand audit event with `tenant_id` NULL. It never infers a tenant or fans
+the event out to memberships. Brand-scoped audit export will include these rows;
+tenant-scoped export will exclude them. Export itself remains Unit 7 work.
+
+The wire payload excludes representations, event details, resource paths, IP
+addresses, emails, usernames, sessions, tokens, credentials and provider error
+text. Core inserts the native Keycloak event receipt and its audit row in one
+transaction. A retry of the same native event ID and body succeeds without a
+second audit row. The same trusted realm, kind and native ID with another body
+is rejected. The receipt table is additive and its rows remain after an image
+replacement. Migrations are forward only: an older Core binary that lacks an
+applied receipt migration refuses startup and readiness, so the additive table
+does not make an old-image rollback supported. It cannot restore an event the
+source listener lost.
+
+Delivery has at-least-once attempts only while the bounded in-memory capture,
+queue and retry window remain available. Events may be lost after Keycloak
+process death, capture or queue overflow, and retry/deadline exhaustion. Each
+detectable drop increments a counter and creates a PII-free WARN log record. A
+hard process death cannot emit its final counter or warning. Native Keycloak
+event storage has expiry enabled on the reference realm and is a backfill aid,
+not a durable queue or proof of complete recovery.

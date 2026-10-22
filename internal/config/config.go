@@ -14,11 +14,14 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var keycloakAuditSourceID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // Variable names.
 const (
@@ -59,6 +62,11 @@ const (
 	EnvPluginMirrorDir         = "ZS_PLUGIN_MIRROR_DIR"
 	EnvPluginMirrorSecret      = "ZS_PLUGIN_MIRROR_SECRET"
 	EnvPluginMirrorURL         = "ZS_PLUGIN_MIRROR_URL"
+	// EnvKeycloakAuditSecrets maps an applied Keycloak realm name to its
+	// deployment-injected HMAC key as realm=secret pairs separated by semicolons.
+	// It is never read from a realm attribute or brand manifest.
+	EnvKeycloakAuditSecrets    = "ZS_KEYCLOAK_AUDIT_SECRETS"
+	EnvKeycloakAuditSourceID   = "ZS_KEYCLOAK_AUDIT_SOURCE_ID"
 	reservedTestVariablePrefix = "ZS_TEST_"
 )
 
@@ -105,6 +113,8 @@ var known = map[string]bool{
 	EnvQuotaSweepInterval: true, EnvUsagePartitionInterval: true,
 	EnvKillBillDatabaseURL: true, EnvPDFRendererURL: true, EnvPluginMirrorDir: true,
 	EnvPluginMirrorSecret: true, EnvPluginMirrorURL: true,
+	EnvKeycloakAuditSecrets:  true,
+	EnvKeycloakAuditSourceID: true,
 }
 
 // Config is the validated service configuration.
@@ -209,6 +219,9 @@ type Config struct {
 	// only from the verified mirror. Starting an already-installed plugin
 	// does not download a jar.
 	PluginMirrorURL string
+	// KeycloakAuditSecrets authorizes the Keycloak audit listener by realm.
+	KeycloakAuditSecrets  map[string][]byte
+	KeycloakAuditSourceID string
 }
 
 // Load reads the configuration from environ, a list of KEY=value strings as
@@ -245,6 +258,7 @@ func Load(environ []string) (Config, error) {
 		WalletCreditCacheTTL:    DefaultWalletCreditCacheTTL,
 		QuotaSweepInterval:      DefaultQuotaSweepInterval,
 		UsagePartitionInterval:  DefaultUsagePartition,
+		KeycloakAuditSourceID:   "keycloak",
 	}
 	fail := func(format string, args ...any) { problems = append(problems, fmt.Sprintf(format, args...)) }
 
@@ -371,6 +385,24 @@ func Load(environ []string) (Config, error) {
 	}
 	parseSecret(EnvKillBillWebhookSecret, &cfg.KillBillWebhookSecret)
 	parseSecret(EnvPluginMirrorSecret, &cfg.PluginMirrorSecret)
+	if raw := env[EnvKeycloakAuditSecrets]; raw != "" {
+		cfg.KeycloakAuditSecrets = map[string][]byte{}
+		for _, pair := range strings.Split(raw, ";") {
+			realm, secret, ok := strings.Cut(pair, "=")
+			if !ok || realm == "" || strings.ContainsAny(realm, "=;\x00") || len(secret) < minWebhookSecretLength || cfg.KeycloakAuditSecrets[realm] != nil {
+				fail("%s must be unique realm=secret pairs with secrets at least %d characters", EnvKeycloakAuditSecrets, minWebhookSecretLength)
+				break
+			}
+			cfg.KeycloakAuditSecrets[realm] = []byte(secret)
+		}
+	}
+	if raw := env[EnvKeycloakAuditSourceID]; raw != "" {
+		if !keycloakAuditSourceID.MatchString(raw) {
+			fail("%s must contain only letters, digits, underscores and hyphens", EnvKeycloakAuditSourceID)
+		} else {
+			cfg.KeycloakAuditSourceID = raw
+		}
+	}
 	if v := env[EnvKillBillDatabaseURL]; strings.TrimSpace(v) != "" {
 		if err := validateDatabaseURL(v); err != nil {
 			fail("%s %s", EnvKillBillDatabaseURL, err)

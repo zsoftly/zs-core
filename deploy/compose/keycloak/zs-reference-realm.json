@@ -1,4 +1,9 @@
 {
+	"eventsEnabled": true,
+	"eventsExpiration": 604800,
+	"adminEventsEnabled": true,
+	"adminEventsDetailsEnabled": false,
+	"eventsListeners": ["jboss-logging", "zs-audit"],
   "realm": "zs-reference",
   "displayName": "ZSoftly reference",
   "enabled": true,

@@ -139,6 +139,18 @@ func TestComponentSettings(t *testing.T) {
 	}
 }
 
+func TestKeycloakAuditSettingsDoNotLeakSecrets(t *testing.T) {
+	secret := strings.Repeat("a", 32)
+	cfg, err := Load([]string{dbURL, "ZS_KEYCLOAK_AUDIT_SECRETS=one=" + secret + ";two=" + secret, "ZS_KEYCLOAK_AUDIT_SOURCE_ID=keycloak-1"})
+	if err != nil || cfg.KeycloakAuditSourceID != "keycloak-1" || len(cfg.KeycloakAuditSecrets) != 2 || string(cfg.KeycloakAuditSecrets["one"]) != secret {
+		t.Fatalf("audit configuration was not loaded")
+	}
+	_, err = Load([]string{dbURL, "ZS_KEYCLOAK_AUDIT_SECRETS=one=short;one=" + secret, "ZS_KEYCLOAK_AUDIT_SOURCE_ID=not a source"})
+	if err == nil || !strings.Contains(err.Error(), "ZS_KEYCLOAK_AUDIT_SECRETS") || !strings.Contains(err.Error(), "ZS_KEYCLOAK_AUDIT_SOURCE_ID") || strings.Contains(err.Error(), "short") {
+		t.Fatalf("invalid audit configuration = %v", err)
+	}
+}
+
 func TestComponentSettingsAreValidatedWithoutValues(t *testing.T) {
 	_, err := Load([]string{
 		dbURL,

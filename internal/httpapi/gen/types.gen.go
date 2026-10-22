@@ -4,7 +4,11 @@
 package gen
 
 import (
+	"encoding/json"
+	"fmt"
 	"time"
+
+	"github.com/oapi-codegen/runtime"
 )
 
 // Defines values for ActivationDecisionState.
@@ -373,6 +377,39 @@ func (e InvitationCreateRole) Valid() bool {
 	case InvitationCreateRoleBillingAdmin:
 		return true
 	case InvitationCreateRoleMember:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for KeycloakAuditEventKind.
+const (
+	KeycloakAuditEventKindAdmin KeycloakAuditEventKind = "admin"
+	KeycloakAuditEventKindUser  KeycloakAuditEventKind = "user"
+)
+
+// Valid indicates whether the value is a known member of the KeycloakAuditEventKind enum.
+func (e KeycloakAuditEventKind) Valid() bool {
+	switch e {
+	case KeycloakAuditEventKindAdmin:
+		return true
+	case KeycloakAuditEventKindUser:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for KeycloakAuditEventVersion.
+const (
+	KeycloakAuditEventVersionN1 KeycloakAuditEventVersion = 1
+)
+
+// Valid indicates whether the value is a known member of the KeycloakAuditEventVersion enum.
+func (e KeycloakAuditEventVersion) Valid() bool {
+	switch e {
+	case KeycloakAuditEventVersionN1:
 		return true
 	default:
 		return false
@@ -1353,6 +1390,43 @@ type InvoicePage struct {
 	NextCursor *NextCursor `json:"next_cursor"`
 }
 
+// KeycloakAuditEvent defines model for KeycloakAuditEvent.
+type KeycloakAuditEvent struct {
+	AdminActorClientId *string                   `json:"admin_actor_client_id,omitempty"`
+	AdminActorRealmId  *string                   `json:"admin_actor_realm_id,omitempty"`
+	AdminActorUserId   *string                   `json:"admin_actor_user_id,omitempty"`
+	ClientId           *string                   `json:"client_id,omitempty"`
+	EventId            string                    `json:"event_id"`
+	EventType          *string                   `json:"event_type,omitempty"`
+	Failed             bool                      `json:"failed"`
+	Kind               KeycloakAuditEventKind    `json:"kind"`
+	OccurredAtMs       int64                     `json:"occurred_at_ms"`
+	Operation          *string                   `json:"operation,omitempty"`
+	RealmId            string                    `json:"realm_id"`
+	RealmName          string                    `json:"realm_name"`
+	ResourceType       *string                   `json:"resource_type,omitempty"`
+	SourceId           string                    `json:"source_id"`
+	SubjectId          *string                   `json:"subject_id,omitempty"`
+	Version            KeycloakAuditEventVersion `json:"version"`
+	union              json.RawMessage
+}
+
+// KeycloakAuditEventKind defines model for KeycloakAuditEvent.Kind.
+type KeycloakAuditEventKind string
+
+// KeycloakAuditEventVersion defines model for KeycloakAuditEvent.Version.
+type KeycloakAuditEventVersion int
+
+// KeycloakAuditEvent0 defines model for KeycloakAuditEvent.0.
+type KeycloakAuditEvent0 struct {
+	Kind interface{} `json:"kind,omitempty"`
+}
+
+// KeycloakAuditEvent1 defines model for KeycloakAuditEvent.1.
+type KeycloakAuditEvent1 struct {
+	Kind interface{} `json:"kind,omitempty"`
+}
+
 // KillBillId The ID of an object that lives in Kill Bill only, such as a subscription, invoice, payment or payment method. Core never maps it to a Core ID.
 type KillBillId = string
 
@@ -2281,6 +2355,9 @@ type Forbidden = ErrorEnvelope
 // NotFound The body of every error response.
 type NotFound = ErrorEnvelope
 
+// PayloadTooLarge The body of every error response.
+type PayloadTooLarge = ErrorEnvelope
+
 // Unauthenticated The body of every error response.
 type Unauthenticated = ErrorEnvelope
 
@@ -2289,6 +2366,9 @@ type Unavailable = ErrorEnvelope
 
 // Unprocessable The body of every error response.
 type Unprocessable = ErrorEnvelope
+
+// UnsupportedMediaType The body of every error response.
+type UnsupportedMediaType = ErrorEnvelope
 
 // ListAuditEventsParams defines parameters for ListAuditEvents.
 type ListAuditEventsParams struct {
@@ -2318,6 +2398,13 @@ type ListAuditEventsParams struct {
 type ApplyBrandParams struct {
 	// Reason Why the brand is applied. Recorded in audit and in Kill Bill. Required for a sensitive change.
 	Reason *string `form:"reason,omitempty" json:"reason,omitempty"`
+}
+
+// ReceiveKeycloakAuditEventParams defines parameters for ReceiveKeycloakAuditEvent.
+type ReceiveKeycloakAuditEventParams struct {
+	XZSKeycloakRealm     string `json:"X-ZS-Keycloak-Realm"`
+	XZSKeycloakTimestamp string `json:"X-ZS-Keycloak-Timestamp"`
+	XZSKeycloakSignature string `json:"X-ZS-Keycloak-Signature"`
 }
 
 // GetPluginJarParams defines parameters for GetPluginJar.
@@ -2488,6 +2575,9 @@ type ReplaceMetersJSONRequestBody = MeterReplace
 // ReplaceQuotasJSONRequestBody defines body for ReplaceQuotas for application/json ContentType.
 type ReplaceQuotasJSONRequestBody = QuotaReplace
 
+// ReceiveKeycloakAuditEventJSONRequestBody defines body for ReceiveKeycloakAuditEvent for application/json ContentType.
+type ReceiveKeycloakAuditEventJSONRequestBody = KeycloakAuditEvent
+
 // AcceptInvitationJSONRequestBody defines body for AcceptInvitation for application/json ContentType.
 type AcceptInvitationJSONRequestBody = InvitationAccept
 
@@ -2592,3 +2682,294 @@ type RecordUsageJSONRequestBody = UsageEventCreate
 
 // RecordUsageBatchJSONRequestBody defines body for RecordUsageBatch for application/json ContentType.
 type RecordUsageBatchJSONRequestBody = UsageBatch
+
+// AsKeycloakAuditEvent0 returns the union data inside the KeycloakAuditEvent as a KeycloakAuditEvent0
+func (t KeycloakAuditEvent) AsKeycloakAuditEvent0() (KeycloakAuditEvent0, error) {
+	var body KeycloakAuditEvent0
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromKeycloakAuditEvent0 overwrites any union data inside the KeycloakAuditEvent as the provided KeycloakAuditEvent0
+func (t *KeycloakAuditEvent) FromKeycloakAuditEvent0(v KeycloakAuditEvent0) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeKeycloakAuditEvent0 performs a merge with any union data inside the KeycloakAuditEvent, using the provided KeycloakAuditEvent0
+func (t *KeycloakAuditEvent) MergeKeycloakAuditEvent0(v KeycloakAuditEvent0) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsKeycloakAuditEvent1 returns the union data inside the KeycloakAuditEvent as a KeycloakAuditEvent1
+func (t KeycloakAuditEvent) AsKeycloakAuditEvent1() (KeycloakAuditEvent1, error) {
+	var body KeycloakAuditEvent1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromKeycloakAuditEvent1 overwrites any union data inside the KeycloakAuditEvent as the provided KeycloakAuditEvent1
+func (t *KeycloakAuditEvent) FromKeycloakAuditEvent1(v KeycloakAuditEvent1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeKeycloakAuditEvent1 performs a merge with any union data inside the KeycloakAuditEvent, using the provided KeycloakAuditEvent1
+func (t *KeycloakAuditEvent) MergeKeycloakAuditEvent1(v KeycloakAuditEvent1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t KeycloakAuditEvent) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	object := make(map[string]json.RawMessage)
+	if t.union != nil {
+		err = json.Unmarshal(b, &object)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if t.AdminActorClientId != nil {
+		object["admin_actor_client_id"], err = json.Marshal(t.AdminActorClientId)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'admin_actor_client_id': %w", err)
+		}
+	}
+
+	if t.AdminActorRealmId != nil {
+		object["admin_actor_realm_id"], err = json.Marshal(t.AdminActorRealmId)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'admin_actor_realm_id': %w", err)
+		}
+	}
+
+	if t.AdminActorUserId != nil {
+		object["admin_actor_user_id"], err = json.Marshal(t.AdminActorUserId)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'admin_actor_user_id': %w", err)
+		}
+	}
+
+	if t.ClientId != nil {
+		object["client_id"], err = json.Marshal(t.ClientId)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'client_id': %w", err)
+		}
+	}
+
+	object["event_id"], err = json.Marshal(t.EventId)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'event_id': %w", err)
+	}
+
+	if t.EventType != nil {
+		object["event_type"], err = json.Marshal(t.EventType)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'event_type': %w", err)
+		}
+	}
+
+	object["failed"], err = json.Marshal(t.Failed)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'failed': %w", err)
+	}
+
+	object["kind"], err = json.Marshal(t.Kind)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'kind': %w", err)
+	}
+
+	object["occurred_at_ms"], err = json.Marshal(t.OccurredAtMs)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'occurred_at_ms': %w", err)
+	}
+
+	if t.Operation != nil {
+		object["operation"], err = json.Marshal(t.Operation)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'operation': %w", err)
+		}
+	}
+
+	object["realm_id"], err = json.Marshal(t.RealmId)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'realm_id': %w", err)
+	}
+
+	object["realm_name"], err = json.Marshal(t.RealmName)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'realm_name': %w", err)
+	}
+
+	if t.ResourceType != nil {
+		object["resource_type"], err = json.Marshal(t.ResourceType)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'resource_type': %w", err)
+		}
+	}
+
+	object["source_id"], err = json.Marshal(t.SourceId)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'source_id': %w", err)
+	}
+
+	if t.SubjectId != nil {
+		object["subject_id"], err = json.Marshal(t.SubjectId)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'subject_id': %w", err)
+		}
+	}
+
+	object["version"], err = json.Marshal(t.Version)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'version': %w", err)
+	}
+
+	b, err = json.Marshal(object)
+	return b, err
+}
+
+func (t *KeycloakAuditEvent) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	if err != nil {
+		return err
+	}
+	object := make(map[string]json.RawMessage)
+	err = json.Unmarshal(b, &object)
+	if err != nil {
+		return err
+	}
+
+	if raw, found := object["admin_actor_client_id"]; found {
+		err = json.Unmarshal(raw, &t.AdminActorClientId)
+		if err != nil {
+			return fmt.Errorf("error reading 'admin_actor_client_id': %w", err)
+		}
+	}
+
+	if raw, found := object["admin_actor_realm_id"]; found {
+		err = json.Unmarshal(raw, &t.AdminActorRealmId)
+		if err != nil {
+			return fmt.Errorf("error reading 'admin_actor_realm_id': %w", err)
+		}
+	}
+
+	if raw, found := object["admin_actor_user_id"]; found {
+		err = json.Unmarshal(raw, &t.AdminActorUserId)
+		if err != nil {
+			return fmt.Errorf("error reading 'admin_actor_user_id': %w", err)
+		}
+	}
+
+	if raw, found := object["client_id"]; found {
+		err = json.Unmarshal(raw, &t.ClientId)
+		if err != nil {
+			return fmt.Errorf("error reading 'client_id': %w", err)
+		}
+	}
+
+	if raw, found := object["event_id"]; found {
+		err = json.Unmarshal(raw, &t.EventId)
+		if err != nil {
+			return fmt.Errorf("error reading 'event_id': %w", err)
+		}
+	}
+
+	if raw, found := object["event_type"]; found {
+		err = json.Unmarshal(raw, &t.EventType)
+		if err != nil {
+			return fmt.Errorf("error reading 'event_type': %w", err)
+		}
+	}
+
+	if raw, found := object["failed"]; found {
+		err = json.Unmarshal(raw, &t.Failed)
+		if err != nil {
+			return fmt.Errorf("error reading 'failed': %w", err)
+		}
+	}
+
+	if raw, found := object["kind"]; found {
+		err = json.Unmarshal(raw, &t.Kind)
+		if err != nil {
+			return fmt.Errorf("error reading 'kind': %w", err)
+		}
+	}
+
+	if raw, found := object["occurred_at_ms"]; found {
+		err = json.Unmarshal(raw, &t.OccurredAtMs)
+		if err != nil {
+			return fmt.Errorf("error reading 'occurred_at_ms': %w", err)
+		}
+	}
+
+	if raw, found := object["operation"]; found {
+		err = json.Unmarshal(raw, &t.Operation)
+		if err != nil {
+			return fmt.Errorf("error reading 'operation': %w", err)
+		}
+	}
+
+	if raw, found := object["realm_id"]; found {
+		err = json.Unmarshal(raw, &t.RealmId)
+		if err != nil {
+			return fmt.Errorf("error reading 'realm_id': %w", err)
+		}
+	}
+
+	if raw, found := object["realm_name"]; found {
+		err = json.Unmarshal(raw, &t.RealmName)
+		if err != nil {
+			return fmt.Errorf("error reading 'realm_name': %w", err)
+		}
+	}
+
+	if raw, found := object["resource_type"]; found {
+		err = json.Unmarshal(raw, &t.ResourceType)
+		if err != nil {
+			return fmt.Errorf("error reading 'resource_type': %w", err)
+		}
+	}
+
+	if raw, found := object["source_id"]; found {
+		err = json.Unmarshal(raw, &t.SourceId)
+		if err != nil {
+			return fmt.Errorf("error reading 'source_id': %w", err)
+		}
+	}
+
+	if raw, found := object["subject_id"]; found {
+		err = json.Unmarshal(raw, &t.SubjectId)
+		if err != nil {
+			return fmt.Errorf("error reading 'subject_id': %w", err)
+		}
+	}
+
+	if raw, found := object["version"]; found {
+		err = json.Unmarshal(raw, &t.Version)
+		if err != nil {
+			return fmt.Errorf("error reading 'version': %w", err)
+		}
+	}
+
+	return err
+}

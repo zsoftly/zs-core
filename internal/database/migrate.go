@@ -111,13 +111,13 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) ([]int64, erro
 	if err != nil {
 		return nil, err
 	}
+	if err := validateAppliedMigrations(migrations, applied); err != nil {
+		return nil, err
+	}
 
 	var done []int64
 	for _, m := range migrations {
-		if checksum, ok := applied[m.Version]; ok {
-			if checksum != m.Checksum {
-				return done, fmt.Errorf("migration %06d_%s was changed after it was applied", m.Version, m.Name)
-			}
+		if _, ok := applied[m.Version]; ok {
 			continue
 		}
 		err := pgx.BeginFunc(ctx, conn.Conn(), func(tx pgx.Tx) error {
@@ -155,18 +155,56 @@ func Pending(ctx context.Context, db Querier, fsys fs.FS) ([]int64, error) {
 			return nil, err
 		}
 	}
+	if err := validateAppliedMigrations(migrations, applied); err != nil {
+		return nil, err
+	}
 	var pending []int64
 	for _, m := range migrations {
-		checksum, ok := applied[m.Version]
+		_, ok := applied[m.Version]
 		if !ok {
 			pending = append(pending, m.Version)
-			continue
-		}
-		if checksum != m.Checksum {
-			return nil, fmt.Errorf("migration %06d_%s was changed after it was applied", m.Version, m.Name)
 		}
 	}
 	return pending, nil
+}
+
+// validateAppliedMigrations verifies the complete, contiguous migration
+// history before a caller applies any pending entries. It prevents an older
+// binary from writing into a schema whose history contains a version it does
+// not embed.
+func validateAppliedMigrations(migrations []Migration, applied map[int64]string) error {
+	supported := make(map[int64]Migration, len(migrations))
+	for _, m := range migrations {
+		supported[m.Version] = m
+		if checksum, ok := applied[m.Version]; ok && checksum != m.Checksum {
+			return fmt.Errorf("migration %06d_%s was changed after it was applied", m.Version, m.Name)
+		}
+	}
+
+	var observed int64
+	unknownVersion := false
+	for version := range applied {
+		if _, ok := supported[version]; !ok && (!unknownVersion || version > observed) {
+			observed = version
+			unknownVersion = true
+		}
+	}
+	if unknownVersion {
+		return fmt.Errorf("database schema has applied migration version %06d, but this binary supports versions through %06d", observed, migrations[len(migrations)-1].Version)
+	}
+
+	var highestApplied int64
+	for version := range applied {
+		if version > highestApplied {
+			highestApplied = version
+		}
+	}
+	for version := int64(1); version <= highestApplied; version++ {
+		if _, ok := applied[version]; !ok {
+			return fmt.Errorf("database schema history is missing migration version %06d before applied version %06d", version, highestApplied)
+		}
+	}
+	return nil
 }
 
 // Querier is satisfied by pgxpool.Pool, pgx.Conn and pgx.Tx.

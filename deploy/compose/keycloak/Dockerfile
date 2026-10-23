@@ -3,6 +3,7 @@
 # files other than the build output kc.sh writes itself.
 ARG KEYCLOAK_IMAGE
 FROM ${KEYCLOAK_IMAGE} AS builder
+COPY extensions/keycloak/event-listener/target/keycloak-audit-listener-1.0.0.jar /opt/keycloak/providers/keycloak-audit-listener.jar
 ENV KC_DB=postgres \
     KC_HEALTH_ENABLED=true \
     KC_METRICS_ENABLED=true

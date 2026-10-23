@@ -76,6 +76,12 @@ func realmFields(m *Manifest) []field {
 		// Tenants are backed by Keycloak Organizations, which answer 404
 		// until the realm enables them.
 		{"identity.organizations_enabled", "organizationsEnabled", true},
+		// Core owns the audit listener configuration, but preserves listeners
+		// already configured on an existing realm below.
+		{"identity.audit.user_events_enabled", "eventsEnabled", true},
+		{"identity.audit.admin_events_enabled", "adminEventsEnabled", true},
+		{"identity.audit.admin_event_details_enabled", "adminEventsDetailsEnabled", false},
+		{"identity.audit.native_event_expiration", "eventsExpiration", int64(604800)},
 	}
 	if id.LoginTheme != "" {
 		fs = append(fs, field{"identity.login_theme", "loginTheme", id.LoginTheme})
@@ -175,6 +181,22 @@ func planKeycloak(ctx context.Context, kc *keycloak.Client, m *Manifest, sec res
 
 	var changes []Change
 	rf := realmFields(m)
+	// Do not replace another installed listener when enabling zs-audit.
+	listeners := []string{"zs-audit"}
+	if current != nil {
+		if existing, ok := current["eventsListeners"].([]any); ok {
+			listeners = listeners[:0]
+			for _, value := range existing {
+				if name, ok := value.(string); ok {
+					listeners = append(listeners, name)
+				}
+			}
+			if !containsString(listeners, "zs-audit") {
+				listeners = append(listeners, "zs-audit")
+			}
+		}
+	}
+	rf = append(rf, field{"identity.audit.listeners", "eventsListeners", listeners})
 	if !exists {
 		fields, update := allFields(rf)
 		changes = append(changes, Change{

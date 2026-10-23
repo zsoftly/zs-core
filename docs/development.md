@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-You need Go 1.26.1 or later and a Postgres server. Postgres 18 is what the stack and the test harness run. Earlier majors are not tested. Docker runs the integration tests unless you point them at your own server. `make check` gates every change. It checks formatting, runs `go vet`, runs the unit tests and fails when the generated API types are stale. There is no hosted CI workflow, so run `make check` before you push, and run `make test-integration` when you touch SQL, migrations or anything under `pkg/` that talks to Postgres. Configuration is environment only; [configuration.md](configuration.md) lists every variable. The service applies its migrations before it reports ready.
+You need Go 1.26.1 or later, JDK 21, Maven, and a Postgres server. Postgres 18 is what the stack and the test harness run. Earlier majors are not tested. Docker runs the integration tests unless you point them at your own server. `make check` gates every change. It checks formatting, runs `go vet`, runs the unit tests, verifies the Keycloak provider with Maven, and fails when the generated API types are stale. There is no hosted CI workflow, so run `make check` before you push, and run `make test-integration` when you touch SQL, migrations or anything under `pkg/` that talks to Postgres. Configuration is environment only; [configuration.md](configuration.md) lists every variable. The service applies its migrations before it reports ready.
 
 ## Make targets
 
@@ -18,7 +18,8 @@ You need Go 1.26.1 or later and a Postgres server. Postgres 18 is what the stack
 | `make build` | Builds `bin/zs-core`. |
 | `make generate` | Regenerates `internal/httpapi/gen/types.gen.go` from `api/openapi.yaml`. |
 | `make generate-check` | Fails if the generated types do not match the OpenAPI document. |
-| `make check` | `fmt-check`, `vet`, `test` and `generate-check`. This is the merge gate. |
+| `make check` | `fmt-check`, `vet`, `test`, `generate-check` and `keycloak-audit-provider`. This is the merge gate. |
+| `make keycloak-audit-provider` | Runs `mvn -B verify` for the pinned Keycloak 26.8.1 event listener. Requires JDK 21 and Maven. |
 | `make stack-up`, `make stack-down`, `make stack-reset`, `make stack-logs`, `make stack-bootstrap`, `make stack-apply`, `make stack-verify`, `make doctor` | The reference stack. They run `docker compose` in the current shell, and only where `ZS_BUILD_HOST=1` is set. Use them on a build host. See [../deploy/compose/README.md](../deploy/compose/README.md). |
 
 ## Run the service

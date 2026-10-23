@@ -72,7 +72,8 @@ services:
   keycloak:
     image: zs-core/keycloak:local
     build:
-      context: ./keycloak
+      context: ../..
+      dockerfile: deploy/compose/keycloak/Dockerfile
       args:
         KEYCLOAK_IMAGE: ${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244}  # quay.io/keycloak/keycloak:26.8.1
     command: ["start", "--optimized", "--import-realm"]
@@ -89,6 +90,9 @@ services:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .env}
       ZS_STAFF_CLIENT_SECRET: ${ZS_STAFF_CLIENT_SECRET:?set in .env}
+      KC_SPI_EVENTS_LISTENER__ZS_AUDIT__ENDPOINT: http://core:8080/v1/identity/events/keycloak
+      KC_SPI_EVENTS_LISTENER__ZS_AUDIT__SOURCE_ID: ${ZS_KEYCLOAK_AUDIT_SOURCE_ID:-keycloak}
+      KC_SPI_EVENTS_LISTENER__ZS_AUDIT__REALM_SECRETS: zs-reference=${ZS_KEYCLOAK_AUDIT_SECRET:?set in .env}
     volumes:
       - ./keycloak/zs-reference-realm.json:/opt/keycloak/data/import/zs-reference-realm.json:ro
     depends_on:
@@ -254,6 +258,8 @@ services:
       ZS_PLUGIN_MIRROR_DIR: /var/lib/zs-core/plugins
       ZS_PLUGIN_MIRROR_SECRET: ${ZS_PLUGIN_MIRROR_SECRET:?set in .env}
       ZS_PLUGIN_MIRROR_URL: ${ZS_PLUGIN_MIRROR_URL:-http://core:8080}
+      ZS_KEYCLOAK_AUDIT_SECRETS: zs-reference=${ZS_KEYCLOAK_AUDIT_SECRET:?set in .env}
+      ZS_KEYCLOAK_AUDIT_SOURCE_ID: ${ZS_KEYCLOAK_AUDIT_SOURCE_ID:-keycloak}
     volumes:
       - plugin-mirror:/var/lib/zs-core/plugins
       - ../../brands:/app/brands:ro

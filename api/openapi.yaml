@@ -871,6 +871,38 @@ paths:
         "403": {$ref: "#/components/responses/Forbidden"}
         "404": {$ref: "#/components/responses/NotFound"}
         "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/identity/events/keycloak:
+    post:
+      tags: [audit]
+      operationId: receiveKeycloakAuditEvent
+      summary: Receive an authenticated Keycloak audit event.
+      description: |
+        Deployment-only receiver for the pinned Keycloak listener. It is not
+        bearer authenticated. The sender supplies one each of
+        `X-ZS-Keycloak-Realm`, `X-ZS-Keycloak-Timestamp`, and
+        `X-ZS-Keycloak-Signature`. The signature is HMAC-SHA256 over the
+        decimal timestamp, one LF byte, and the exact JSON bytes. Core allows
+        five minutes of skew, maps the authenticated realm to an active brand,
+        and records a brand event with no tenant. Payloads are at most 16 KiB.
+      security: []
+      parameters:
+        - {name: X-ZS-Keycloak-Realm, in: header, required: true, schema: {type: string, minLength: 1, maxLength: 63}}
+        - {name: X-ZS-Keycloak-Timestamp, in: header, required: true, schema: {type: string, pattern: '^[0-9]{1,16}$'}}
+        - {name: X-ZS-Keycloak-Signature, in: header, required: true, schema: {type: string, pattern: '^[0-9a-f]{64}$'}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/KeycloakAuditEvent"}
+      responses:
+        "204": {description: The receipt and audit row committed, or the identical receipt already exists.}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+        "415": {$ref: "#/components/responses/UnsupportedMediaType"}
+        "503": {$ref: "#/components/responses/Unavailable"}
   /v1/tenants/{id}/audit/events:
     get:
       tags: [audit]
@@ -2768,6 +2800,22 @@ components:
       content:
         application/json:
           schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+    PayloadTooLarge:
+      description: The request body is too large.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+    UnsupportedMediaType:
+      description: The request content type is not supported.
+      headers:
+        X-Request-ID: {$ref: "#/components/headers/RequestId"}
+        Cache-Control: {$ref: "#/components/headers/CacheControl"}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
     Unavailable:
       description: A dependency is unavailable. Retry later.
       headers:
@@ -4151,3 +4199,41 @@ components:
         reason: {type: string}
         expires_at: {type: [string, "null"], format: date-time}
         created_at: {type: string, format: date-time}
+    KeycloakAuditEvent:
+      type: object
+      additionalProperties: false
+      required: [version, source_id, event_id, realm_id, realm_name, kind, occurred_at_ms, failed]
+      properties:
+        version: {type: integer, const: 1}
+        source_id: {type: string, pattern: "^[A-Za-z0-9_-]{1,128}$"}
+        event_id: {type: string, minLength: 1, maxLength: 128}
+        realm_id: {type: string, minLength: 1, maxLength: 255}
+        realm_name: {type: string, minLength: 1, maxLength: 63}
+        kind: {type: string, enum: [user, admin]}
+        occurred_at_ms: {type: integer, format: int64, minimum: 1}
+        failed: {type: boolean}
+        event_type: {type: string, minLength: 1, maxLength: 100}
+        subject_id: {type: string, minLength: 1, maxLength: 255}
+        client_id: {type: string, minLength: 1, maxLength: 255}
+        operation: {type: string, minLength: 1, maxLength: 32}
+        resource_type: {type: string, minLength: 1, maxLength: 128}
+        admin_actor_realm_id: {type: string, minLength: 1, maxLength: 255}
+        admin_actor_user_id: {type: string, minLength: 1, maxLength: 255}
+        admin_actor_client_id: {type: string, minLength: 1, maxLength: 255}
+      oneOf:
+        - properties: {kind: {const: user}}
+          required: [event_type]
+          not:
+            anyOf:
+              - required: [operation]
+              - required: [resource_type]
+              - required: [admin_actor_realm_id]
+              - required: [admin_actor_user_id]
+              - required: [admin_actor_client_id]
+        - properties: {kind: {const: admin}}
+          required: [operation, resource_type]
+          not:
+            anyOf:
+              - required: [event_type]
+              - required: [subject_id]
+              - required: [client_id]

@@ -43,13 +43,15 @@ func newAPIOptions(ctx context.Context, cfg config.Config, pool *pgxpool.Pool, l
 	resolver := secrets.Default{Dir: cfg.SecretsDir}
 	notifier := newNotificationService(pool, resolver, log)
 	opts := httpapi.Options{
-		DB:         pool,
-		Migrations: migrations.FS,
-		Logger:     log,
-		Verifier:   &identity.Verifier{Brands: registry, Keys: keycloak.NewKeySet(cfg.KeycloakURL, keycloak.KeySetOptions{})},
-		Brands:     registry,
-		BrandDeps:  brand.Deps{Secrets: resolver},
-		BrandsDir:  cfg.BrandsDir,
+		DB:                    pool,
+		Migrations:            migrations.FS,
+		Logger:                log,
+		Verifier:              &identity.Verifier{Brands: registry, Keys: keycloak.NewKeySet(cfg.KeycloakURL, keycloak.KeySetOptions{})},
+		Brands:                registry,
+		BrandDeps:             brand.Deps{Secrets: resolver},
+		BrandsDir:             cfg.BrandsDir,
+		KeycloakAuditSecrets:  cfg.KeycloakAuditSecrets,
+		KeycloakAuditSourceID: cfg.KeycloakAuditSourceID,
 	}
 	if kc, err := newKeycloak(cfg); err == nil {
 		opts.BrandDeps.Keycloak = kc

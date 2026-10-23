@@ -6,7 +6,7 @@ This directory holds the Docker Compose stack that runs every pinned component o
 
 ## Run it on the build host
 
-The `make stack-*` targets run `docker compose` in the shell you are in. The build host needs Docker with the Compose plugin, `make`, `rsync`, `curl` and `python3`.
+The `make stack-*` targets run `docker compose` in the shell you are in. The build host needs Docker with the Compose plugin, `make`, `rsync`, `curl`, `python3`, JDK 21 and Maven. `make stack-up` first runs `mvn -B verify` in `extensions/keycloak/event-listener` so the Keycloak Dockerfile can copy the provider jar.
 
 ### The build host marker
 
@@ -82,7 +82,7 @@ One container. `postgres/10-databases.sh` runs once, when the data directory is 
 
 ### Keycloak
 
-Keycloak runs in production mode: `start --optimized --import-realm`. The optimized start needs a build step, so `keycloak/Dockerfile` runs the `kc.sh build` command Keycloak documents, with the database vendor and the health and metrics endpoints fixed, and copies the result into a second stage that starts from the same upstream image. It adds no files of its own and does not change the upstream image. The base image is the `KEYCLOAK_IMAGE` build argument, which `compose.yaml` takes from the pinned tag.
+Keycloak runs in production mode: `start --optimized --import-realm`. The optimized start needs a build step, so `keycloak/Dockerfile` copies the locally built `zs-audit` provider jar, runs the `kc.sh build` command Keycloak documents with the database vendor and health and metrics endpoints fixed, and copies the result into a second stage that starts from the same upstream image. The HMAC secret remains deployment configuration and is never baked into an image. The base image is the `KEYCLOAK_IMAGE` build argument, which `compose.yaml` takes from the pinned digest.
 
 The hostname is `http://127.0.0.1:8180`, with the back-channel hostname resolved from the request, so other containers can reach it as `http://keycloak:8080` while browsers use the loopback address. TLS is off because nothing leaves the loopback interface. Health and metrics are on the management port, 9000.
 

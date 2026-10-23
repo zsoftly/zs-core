@@ -25,6 +25,8 @@ ZSoftly Core reads its configuration from environment variables only, there is n
 | `ZS_KEYCLOAK_ADMIN_PASSWORD` | text | none | no | Password of that administrator. Never logged. |
 | `ZS_KEYCLOAK_ADMIN_CLIENT_ID` | text | none | no | A confidential client in the `master` realm with realm management rights. When set with its secret, the Admin API token comes from the client credentials grant instead of the admin password. |
 | `ZS_KEYCLOAK_ADMIN_CLIENT_SECRET` | text | none | no | Secret of that client. Set together with the client ID. Never logged. |
+| `ZS_KEYCLOAK_AUDIT_SECRETS` | `realm=secret[;realm=secret]` | none | no | Deployment-injected HMAC keys for the Keycloak audit listener, one per accepted realm. Every secret is at least 32 characters. This is never a realm attribute or brand-manifest setting, and is never logged. |
+| `ZS_KEYCLOAK_AUDIT_SOURCE_ID` | letters, digits, `_`, `-` | `keycloak` | no | Fixed source identifier that Core accepts from the Keycloak audit listener. |
 | `ZS_KILLBILL_URL` | `http(s)://host[:port]` | none | no | Base URL of Kill Bill. Used by brand apply, brand diff and `doctor`. |
 | `ZS_KILLBILL_ADMIN_USER` | text | none | no | Kill Bill administrator, normally `admin`. Set together with the password. Without it, brand apply fails and `doctor` reports a skip. |
 | `ZS_KILLBILL_ADMIN_PASSWORD` | text | none | no | Password of that administrator. Never logged. |

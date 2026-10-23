@@ -119,7 +119,7 @@ ZSoftly Core is under active development. Expect bugs, breaking changes, and gap
 | Path | Contents |
 | --- | --- |
 | `cmd/zs-core` | The service binary, with `serve`, `migrate` and the operator commands `doctor`, `upgrade`, `brand`, `grant`, `tenant`, `credit-code`, `credit`, `wallet` and `usage`. |
-| `pkg/` | Importable packages: `errors`, `idgen`, `scope`, `idempotency`, `events`, `outbox`, `audit`, `brand`, `identity`, `tenant`, `apikey`, `billing`, `wallet`, `metering` and `quota`. Writers take a `pgx.Tx`, so a product can use them inside its own transaction. |
+| `pkg/` | Importable packages: `errors`, `idgen`, `scope`, `idempotency`, `events`, `outbox`, `audit`, `keycloakaudit`, `brand`, `identity`, `tenant`, `apikey`, `billing`, `wallet`, `metering` and `quota`. Writers take a `pgx.Tx`, so a product can use them inside its own transaction. |
 | `internal/` | Service-only code: configuration, database and migration runner, the HTTP API, the Keycloak and Kill Bill clients, and the test harnesses for Postgres, the engines and the reference stack. |
 | `migrations/` | Forward-only SQL migrations, embedded in the binary. |
 | `api/openapi.yaml` | The OpenAPI 3.1 contract. Go types in `internal/httpapi/gen` are generated from it. |
@@ -135,7 +135,7 @@ Phase 5a adds [plugin operations](docs/modules/plugins.md), [invoice rendering](
 
 - The [billing recipient projection](docs/modules/tenants.md#billing-recipient-projection) eventually reconciles the account's primary email to an eligible current owner, or clears it when none is eligible. Membership and ownership changes commit first; pending work and failed checks retry with bounded backoff. There is no instant recipient cutoff or recall of queued or sent mail. Additional CC recipients remain unmanaged: doctor warns with the account ID, without printing addresses or deleting entries.
 - Invoice numbers are server-wide unique and increasing, with per-tenant gaps. Owner review is pending; numbering is not gapless.
-- V1 remains incomplete. Keycloak event ingestion, guide acceptance, and theme claims are not part of this candidate.
+- V1 remains incomplete. Guide acceptance and theme claims are not part of this candidate. Keycloak audit ingestion uses bounded, best-effort delivery after the identity transaction commits; it is not a lossless source queue. Audit export remains later work.
 
 ## License
 

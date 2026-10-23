@@ -83,6 +83,10 @@ type Options struct {
 	// ZS_PLUGIN_MIRROR_SECRET. Without both the route answers 404.
 	PluginMirror       *kbplugin.Mirror
 	PluginMirrorSecret []byte
+	// KeycloakAuditSecrets maps deployed realm names to HMAC keys. It is not
+	// a brand manifest value and is never exposed through HTTP.
+	KeycloakAuditSecrets  map[string][]byte
+	KeycloakAuditSourceID string
 	// Now defaults to time.Now.
 	Now func() time.Time
 }
@@ -102,8 +106,10 @@ type server struct {
 	quota      *quota.Service
 	now        func() time.Time
 
-	pluginMirror       *kbplugin.Mirror
-	pluginMirrorSecret []byte
+	pluginMirror          *kbplugin.Mirror
+	pluginMirrorSecret    []byte
+	keycloakAuditSecrets  map[string][]byte
+	keycloakAuditSourceID string
 }
 
 // New returns the API handler.
@@ -127,8 +133,10 @@ func New(opts Options) http.Handler {
 		quota:      opts.Quota,
 		now:        opts.Now,
 
-		pluginMirror:       opts.PluginMirror,
-		pluginMirrorSecret: opts.PluginMirrorSecret,
+		pluginMirror:          opts.PluginMirror,
+		pluginMirrorSecret:    opts.PluginMirrorSecret,
+		keycloakAuditSecrets:  opts.KeycloakAuditSecrets,
+		keycloakAuditSourceID: opts.KeycloakAuditSourceID,
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -192,6 +200,7 @@ func New(opts Options) http.Handler {
 	mux.HandleFunc("GET /v1/tenants/{id}/billing/proxy/{path...}", s.proxyBilling)
 	mux.HandleFunc("POST /v1/tenants/{id}/billing/proxy/{path...}", s.proxyBilling)
 	mux.HandleFunc("POST /v1/billing/webhooks/killbill/{brand}/{token}", s.receiveKillBillNotification)
+	mux.HandleFunc("POST /v1/identity/events/keycloak", s.receiveKeycloakAudit)
 
 	mux.Handle("GET /v1/tenants/{id}/wallet", s.member(s.getWallet))
 	mux.Handle("GET /v1/tenants/{id}/reservations", s.member(s.listReservations))

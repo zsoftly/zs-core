@@ -11,7 +11,7 @@ GO_FILES   = $(shell find . -name '*.go' -not -path './vendor/*' -not -path './b
 COMPOSE_DIR := deploy/compose
 COMPOSE     := docker compose --project-directory $(COMPOSE_DIR) -f $(COMPOSE_DIR)/compose.yaml
 
-.PHONY: fmt fmt-check vet lint test test-race test-integration build generate generate-check check clean \
+.PHONY: fmt fmt-check vet lint test test-race test-integration build generate generate-check check clean keycloak-audit-provider \
 	stack-up stack-down stack-reset stack-logs stack-bootstrap stack-apply stack-verify doctor stack-guard
 
 fmt:
@@ -61,7 +61,7 @@ generate-check:
 		echo "$(GEN_OUT) is stale: run make generate"; exit 1; \
 	fi
 
-check: fmt-check vet test generate-check
+check: fmt-check vet test generate-check keycloak-audit-provider
 
 clean:
 	rm -rf bin
@@ -76,7 +76,10 @@ stack-guard:
 	fi
 
 # Builds the Keycloak and Core images, starts everything and waits for health.
-stack-up: stack-guard
+keycloak-audit-provider:
+	cd extensions/keycloak/event-listener && mvn -B verify
+
+stack-up: stack-guard keycloak-audit-provider
 	@test -f $(COMPOSE_DIR)/.env || cp $(COMPOSE_DIR)/.env.example $(COMPOSE_DIR)/.env
 	$(COMPOSE) up -d --build --wait
 

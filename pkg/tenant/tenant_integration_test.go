@@ -5,11 +5,14 @@ package tenant_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zsoftly/zs-core/internal/enginetest"
 	"github.com/zsoftly/zs-core/internal/postgrestest"
@@ -248,6 +251,205 @@ WHERE status = 'pending' AND last_error LIKE 'killbill.account:%'`).Scan(&tenant
 	// The client's retry with the same key now returns the tenant.
 	if again, err := e.createOrg(owner, "Rollback Ltd", "rollback-key"); err != nil || again.ID != tenantID {
 		t.Fatalf("retry = %v %v", again.PublicID(), err)
+	}
+}
+
+func TestSweeperPersistsCreationCursorAfterExaminedWork(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.fake.SetDown(false, true)
+	first := e.person("cursor-first@example.test")
+	second := e.person("cursor-second@example.test")
+	if _, err := e.createOrg(first, "Cursor First", "cursor-first-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("first creation = %v", err)
+	}
+	if _, err := e.createOrg(second, "Cursor Second", "cursor-second-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("second creation = %v", err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_provisioning SET next_attempt_at = date_trunc('minute', now())
+        WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	e.fake.SetDown(false, false)
+	report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Batch: 1}).SweepOnce(ctx)
+	if err != nil || report.Completed != 2 {
+		t.Fatalf("sweep = %+v %v", report, err)
+	}
+	var wrapped bool
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id IS NULL FROM sweep_cursor WHERE kind = 'creation'`).Scan(&wrapped); err != nil {
+		t.Fatalf("creation cursor = %v", err)
+	}
+	if !wrapped {
+		t.Fatal("creation cursor did not wrap after the end of eligible work")
+	}
+}
+
+func TestSweeperCompletesCreationWithOneConnection(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.fake.SetDown(false, true)
+	owner := e.person("one-connection@example.test")
+	if _, err := e.createOrg(owner, "One Connection", "one-connection-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("creation = %v", err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_provisioning SET next_attempt_at = now() WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgxpool.ParseConfig(e.db.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	e.fake.SetDown(false, false)
+	sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	report, err := (&tenant.Sweeper{DB: pool, Engines: e.eng, Batch: 1}).SweepOnce(sweepCtx)
+	if err != nil || report.Completed != 1 {
+		t.Fatalf("one-connection sweep = %+v %v", report, err)
+	}
+}
+
+func TestSweeperCreationCursorAdvancesPastLockedPrefix(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.fake.SetDown(false, true)
+	first := e.person("locked-prefix-first@example.test")
+	second := e.person("locked-prefix-second@example.test")
+	if _, err := e.createOrg(first, "Locked Prefix First", "locked-prefix-first-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("first creation = %v", err)
+	}
+	if _, err := e.createOrg(second, "Locked Prefix Second", "locked-prefix-second-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("second creation = %v", err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_provisioning SET next_attempt_at = date_trunc('minute', now())
+        WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	var lockedID idgen.UUID
+	if err := e.db.Pool.QueryRow(ctx, `SELECT tenant_id FROM tenant_provisioning WHERE status = 'pending'
+        ORDER BY next_attempt_at, tenant_id LIMIT 1`).Scan(&lockedID); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := e.db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lock.Rollback(context.Background()) })
+	if _, err := lock.Exec(ctx, `SELECT tenant_id FROM tenant_provisioning WHERE tenant_id = $1 FOR UPDATE`, lockedID); err != nil {
+		t.Fatal(err)
+	}
+	e.fake.SetDown(false, false)
+	report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Batch: 1}).SweepOnce(ctx)
+	if err != nil || report.Completed != 1 {
+		t.Fatalf("locked-prefix sweep = %+v %v", report, err)
+	}
+	var exists bool
+	if err := e.db.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sweep_cursor WHERE kind = 'creation')`).Scan(&exists); err != nil {
+		t.Fatalf("creation cursor = %v", err)
+	}
+	if !exists {
+		t.Fatal("creation cursor was not persisted")
+	}
+	var status string
+	if err := e.db.Pool.QueryRow(ctx, `SELECT status FROM tenant_provisioning WHERE tenant_id = $1`, lockedID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" {
+		t.Fatalf("locked prefix status = %q, want pending", status)
+	}
+}
+
+func TestSweeperCreationCursorCapsWorkAndResumes(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.fake.SetDown(false, true)
+	for i := range 51 {
+		owner := e.person(fmt.Sprintf("cursor-cap-%02d@example.test", i))
+		if _, err := e.createOrg(owner, fmt.Sprintf("Cursor Cap %02d", i), fmt.Sprintf("cursor-cap-key-%02d", i)); code(err) != "billing_unavailable" {
+			t.Fatalf("creation %d = %v", i, err)
+		}
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_provisioning SET next_attempt_at = date_trunc('minute', now())
+        WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	var fiftieth idgen.UUID
+	if err := e.db.Pool.QueryRow(ctx, `SELECT tenant_id FROM tenant_provisioning WHERE status = 'pending'
+        ORDER BY next_attempt_at, tenant_id OFFSET 49 LIMIT 1`).Scan(&fiftieth); err != nil {
+		t.Fatal(err)
+	}
+	e.fake.SetDown(false, false)
+	sweeper := &tenant.Sweeper{DB: e.db.Pool, Engines: e.eng}
+	first, err := sweeper.SweepOnce(ctx)
+	if err != nil || first.Completed != 50 {
+		t.Fatalf("first capped sweep = %+v %v", first, err)
+	}
+	var cursor idgen.UUID
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id FROM sweep_cursor WHERE kind = 'creation'`).Scan(&cursor); err != nil {
+		t.Fatalf("first creation cursor = %v", err)
+	}
+	if cursor != fiftieth {
+		t.Fatalf("first cursor = %s, want %s", cursor, fiftieth)
+	}
+	second, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng}).SweepOnce(ctx)
+	if err != nil || second.Completed != 1 {
+		t.Fatalf("resume sweep = %+v %v", second, err)
+	}
+	var wrapped bool
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id IS NULL FROM sweep_cursor WHERE kind = 'creation'`).Scan(&wrapped); err != nil {
+		t.Fatalf("wrapped creation cursor = %v", err)
+	}
+	if !wrapped {
+		t.Fatal("creation cursor did not wrap after resumed final work")
+	}
+}
+
+func TestSweeperCreationCursorResumesAfterStoredRow(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.fake.SetDown(false, true)
+	first := e.person("cursor-resume-first@example.test")
+	second := e.person("cursor-resume-second@example.test")
+	if _, err := e.createOrg(first, "Cursor Resume First", "cursor-resume-first-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("first creation = %v", err)
+	}
+	if _, err := e.createOrg(second, "Cursor Resume Second", "cursor-resume-second-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("second creation = %v", err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_provisioning SET next_attempt_at = date_trunc('minute', now()) WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	var firstID idgen.UUID
+	var eligibleAt time.Time
+	if err := e.db.Pool.QueryRow(ctx, `SELECT tenant_id, next_attempt_at FROM tenant_provisioning WHERE status = 'pending' ORDER BY next_attempt_at, tenant_id LIMIT 1`).Scan(&firstID, &eligibleAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO sweep_cursor (kind, last_eligible_at, last_tenant_id) VALUES ('creation', $1, $2)`, eligibleAt, firstID); err != nil {
+		t.Fatal(err)
+	}
+	e.fake.SetDown(false, false)
+	report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Batch: 1}).SweepOnce(ctx)
+	if err != nil || report.Completed != 1 {
+		t.Fatalf("resumed sweep = %+v %v", report, err)
+	}
+	var firstStatus string
+	if err := e.db.Pool.QueryRow(ctx, `SELECT status FROM tenant_provisioning WHERE tenant_id = $1`, firstID).Scan(&firstStatus); err != nil {
+		t.Fatal(err)
+	}
+	if firstStatus != "pending" {
+		t.Fatalf("stored cursor predecessor = %q, want pending", firstStatus)
+	}
+	var wrapped bool
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id IS NULL FROM sweep_cursor WHERE kind = 'creation'`).Scan(&wrapped); err != nil {
+		t.Fatal(err)
+	}
+	if !wrapped {
+		t.Fatal("creation cursor did not wrap after resumed tail")
 	}
 }
 

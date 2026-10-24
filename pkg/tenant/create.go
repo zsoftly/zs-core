@@ -64,6 +64,7 @@ type provisioning struct {
 	OrgID          string
 	AccountID      string
 	Attempts       int
+	EligibleAt     time.Time
 	Claim          []byte
 	// BillingLocale is the creator's locale in Kill Bill's form, such as
 	// fr_CA, or "".
@@ -76,13 +77,13 @@ func (p provisioning) publicID() string { return idgen.Format(idgen.Tenant, p.Te
 
 const provisioningColumns = `tenant_id, brand_id, kind, slug, name, coalesce(billing_country, ''), created_by_identity_id,
        coalesce(idempotency_key, ''), fingerprint, status, coalesce(keycloak_organization_id, ''),
-       coalesce(killbill_account_id::text, ''), attempts, claim_token, coalesce(billing_locale, '')`
+       coalesce(killbill_account_id::text, ''), attempts, next_attempt_at, claim_token, coalesce(billing_locale, '')`
 
 func scanProvisioning(row pgx.Row) (provisioning, error) {
 	var p provisioning
 	var kind string
 	err := row.Scan(&p.TenantID, &p.BrandID, &kind, &p.Slug, &p.Name, &p.BillingCountry, &p.CreatedBy,
-		&p.IdempotencyKey, &p.Fingerprint, &p.Status, &p.OrgID, &p.AccountID, &p.Attempts, &p.Claim, &p.BillingLocale)
+		&p.IdempotencyKey, &p.Fingerprint, &p.Status, &p.OrgID, &p.AccountID, &p.Attempts, &p.EligibleAt, &p.Claim, &p.BillingLocale)
 	p.Kind = Kind(kind)
 	return p, err
 }
@@ -309,9 +310,13 @@ func provision(ctx context.Context, db DB, eng Engines, p provisioning, actor ev
 		return Tenant{}, failProvisioning(ctx, db, p, "engines", err, actor, correlationID)
 	}
 	var keycloakUser, email string
-	if err := db.QueryRow(ctx, `SELECT coalesce(keycloak_user_id, ''), CASE WHEN email_verified THEN coalesce(email, '') ELSE '' END
-FROM identities WHERE brand_id = $1 AND id = $2`,
-		p.BrandID, p.CreatedBy).Scan(&keycloakUser, &email); err != nil {
+	args, err := p.scope().Bind(p.CreatedBy)
+	if err != nil {
+		return Tenant{}, failProvisioning(ctx, db, p, "identity", err, actor, correlationID)
+	}
+	if err := db.QueryRow(ctx, `SELECT coalesce(i.keycloak_user_id, ''), CASE WHEN i.email_verified THEN coalesce(i.email, '') ELSE '' END
+FROM tenant_provisioning p JOIN identities i ON i.brand_id = p.brand_id AND i.id = p.created_by_identity_id
+WHERE p.brand_id = $1 AND p.tenant_id = $2 AND i.id = $3`, args...).Scan(&keycloakUser, &email); err != nil {
 		return Tenant{}, failProvisioning(ctx, db, p, "identity", unavailable(err), actor, correlationID)
 	}
 	if p.OrgID == "" {

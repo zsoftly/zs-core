@@ -289,6 +289,9 @@ func (g *LifecycleGuard) readyLocked(child bool) error {
 }
 
 func (g *LifecycleGuard) targetErr(ctx context.Context, args []any) error {
+	if g.global {
+		return nil
+	}
 	if brand, err := scope.BrandFromContext(ctx); err == nil && brand != g.scope.Brand {
 		return ErrWrongScope
 	}

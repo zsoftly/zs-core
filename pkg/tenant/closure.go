@@ -3,6 +3,7 @@ package tenant
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -109,14 +110,8 @@ func ExecuteClosureInvoiceOnce(ctx context.Context, db DB, eng Engines, sc scope
 	if _, err := sc.Bind(); err != nil {
 		return ClosureExecutionResult{}, err
 	}
-	rec, err := brand.Get(ctx, db, sc.Brand)
-	if err != nil || rec.Manifest == nil || len(rec.Manifest.Billing.Currencies) == 0 {
-		if err != nil {
-			return ClosureExecutionResult{}, err
-		}
-		return ClosureExecutionResult{}, zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is not ready.")
-	}
 	var (
+		rec              brand.Record
 		attemptID        idgen.UUID
 		accountID        string
 		targetDate       time.Time
@@ -128,9 +123,10 @@ func ExecuteClosureInvoiceOnce(ctx context.Context, db DB, eng Engines, sc scope
 		expectedCurrency string
 	)
 	manualReview := zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is pending manual review.")
-	// lock reads the attempt under its row lock and refuses it unless the
-	// tenant is closing, the settlement waits for finance, and the brand still
-	// stores the Kill Bill tenant the attempt was claimed against.
+	// lock reads the attempt under its row lock and, inside that lock, the
+	// brand, once. It refuses the attempt unless the tenant is closing, the
+	// settlement waits for finance, and the brand still stores the Kill Bill
+	// tenant the attempt was claimed against.
 	lock := func(tx pgx.Tx) error {
 		var status, settlement string
 		err := tx.QueryRow(ctx, `SELECT a.id, a.killbill_account_id::text, a.target_date, t.status, s.status, a.killbill_tenant_id::text
@@ -147,13 +143,19 @@ WHERE a.brand_id = $1 AND a.tenant_id = $2 FOR UPDATE`, sc.Brand, sc.Tenant).Sca
 		if status != "closing" || settlement != "finance_pending" {
 			return zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is not ready.")
 		}
+		if rec, err = brand.Get(ctx, tx, sc.Brand); err != nil {
+			return err
+		}
+		if rec.Manifest == nil || len(rec.Manifest.Billing.Currencies) == 0 {
+			return zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is not ready.")
+		}
 		if !strings.EqualFold(attemptTenant, rec.KillBillTenantID) {
 			return manualReview
 		}
 		return nil
 	}
 	// First read what is already recorded. Nothing is started yet.
-	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+	err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
 		if err := lock(tx); err != nil {
 			return err
 		}
@@ -186,7 +188,8 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 	// Bill answers, and the tenant its API key resolves to is the one the
 	// brand stores and the attempt was claimed against. A failure here leaves
 	// nothing to review.
-	be, err := eng.forBillingBrand(ctx, db, sc.Brand)
+	read := rec
+	be, err := eng.billingFor(ctx, read)
 	if err != nil {
 		return ClosureExecutionResult{}, err
 	}
@@ -194,15 +197,42 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 	if err != nil {
 		return ClosureExecutionResult{}, engineError(err)
 	}
-	if !strings.EqualFold(live.TenantID, rec.KillBillTenantID) || !strings.EqualFold(live.TenantID, attemptTenant) {
+	if !strings.EqualFold(live.TenantID, read.KillBillTenantID) || !strings.EqualFold(live.TenantID, attemptTenant) {
 		return ClosureExecutionResult{}, manualReview
 	}
 	if !recorded {
+		// The account is read with the brand credentials: it proves the secret,
+		// that the account belongs to this tenant, and the currency to expect.
+		acct, err := eng.KillBill.AccountWithBalance(ctx, be.creds, accountID)
+		if err != nil {
+			return ClosureExecutionResult{}, engineError(err)
+		}
+		if !strings.EqualFold(acct.AccountID, accountID) || !slices.Contains(read.Manifest.Billing.Currencies, acct.Currency) {
+			return ClosureExecutionResult{}, zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is not ready.")
+		}
+		expectedCurrency = acct.Currency
+		// The dry run asks for the invoice a real run would create for the same
+		// account and target date. It answers 204 when there is nothing to
+		// invoice, which is recorded as definite and posts nothing. The tenant
+		// is closing, so nothing new is billed between this read and the POST
+		// below.
+		_, found, err := eng.KillBill.DryRunInvoice(ctx, be.creds, callContext("", "closure invoice dry run"), accountID, targetDate.Format(time.DateOnly))
+		if err != nil {
+			return ClosureExecutionResult{}, engineError(err)
+		}
+		if !found {
+			if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "no_invoice", ""); err != nil {
+				return ClosureExecutionResult{}, err
+			}
+			return ClosureExecutionResult{NoInvoice: true}, nil
+		}
 		err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
 			if err := lock(tx); err != nil {
 				return err
 			}
-			expectedCurrency = rec.Manifest.Billing.Currencies[0]
+			if rec.KillBillTenantID != read.KillBillTenantID || rec.KillBillAPIKey != read.KillBillAPIKey {
+				return manualReview
+			}
 			tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, expected_currency)
 VALUES ($1, $2, 'started', $3)
 ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expectedCurrency)
@@ -222,23 +252,16 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expect
 	}
 	if started {
 		postCtx, cancelPost := context.WithTimeout(context.WithoutCancel(ctx), closurePostBound)
-		trigger, err := eng.KillBill.TriggerInvoice(postCtx, be.creds, callContext("", "closure invoice"), accountID, targetDate.Format(time.DateOnly))
+		invoiceID, err = eng.KillBill.TriggerInvoice(postCtx, be.creds, callContext("", "closure invoice"), accountID, targetDate.Format(time.DateOnly))
 		cancelPost()
 		if err != nil {
+			// Any failure of the real POST, a bare 404 included, proves nothing:
+			// it is an unknown outcome for manual review, never posted again.
 			if persistErr := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "post_unknown", ""); persistErr != nil {
 				return ClosureExecutionResult{}, errors.Join(engineError(err), persistErr)
 			}
 			return ClosureExecutionResult{}, engineError(err)
 		}
-		if !trigger.Created {
-			// Kill Bill answered that there is nothing to invoice. That is
-			// definite: it is recorded and the attempt is never posted again.
-			if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "no_invoice", ""); err != nil {
-				return ClosureExecutionResult{Posted: true}, err
-			}
-			return ClosureExecutionResult{Posted: true, NoInvoice: true}, nil
-		}
-		invoiceID = trigger.InvoiceID
 		if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "invoice_id", invoiceID); err != nil {
 			return ClosureExecutionResult{}, err
 		}

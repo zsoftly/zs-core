@@ -251,7 +251,7 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 	var responseMu sync.Mutex
 	var invoiceID, targetDate string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if answerTenantLookup(w, r, tn.BrandID) {
+		if answerPreflight(w, r, tn, 0, 0) {
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
@@ -339,7 +339,7 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 	}
 	var posts atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if answerTenantLookup(w, r, tn.BrandID) {
+		if answerPreflight(w, r, tn, 0, 0) {
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
@@ -386,7 +386,7 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 	}
 	var posts atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if answerTenantLookup(w, r, tn.BrandID) {
+		if answerPreflight(w, r, tn, 0, 0) {
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
@@ -573,7 +573,7 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 			wrongTargetDate := tc.targetDate == "wrong"
 			var invoiceID, targetDate string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if answerTenantLookup(w, r, tn.BrandID) {
+				if answerPreflight(w, r, tn, 0, 0) {
 					return
 				}
 				if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
@@ -681,10 +681,53 @@ func answerTenantLookup(w http.ResponseWriter, r *http.Request, tenantID idgen.U
 	return true
 }
 
+// answerPreflight answers what ExecuteClosureInvoiceOnce reads from Kill Bill
+// before it starts: the tenant lookup, the account and the invoice dry run.
+// dry: 0 something to invoice, 1 nothing (204), 2 unavailable. account: 0 the
+// tenant's account in CAD, 1 unavailable, 2 in a currency the brand does not bill in, 3 another account.
+func answerPreflight(w http.ResponseWriter, r *http.Request, tn tenant.Tenant, dry, account int32) bool {
+	if answerTenantLookup(w, r, tn.BrandID) {
+		return true
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/1.0/kb/accounts/"+tn.KillBillAccountID {
+		id, currency := tn.KillBillAccountID, "CAD"
+		switch account {
+		case 1:
+			http.Error(w, "account unavailable", http.StatusServiceUnavailable)
+			return true
+		case 2:
+			currency = "ZZZ"
+		case 3:
+			id = idgen.MustNewV7().String()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accountId":"` + id + `","currency":"` + currency + `"}`))
+		return true
+	}
+	if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices/dryRun" {
+		switch dry {
+		case 1:
+			w.WriteHeader(http.StatusNoContent)
+		case 2:
+			http.Error(w, "dry run unavailable", http.StatusServiceUnavailable)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"amount":1,"currency":"CAD"}`))
+		}
+		return true
+	}
+	return false
+}
+
+// kbMode says how the Kill Bill of claimedClosure answers.
+// lookup: 0 the stored tenant, 1 another tenant, 2 unavailable.
+// post: 0 created, 2 slow, 3 a bare 404. dry and account are as for answerPreflight.
+type kbMode struct{ lookup, post, dry, account atomic.Int32 }
+
 // claimedClosure is a closing tenant with a claimed, not yet executed,
 // closure invoice, and a Kill Bill whose tenant lookup answers as lookup
 // says: 0 the stored tenant, 1 another tenant, 2 unavailable.
-func claimedClosure(t *testing.T, lookup, post *atomic.Int32, posts, lookups *atomic.Int64) (*env, tenant.Tenant) {
+func claimedClosure(t *testing.T, m *kbMode, posts, lookups *atomic.Int64) (*env, tenant.Tenant) {
 	t.Helper()
 	e := newEnv(t)
 	ctx := context.Background()
@@ -706,7 +749,7 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/1.0/kb/tenants" {
 			lookups.Add(1)
-			switch lookup.Load() {
+			switch m.lookup.Load() {
 			case 1:
 				answerTenantLookup(w, r, idgen.MustNewV7())
 			case 2:
@@ -716,17 +759,19 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 			}
 			return
 		}
+		if answerPreflight(w, r, tn, m.dry.Load(), m.account.Load()) {
+			return
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
 			posts.Add(1)
-			switch post.Load() {
-			case 1:
-				// Kill Bill 0.24.22 answers nothing-to-invoice with Tomcat's own 404 page.
+			switch m.post.Load() {
+			case 2:
+				time.Sleep(800 * time.Millisecond)
+			case 3:
 				w.Header().Set("Content-Type", "text/html;charset=utf-8")
 				w.WriteHeader(http.StatusNotFound)
 				_, _ = w.Write([]byte("<!doctype html><html><body><h3>Apache Tomcat/9.0.122</h3></body></html>"))
 				return
-			case 2:
-				time.Sleep(800 * time.Millisecond)
 			}
 			mu.Lock()
 			invoiceID = idgen.MustNewV7().String()
@@ -758,11 +803,10 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 // A Kill Bill tenant rebuilt under the same API key is not the tenant the
 // brand stores. The live lookup catches it before anything is started.
 func TestClosureInvoiceExecutionRefusesARebuiltKillBillTenant(t *testing.T) {
-	var lookup atomic.Int32
+	var m kbMode
 	var posts, lookups atomic.Int64
-	lookup.Store(1)
-	var post atomic.Int32
-	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
+	m.lookup.Store(1)
+	e, tn := claimedClosure(t, &m, &posts, &lookups)
 	ctx := context.Background()
 	if _, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || posts.Load() != 0 {
 		t.Fatalf("rebuilt tenant = %v posts=%d", err, posts.Load())
@@ -776,11 +820,10 @@ func TestClosureInvoiceExecutionRefusesARebuiltKillBillTenant(t *testing.T) {
 // A lookup that fails leaves nothing started, so the attempt is not stuck
 // for manual review: once Kill Bill answers, it starts and posts once.
 func TestClosureInvoiceExecutionLeavesNothingStartedWhenTheLookupFails(t *testing.T) {
-	var lookup atomic.Int32
+	var m kbMode
 	var posts, lookups atomic.Int64
-	lookup.Store(2)
-	var post atomic.Int32
-	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
+	m.lookup.Store(2)
+	e, tn := claimedClosure(t, &m, &posts, &lookups)
 	ctx := context.Background()
 	if _, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || posts.Load() != 0 {
 		t.Fatalf("failed lookup = %v posts=%d", err, posts.Load())
@@ -789,44 +832,138 @@ func TestClosureInvoiceExecutionLeavesNothingStartedWhenTheLookupFails(t *testin
 	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_invoice_outcomes`).Scan(&outcomes); err != nil || outcomes != 0 {
 		t.Fatalf("outcomes after a failed lookup = %d, %v", outcomes, err)
 	}
-	lookup.Store(0)
+	m.lookup.Store(0)
 	result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
 	if err != nil || !result.Posted || !result.Evidenced || posts.Load() != 1 {
 		t.Fatalf("after the lookup recovered = %+v %v posts=%d", result, err, posts.Load())
 	}
 }
 
-// Kill Bill answers with a bare 404 when the account has nothing to invoice. That is a
-// definite answer: it is recorded once, never posted again, and a repeat
-// returns it without calling Kill Bill.
-func TestClosureInvoiceExecutionRecordsNothingToInvoice(t *testing.T) {
-	var lookup, post atomic.Int32
+// The invoice dry run answers 204 when there is nothing to invoice. That is
+// definite: it is recorded as no_invoice, nothing is started and no real POST
+// is made. A repeat returns it without calling Kill Bill.
+func TestClosureInvoiceExecutionRecordsNothingToInvoiceFromTheDryRun(t *testing.T) {
+	var m kbMode
 	var posts, lookups atomic.Int64
-	post.Store(1)
-	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
+	m.dry.Store(1)
+	e, tn := claimedClosure(t, &m, &posts, &lookups)
 	ctx := context.Background()
 	result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
-	if err != nil || !result.Posted || !result.NoInvoice || result.Evidenced || posts.Load() != 1 {
+	if err != nil || result.Posted || !result.NoInvoice || result.Evidenced || posts.Load() != 0 {
 		t.Fatalf("nothing to invoice = %+v %v posts=%d", result, err, posts.Load())
 	}
-	var outcomes int
-	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_invoice_outcomes WHERE kind = 'no_invoice' AND invoice_id IS NULL`).Scan(&outcomes); err != nil || outcomes != 1 {
-		t.Fatalf("no_invoice outcomes = %d, %v", outcomes, err)
+	var noInvoice, started int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'no_invoice' AND invoice_id IS NULL), count(*) FILTER (WHERE kind = 'started')
+FROM tenant_closure_invoice_outcomes`).Scan(&noInvoice, &started); err != nil || noInvoice != 1 || started != 0 {
+		t.Fatalf("no_invoice outcomes = %d started = %d, %v", noInvoice, started, err)
 	}
 	lookupsBefore := lookups.Load()
 	again, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
-	if err != nil || !again.NoInvoice || again.Posted || posts.Load() != 1 || lookups.Load() != lookupsBefore {
+	if err != nil || !again.NoInvoice || again.Posted || posts.Load() != 0 || lookups.Load() != lookupsBefore {
 		t.Fatalf("repeat = %+v %v posts=%d lookups %d -> %d", again, err, posts.Load(), lookupsBefore, lookups.Load())
+	}
+}
+
+// A real POST that answers a bare 404 is not proof of anything. It is an
+// unknown outcome for manual review, never nothing to invoice, and is not
+// posted again.
+func TestClosureInvoiceExecutionTreatsABareNotFoundPostAsUnknown(t *testing.T) {
+	var m kbMode
+	var posts, lookups atomic.Int64
+	m.post.Store(3)
+	e, tn := claimedClosure(t, &m, &posts, &lookups)
+	ctx := context.Background()
+	if result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || result.NoInvoice || posts.Load() != 1 {
+		t.Fatalf("bare 404 = %+v %v posts=%d", result, err, posts.Load())
+	}
+	var unknown, noInvoice int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'post_unknown'), count(*) FILTER (WHERE kind = 'no_invoice')
+FROM tenant_closure_invoice_outcomes`).Scan(&unknown, &noInvoice); err != nil || unknown != 1 || noInvoice != 0 {
+		t.Fatalf("post_unknown = %d no_invoice = %d, %v", unknown, noInvoice, err)
+	}
+	if result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || result.NoInvoice || posts.Load() != 1 {
+		t.Fatalf("repeat = %+v %v posts=%d", result, err, posts.Load())
+	}
+}
+
+// The account is read with the brand credentials before anything is started.
+// An unreadable account, a currency the brand does not bill in and another
+// account all leave nothing started; the recorded currency is the account's.
+func TestClosureInvoiceExecutionReadsTheAccountBeforeStarting(t *testing.T) {
+	var m kbMode
+	var posts, lookups atomic.Int64
+	e, tn := claimedClosure(t, &m, &posts, &lookups)
+	ctx := context.Background()
+	for name, mode := range map[string]int32{"unavailable": 1, "currency the brand does not bill in": 2, "another account": 3} {
+		m.account.Store(mode)
+		if _, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || posts.Load() != 0 {
+			t.Fatalf("%s: err = %v posts=%d", name, err, posts.Load())
+		}
+		var outcomes int
+		if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_invoice_outcomes`).Scan(&outcomes); err != nil || outcomes != 0 {
+			t.Fatalf("%s: outcomes = %d, %v", name, outcomes, err)
+		}
+	}
+	m.account.Store(0)
+	if result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err != nil || !result.Posted || !result.Evidenced {
+		t.Fatalf("execution = %+v %v", result, err)
+	}
+	var currency string
+	if err := e.db.Pool.QueryRow(ctx, `SELECT expected_currency FROM tenant_closure_invoice_outcomes WHERE kind = 'started'`).Scan(&currency); err != nil || currency != "CAD" {
+		t.Fatalf("recorded currency = %q, %v", currency, err)
+	}
+}
+
+// An evidenced or read_mismatch outcome names the invoice ID that was
+// recorded, and no other.
+func TestClosureInvoiceOutcomeMustNameTheRecordedInvoice(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	p := e.person("owner@example.test")
+	tn := e.mustOrg(p, "Tenant A")
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status)
+VALUES ($1, $2, now(), 'finance_pending')`, tn.BrandID, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	attemptID, recorded := idgen.MustNewV7(), idgen.MustNewV7()
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_attempts (id, brand_id, tenant_id, killbill_tenant_id, killbill_account_id, target_date)
+VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, attemptID, tn.BrandID, tn.ID, tn.KillBillAccountID); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(kind string, invoice any, currency any) error {
+		_, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, invoice_id, expected_currency) VALUES ($1, $2, $3, $4, $5)`,
+			idgen.MustNewV7(), attemptID, kind, invoice, currency)
+		return err
+	}
+	if err := insert("started", nil, "CAD"); err != nil {
+		t.Fatal(err)
+	}
+	refused := func(kind string, invoice idgen.UUID, why string) {
+		t.Helper()
+		var pgErr *pgconn.PgError
+		if err := insert(kind, invoice, nil); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("%s %s = %v, want a check violation", kind, why, err)
+		}
+	}
+	// With no invoice_id outcome recorded there is no invoice to name.
+	refused("evidenced", recorded, "before any invoice_id outcome")
+	if err := insert("invoice_id", recorded, nil); err != nil {
+		t.Fatal(err)
+	}
+	refused("evidenced", idgen.MustNewV7(), "for another invoice")
+	refused("read_mismatch", idgen.MustNewV7(), "for another invoice")
+	if err := insert("evidenced", recorded, nil); err != nil {
+		t.Fatalf("evidenced for the recorded invoice = %v", err)
 	}
 }
 
 // A stop while the POST is in flight still records the invoice ID the answer
 // carries, so the attempt is recovered by its read and never posted again.
 func TestClosureInvoiceExecutionRecordsTheInvoiceIDWhenStoppedDuringThePost(t *testing.T) {
-	var lookup, post atomic.Int32
+	var m kbMode
 	var posts, lookups atomic.Int64
-	post.Store(2)
-	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
+	m.post.Store(2)
+	e, tn := claimedClosure(t, &m, &posts, &lookups)
 	ctx := context.Background()
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -852,9 +989,9 @@ FROM tenant_closure_invoice_outcomes`).Scan(&invoiceOutcomes, &unknown); err != 
 // A database failure while the invoice ID is recorded, after Kill Bill has
 // created the invoice, is retried instead of leaving the attempt unrecorded.
 func TestClosureInvoiceExecutionRetriesRecordingTheInvoiceID(t *testing.T) {
-	var lookup, post atomic.Int32
+	var m kbMode
 	var posts, lookups atomic.Int64
-	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
+	e, tn := claimedClosure(t, &m, &posts, &lookups)
 	ctx := context.Background()
 	for _, sql := range []string{
 		`CREATE SEQUENCE closure_outcome_fail_seq`,

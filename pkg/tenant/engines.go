@@ -68,6 +68,15 @@ func (e Engines) forBillingBrand(ctx context.Context, q Querier, id idgen.UUID) 
 	if err != nil {
 		return brandEngines{}, err
 	}
+	return e.billingFor(ctx, rec)
+}
+
+// billingFor builds the billing engines of a brand record that the caller
+// already read, so a caller that holds a lock reads the brand once.
+func (e Engines) billingFor(ctx context.Context, rec brand.Record) (brandEngines, error) {
+	if e.KillBill == nil || e.Secrets == nil {
+		return brandEngines{}, zserrors.New(zserrors.CodeNotReady, "Billing recipient reconciliation needs the Kill Bill admin settings.")
+	}
 	if rec.Status != brand.StatusActive || rec.AppliedAt.IsZero() || rec.Manifest == nil || len(rec.Manifest.Billing.Currencies) == 0 {
 		return brandEngines{}, zserrors.New(zserrors.CodeNotReady, "The brand is not applied.")
 	}

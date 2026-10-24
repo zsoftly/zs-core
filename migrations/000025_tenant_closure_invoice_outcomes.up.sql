@@ -25,3 +25,17 @@ CREATE TRIGGER tenant_closure_invoice_outcome_guard BEFORE UPDATE OR DELETE ON t
 FOR EACH ROW EXECUTE FUNCTION tenant_closure_invoice_outcome_guard();
 CREATE TRIGGER tenant_closure_invoice_outcome_no_truncate BEFORE TRUNCATE ON tenant_closure_invoice_outcomes
 FOR EACH STATEMENT EXECUTE FUNCTION tenant_closure_invoice_outcome_guard();
+
+CREATE FUNCTION tenant_closure_invoice_outcome_tie() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.kind IN ('evidenced', 'read_mismatch') AND NOT EXISTS (
+        SELECT 1 FROM tenant_closure_invoice_outcomes o
+        WHERE o.attempt_id = NEW.attempt_id AND o.kind = 'invoice_id' AND o.invoice_id = NEW.invoice_id
+    ) THEN
+        RAISE EXCEPTION 'closure invoice outcome must name the recorded invoice' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER tenant_closure_invoice_outcome_tie BEFORE INSERT ON tenant_closure_invoice_outcomes
+FOR EACH ROW EXECUTE FUNCTION tenant_closure_invoice_outcome_tie();

@@ -128,7 +128,7 @@ func ExecuteClosureInvoiceOnce(ctx context.Context, db DB, eng Engines, sc scope
 	// brand, once. It refuses the attempt unless the tenant is closing, the
 	// settlement waits for finance, and the brand still stores the Kill Bill
 	// tenant the attempt was claimed against.
-	lock := func(tx pgx.Tx) error {
+	lock := func(ctx context.Context, tx pgx.Tx) error {
 		var status, settlement string
 		err := tx.QueryRow(ctx, `SELECT a.id, a.killbill_account_id::text, a.target_date, t.status, s.status, a.killbill_tenant_id::text
 FROM tenant_closure_invoice_attempts a
@@ -157,7 +157,7 @@ WHERE a.brand_id = $1 AND a.tenant_id = $2 FOR UPDATE`, sc.Brand, sc.Tenant).Sca
 	}
 	// First read what is already recorded. Nothing is started yet.
 	err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
-		if err := lock(tx); err != nil {
+		if err := lock(ctx, tx); err != nil {
 			return err
 		}
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes WHERE attempt_id = $1 AND kind = 'no_invoice')`, attemptID).Scan(&noInvoice); err != nil {
@@ -226,20 +226,23 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 			// The dry run may be stale: another executor can have started and
 			// posted since this one read. So no_invoice is recorded under the
 			// attempt lock, and only while nothing has been started.
+			// Every statement of this write runs apart from the caller's context,
+			// so a stop after the dry run cannot leave the answer unrecorded.
+			writeCtx := context.WithoutCancel(ctx)
 			err := withClosureWriteRetries(func() error {
-				return pgx.BeginFunc(context.WithoutCancel(ctx), db, func(tx pgx.Tx) error {
-					if err := lock(tx); err != nil {
+				return pgx.BeginFunc(writeCtx, db, func(tx pgx.Tx) error {
+					if err := lock(writeCtx, tx); err != nil {
 						return err
 					}
 					var begun bool
-					if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes
+					if err := tx.QueryRow(writeCtx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes
 WHERE attempt_id = $1 AND kind IN ('started', 'invoice_id', 'post_unknown'))`, attemptID).Scan(&begun); err != nil {
 						return unavailable(err)
 					}
 					if begun {
 						return manualReview
 					}
-					if _, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind) VALUES ($1, $2, 'no_invoice')
+					if _, err := tx.Exec(writeCtx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind) VALUES ($1, $2, 'no_invoice')
 ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID); err != nil {
 						return unavailable(err)
 					}
@@ -252,7 +255,7 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID); err !
 			return ClosureExecutionResult{NoInvoice: true}, nil
 		}
 		err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
-			if err := lock(tx); err != nil {
+			if err := lock(ctx, tx); err != nil {
 				return err
 			}
 			if rec.KillBillTenantID != read.KillBillTenantID || rec.KillBillAPIKey != read.KillBillAPIKey ||

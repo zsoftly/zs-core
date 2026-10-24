@@ -42,6 +42,9 @@ FOR EACH ROW EXECUTE FUNCTION tenant_closure_invoice_outcome_tie();
 
 CREATE FUNCTION tenant_closure_invoice_outcome_exclusive() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+    -- Take the attempt lock first, so two concurrent inserts are serialized
+    -- here and the second sees the first, whatever the caller did before.
+    PERFORM 1 FROM tenant_closure_invoice_attempts WHERE id = NEW.attempt_id FOR UPDATE;
     IF NEW.kind = 'no_invoice' AND EXISTS (
         SELECT 1 FROM tenant_closure_invoice_outcomes o WHERE o.attempt_id = NEW.attempt_id AND o.kind IN ('started', 'invoice_id', 'post_unknown')
     ) THEN

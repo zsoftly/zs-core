@@ -169,6 +169,8 @@ Each command changes Kill Bill first, then the Keycloak Organization, then Core,
 
 Closing is terminal. It revokes every API key of the tenant with `tenant_closed`, in the same transaction. Each command on a closed tenant answers `409 tenant_closed`. Core checks again under the tenant lock before it writes. A reactivation that called the engines while a close committed is refused there with `tenant_closed`, the tenant stays closed, and Core disables the Organization again. If that last call fails, the sweeper disables it.
 
+A closing tenant's closure invoice is recorded as an outcome and never assumed. `no_invoice` means Kill Bill's dry run for the account and target date found nothing left to invoice at that moment. Invoices that Kill Bill already generated are evidenced at settlement, not by this outcome.
+
 ## Scope resolution
 
 Every `/v1/tenants/{id}/...` route passes through the same step before its handler. The tenant must belong to the caller's brand, and must not be closed. A write needs it active. A customer token needs an active membership of its identity. A staff or service token has none. An API key must belong to the tenant. Anything else is `404 tenant_not_found`, so a tenant's existence is never confirmed to an outsider. A database failure in this step is `503 authentication_unavailable`. The handler then calls `scope.Require(ctx, "resource:action")`, and a missing permission is `403 permission_denied`.

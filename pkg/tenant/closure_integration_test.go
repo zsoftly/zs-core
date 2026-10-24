@@ -1155,3 +1155,57 @@ FOR EACH ROW WHEN (NEW.kind = 'invoice_id') EXECUTE FUNCTION closure_outcome_alw
 		t.Fatalf("error = %v, want it to name the invoice ID", err)
 	}
 }
+
+// The database alone keeps a start and no_invoice from both being recorded,
+// even when two transactions insert them at the same time: the second waits
+// for the first and then finds it.
+func TestClosureInvoiceExclusionHoldsForConcurrentInserts(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	p := e.person("owner@example.test")
+	tn := e.mustOrg(p, "Tenant A")
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status)
+VALUES ($1, $2, now(), 'finance_pending')`, tn.BrandID, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	attempt := idgen.MustNewV7()
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_attempts (id, brand_id, tenant_id, killbill_tenant_id, killbill_account_id, target_date)
+VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, attempt, tn.BrandID, tn.ID, tn.KillBillAccountID); err != nil {
+		t.Fatal(err)
+	}
+	first, err := e.db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Rollback(ctx)
+	second, err := e.db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Rollback(ctx)
+	if _, err := first.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, expected_currency) VALUES ($1, $2, 'started', 'CAD')`, idgen.MustNewV7(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := second.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind) VALUES ($1, $2, 'no_invoice')`, idgen.MustNewV7(), attempt)
+		done <- err
+	}()
+	// The second insert must wait for the first transaction.
+	select {
+	case err := <-done:
+		t.Fatalf("no_invoice was not held back by a concurrent start: %v", err)
+	case <-time.After(1500 * time.Millisecond):
+	}
+	if err := first.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var pgErr *pgconn.PgError
+	if err := <-done; err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("no_invoice after the concurrent start = %v, want a check violation", err)
+	}
+	var started, noInvoice int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'started'), count(*) FILTER (WHERE kind = 'no_invoice') FROM tenant_closure_invoice_outcomes`).Scan(&started, &noInvoice); err != nil || started != 1 || noInvoice != 0 {
+		t.Fatalf("started = %d no_invoice = %d, %v", started, noInvoice, err)
+	}
+}

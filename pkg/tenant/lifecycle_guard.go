@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/scope"
 )
 
@@ -26,6 +27,7 @@ const (
 )
 
 var ErrLifecycleReleased = errors.New("tenant lifecycle capability is released")
+var ErrWrongScope = errors.New("tenant lifecycle capability scope does not match target")
 
 var _ DB = (*LifecycleGuard)(nil)
 var _ pgx.Tx = (*lifecycleTx)(nil)
@@ -81,12 +83,6 @@ func (g *LifecycleSweep) TryTenant(ctx context.Context, s scope.Scope) (*Lifecyc
 	if g == nil || g.LifecycleGuard == nil {
 		return nil, false, ErrLifecycleReleased
 	}
-	g.mu.Lock()
-	invalid := g.readyLocked(true) != nil || !g.global || g.child != nil || g.activeTx != nil || g.rows != nil
-	g.mu.Unlock()
-	if invalid {
-		return nil, false, ErrLifecycleReleased
-	}
 	if err := s.Validate(); err != nil {
 		return nil, false, err
 	}
@@ -97,9 +93,20 @@ func acquireLifecycle(ctx context.Context, pool *pgxpool.Pool, s scope.Scope, gl
 	acquireCtx, cancel := lifecycleContext(ctx, lifecycleAcquireLimit)
 	defer cancel()
 	var conn *pgxpool.Conn
+	parentLocked := false
 	if parent != nil {
-		if parent.released || !parent.global || parent.child != nil {
+		parent.mu.Lock()
+		parentLocked = true
+		defer func() {
+			if parentLocked {
+				parent.mu.Unlock()
+			}
+		}()
+		if parent.readyLocked(true) != nil || !parent.global {
 			return nil, false, ErrLifecycleReleased
+		}
+		if parent.child != nil || parent.activeTx != nil || parent.rows != nil {
+			return nil, false, nil
 		}
 		conn = parent.conn
 	} else {
@@ -128,6 +135,11 @@ func acquireLifecycle(ctx context.Context, pool *pgxpool.Pool, s scope.Scope, gl
 		err = conn.QueryRow(acquireCtx, `SELECT current_schema(), (hashtextextended('zs-core.tenant.closure:' || current_schema() || ':' || $1::uuid::text || ':' || $2::uuid::text, 0) | '-9223372036854775808'::bigint)`, s.Brand, s.Tenant).Scan(&g.schema, &g.key)
 	}
 	if err != nil || g.schema == "" || (global && g.key < globalSweepNamespace) || (!global && g.key >= globalSweepNamespace) {
+		if parentLocked {
+			parent.invalidateLocked()
+			parent.mu.Unlock()
+			parentLocked = false
+		}
 		g.discard()
 		if err != nil {
 			return nil, false, unavailable(err)
@@ -136,6 +148,11 @@ func acquireLifecycle(ctx context.Context, pool *pgxpool.Pool, s scope.Scope, gl
 	}
 	var locked bool
 	if err := conn.QueryRow(acquireCtx, `SELECT pg_try_advisory_lock($1::bigint)`, g.key).Scan(&locked); err != nil {
+		if parentLocked {
+			parent.invalidateLocked()
+			parent.mu.Unlock()
+			parentLocked = false
+		}
 		g.discard()
 		return nil, false, unavailable(err)
 	}
@@ -154,19 +171,28 @@ func acquireLifecycle(ctx context.Context, pool *pgxpool.Pool, s scope.Scope, gl
 // Begin starts the one short transaction allowed by this capability.
 func (g *LifecycleGuard) Begin(ctx context.Context) (pgx.Tx, error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if err := g.readyLocked(false); err != nil {
+		g.mu.Unlock()
+		return nil, err
+	}
+	if err := g.targetErr(ctx, nil); err != nil {
+		g.mu.Unlock()
 		return nil, err
 	}
 	if g.activeTx != nil || g.rows != nil {
+		g.mu.Unlock()
 		return nil, errors.New("tenant lifecycle operation already active")
 	}
 	tx, err := g.conn.Begin(ctx)
 	if err != nil {
+		g.invalidateLocked()
+		g.mu.Unlock()
+		g.discard()
 		return nil, unavailable(err)
 	}
 	bound := &lifecycleTx{owner: g, generation: g.generation, tx: tx}
 	g.activeTx = bound
+	g.mu.Unlock()
 	return bound, nil
 }
 
@@ -175,6 +201,10 @@ func (g *LifecycleGuard) Begin(ctx context.Context) (pgx.Tx, error) {
 func (g *LifecycleGuard) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	g.mu.Lock()
 	if err := g.readyLocked(false); err != nil {
+		g.mu.Unlock()
+		return nil, err
+	}
+	if err := g.targetErr(ctx, args); err != nil {
 		g.mu.Unlock()
 		return nil, err
 	}
@@ -223,6 +253,23 @@ func (g *LifecycleGuard) readyLocked(child bool) error {
 		parentLive := !g.parent.released && !*g.parent.discarded && g.parent.generation == g.parentGeneration && g.parent.child == g
 		if !parentLive {
 			return ErrLifecycleReleased
+		}
+	}
+	return nil
+}
+
+func (g *LifecycleGuard) targetErr(ctx context.Context, args []any) error {
+	if brand, err := scope.BrandFromContext(ctx); err == nil && brand != g.scope.Brand {
+		return ErrWrongScope
+	}
+	if target, err := scope.FromContext(ctx); err == nil && (target.Brand != g.scope.Brand || target.Tenant != g.scope.Tenant) {
+		return ErrWrongScope
+	}
+	if len(args) >= 2 {
+		brand, brandOK := args[0].(idgen.UUID)
+		tenant, tenantOK := args[1].(idgen.UUID)
+		if brandOK && tenantOK && (brand != g.scope.Brand || tenant != g.scope.Tenant) {
+			return ErrWrongScope
 		}
 	}
 	return nil
@@ -397,10 +444,20 @@ type lifecycleTx struct {
 }
 
 func (t *lifecycleTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if err := t.owner.targetErr(ctx, args); err != nil {
+		return pgconn.CommandTag{}, err
+	}
 	if err := t.readyWithoutRows(); err != nil {
 		return pgconn.CommandTag{}, err
 	}
-	return t.tx.Exec(ctx, sql, args...)
+	tag, err := t.tx.Exec(ctx, sql, args...)
+	if err != nil {
+		t.owner.mu.Lock()
+		t.owner.invalidateLocked()
+		t.owner.mu.Unlock()
+		t.owner.discard()
+	}
+	return tag, err
 }
 
 func (t *lifecycleTx) Begin(context.Context) (pgx.Tx, error) {
@@ -418,6 +475,9 @@ func (t *lifecycleTx) SendBatch(context.Context, *pgx.Batch) pgx.BatchResults {
 func (t *lifecycleTx) LargeObjects() pgx.LargeObjects { return pgx.LargeObjects{} }
 
 func (t *lifecycleTx) Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error) {
+	if err := t.owner.targetErr(ctx, nil); err != nil {
+		return nil, err
+	}
 	if err := t.readyWithoutRows(); err != nil {
 		return nil, err
 	}
@@ -425,20 +485,27 @@ func (t *lifecycleTx) Prepare(ctx context.Context, name, sql string) (*pgconn.St
 }
 
 func (t *lifecycleTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if err := t.owner.targetErr(ctx, args); err != nil {
+		return nil, err
+	}
 	if err := t.ready(); err != nil {
 		return nil, err
 	}
 	t.owner.mu.Lock()
-	defer t.owner.mu.Unlock()
 	if t.owner.rows != nil {
+		t.owner.mu.Unlock()
 		return nil, errors.New("tenant lifecycle result already active")
 	}
 	rows, err := t.tx.Query(ctx, sql, args...)
 	if err != nil {
+		t.owner.invalidateLocked()
+		t.owner.mu.Unlock()
+		t.owner.discard()
 		return nil, err
 	}
 	bound := &lifecycleRows{owner: t.owner, generation: t.generation, rows: rows}
 	t.owner.rows = bound
+	t.owner.mu.Unlock()
 	return bound, nil
 }
 
@@ -470,6 +537,9 @@ func (t *lifecycleTx) Rollback(ctx context.Context) error { return t.finish(ctx,
 func (t *lifecycleTx) finish(ctx context.Context, commit bool) error {
 	if t == nil {
 		return ErrLifecycleReleased
+	}
+	if err := t.owner.targetErr(ctx, nil); err != nil {
+		return err
 	}
 	t.owner.mu.Lock()
 	if t.done {
@@ -578,7 +648,9 @@ func (g *LifecycleGuard) Release() error {
 		return errors.New("tenant lifecycle advisory unlock was not acknowledged")
 	}
 	if g.parent != nil {
+		g.parent.mu.Lock()
 		g.parent.child = nil
+		g.parent.mu.Unlock()
 		return nil
 	}
 	g.conn.Release()

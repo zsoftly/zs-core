@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -16,6 +17,15 @@ import (
 	"github.com/zsoftly/zs-core/pkg/scope"
 	"github.com/zsoftly/zs-core/pkg/tenant"
 )
+
+type queryCounter struct{ starts atomic.Int64 }
+
+func (q *queryCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	q.starts.Add(1)
+	return ctx
+}
+
+func (*queryCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func lifecycleScope() scope.Scope {
 	return scope.Scope{Brand: idgen.MustNewV7(), Tenant: idgen.MustNewV7()}
@@ -423,6 +433,205 @@ func TestLifecycleGuardSameTenantContentionReleasesForReacquire(t *testing.T) {
 	}
 	if err := again.Release(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLifecycleGuardRejectsWrongScopeBeforeSQL(t *testing.T) {
+	db := postgrestest.New(t)
+	tracer := &queryCounter{}
+	config := db.Pool.Config().Copy()
+	config.ConnConfig.Tracer = tracer
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	sc := lifecycleScope()
+	guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), pool, sc)
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	for _, wrong := range []scope.Scope{
+		{Brand: sc.Brand, Tenant: idgen.MustNewV7()},
+		{Brand: idgen.MustNewV7(), Tenant: sc.Tenant},
+	} {
+		tracer.starts.Store(0)
+		if _, err := tenant.Get(context.Background(), guard, wrong); !errors.Is(err, tenant.ErrWrongScope) {
+			t.Fatalf("wrong scope %v error = %v", wrong, err)
+		}
+		if got := tracer.starts.Load(); got != 0 {
+			t.Fatalf("wrong scope %v issued %d queries", wrong, got)
+		}
+	}
+	tracer.starts.Store(0)
+	if _, err := tenant.Get(context.Background(), guard, sc); err == nil {
+		t.Fatal("same scope unexpectedly had a tenant row")
+	}
+	if got := tracer.starts.Load(); got == 0 {
+		t.Fatal("same scope issued no SQL")
+	}
+}
+
+func TestLifecycleGuardInvalidatesAfterDriverErrors(t *testing.T) {
+	for _, operation := range []string{"begin", "exec", "query", "commit"} {
+		t.Run(operation, func(t *testing.T) {
+			db := postgrestest.New(t)
+			guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+			if err != nil || !got {
+				t.Fatalf("guard = %v %v", got, err)
+			}
+			t.Cleanup(func() {
+				if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+					t.Error(err)
+				}
+			})
+			switch operation {
+			case "begin":
+				cancelled, cancel := context.WithCancel(context.Background())
+				cancel()
+				if _, err := guard.Begin(cancelled); err == nil {
+					t.Fatal("cancelled begin succeeded")
+				}
+			case "exec":
+				tx, err := guard.Begin(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) && !errors.Is(err, pgx.ErrTxClosed) {
+						t.Error(err)
+					}
+				})
+				if _, err := tx.Exec(context.Background(), `SELECT FROM`); err == nil {
+					t.Fatal("invalid exec succeeded")
+				}
+			case "query":
+				tx, err := guard.Begin(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) && !errors.Is(err, pgx.ErrTxClosed) {
+						t.Error(err)
+					}
+				})
+				cancelled, cancel := context.WithCancel(context.Background())
+				cancel()
+				if rows, err := tx.Query(cancelled, `SELECT 1`); err == nil {
+					rows.Close()
+					t.Fatal("cancelled query succeeded")
+				}
+			case "commit":
+				setup, err := guard.Begin(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := setup.Exec(context.Background(), `CREATE TEMP TABLE lifecycle_guard_driver_commit (id integer UNIQUE DEFERRABLE INITIALLY DEFERRED)`); err != nil {
+					t.Fatal(err)
+				}
+				if err := setup.Commit(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				tx, err := guard.Begin(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) && !errors.Is(err, pgx.ErrTxClosed) {
+						t.Error(err)
+					}
+				})
+				if _, err := tx.Exec(context.Background(), `INSERT INTO lifecycle_guard_driver_commit (id) VALUES (1), (1)`); err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(context.Background()); err == nil {
+					t.Fatal("deferred commit succeeded")
+				}
+			}
+			if _, err := guard.Query(context.Background(), `SELECT 1`); !errors.Is(err, tenant.ErrLifecycleReleased) {
+				t.Fatalf("query after %s error = %v", operation, err)
+			}
+		})
+	}
+}
+
+func TestLifecycleSweepTryTenantSerializesSameParentChildren(t *testing.T) {
+	db := postgrestest.New(t)
+	parent, got, err := tenant.AcquireLifecycleSweep(context.Background(), db.Pool)
+	if err != nil || !got {
+		t.Fatalf("parent = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := parent.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	sc := lifecycleScope()
+	type result struct {
+		child *tenant.LifecycleGuard
+		got   bool
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			child, got, err := parent.TryTenant(context.Background(), sc)
+			results <- result{child: child, got: got, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	for _, result := range []result{first, second} {
+		if result.child != nil {
+			child := result.child
+			t.Cleanup(func() {
+				if err := child.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+					t.Error(err)
+				}
+			})
+		}
+	}
+	if first.err != nil || second.err != nil || first.got == second.got {
+		t.Fatalf("children = %+v %+v", first, second)
+	}
+	winner := first
+	if !winner.got {
+		winner = second
+	}
+	if contender, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, sc); err != nil || got || contender != nil {
+		t.Fatalf("independent contender = %v %v %v", contender, got, err)
+	}
+	tx, err := winner.child.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(context.Background(), `SELECT 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := winner.child.Release(); err != nil {
+		t.Fatal(err)
+	}
+	again, got, err := parent.TryTenant(context.Background(), sc)
+	if err != nil || !got {
+		t.Fatalf("child reacquire = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := again.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	if independent, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, sc); err != nil || got || independent != nil {
+		t.Fatalf("independent child contender = %v %v %v", independent, got, err)
 	}
 }
 

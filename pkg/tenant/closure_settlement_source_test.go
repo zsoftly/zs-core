@@ -14,7 +14,7 @@ import (
 // a second writer would be a second reading of that rule. A new writer is added
 // to this list on purpose.
 var settlementInsertAllowlist = map[string]bool{
-	// "pkg/tenant/closure_start.go": the code that starts a closure.
+	"pkg/tenant/closure_start.go": true, // the code that starts a closure.
 }
 
 var settlementInsert = regexp.MustCompile(`(?is)insert\s+into\s+(\w+\.)?"?tenant_closure_settlements`)

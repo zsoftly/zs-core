@@ -150,6 +150,9 @@ func transition(ctx context.Context, db DB, eng Engines, s scope.Scope, actor ev
 	if t.Status == StatusClosed {
 		return Tenant{}, errTenantClosed()
 	}
+	if t.Status == StatusClosing {
+		return Tenant{}, errTenantClosing()
+	}
 	if t.Status == to {
 		return t, nil
 	}
@@ -186,13 +189,17 @@ func transition(ctx context.Context, db DB, eng Engines, s scope.Scope, actor ev
 	if err != nil {
 		return Tenant{}, err
 	}
-	if locked.Status == StatusClosed {
-		// A close committed while this change called the engines. Closed is
-		// terminal: put the Organization back to disabled and refuse. The
-		// sweeper corrects it if this call fails.
+	if locked.Status == StatusClosed || locked.Status == StatusClosing {
+		// A close, or the start of a closure, committed while this change
+		// called the engines. Closed is terminal and a closing tenant is
+		// settled by its closure alone: put the Organization back to disabled
+		// and refuse. The sweeper corrects it if this call fails.
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 		if to == StatusActive {
 			_ = setOrganizationEnabled(context.WithoutCancel(ctx), eng.Keycloak, be.realm, t.KeycloakOrganizationID, false)
+		}
+		if locked.Status == StatusClosing {
+			return Tenant{}, errTenantClosing()
 		}
 		return Tenant{}, errTenantClosed()
 	}
@@ -227,6 +234,10 @@ WHERE brand_id = $1 AND id = $2 RETURNING `+tenantColumns, args...))
 
 func errTenantClosed() error {
 	return zserrors.New(zserrors.CodeTenantClosed, "")
+}
+
+func errTenantClosing() error {
+	return zserrors.New(zserrors.CodeNotReady, "The tenant is closing, and its closure settles it.")
 }
 
 func setOrganizationEnabled(ctx context.Context, kc *keycloak.Client, realm, id string, enabled bool) error {

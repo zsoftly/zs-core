@@ -67,6 +67,39 @@ func settleContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), lifecycleCleanupLimit)
 }
 
+// errClosurePassOver says the pass budget ended while a statement was in
+// flight. The statement failed, so the lifecycle capability of the pass is
+// spent, and the whole sweep pass ends cleanly: the rest of it would only
+// meet a released capability.
+var errClosurePassOver = errors.New("the closure pass budget ended")
+
+// passError is what a pass returns when err stopped it. A pass that the caller
+// stopped, as on shutdown, returns that stop. A pass whose own budget ran out
+// is over, which is not a failure, and a caller sees that as
+// errClosurePassOver. Anything else is a real failure.
+func passError(ctx, passCtx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if stop := ctx.Err(); stop != nil {
+		return stop
+	}
+	if passCtx.Err() != nil {
+		return errClosurePassOver
+	}
+	return err
+}
+
+// passEnded reports whether the pass must stop before it starts anything new,
+// and with what. The caller's stop is returned as it is. A spent budget is a
+// clean end: nothing was in flight, so the capability is intact.
+func passEnded(ctx, passCtx context.Context) (bool, error) {
+	if stop := ctx.Err(); stop != nil {
+		return true, stop
+	}
+	return passCtx.Err() != nil, nil
+}
+
 func (s *Sweeper) passBudget() time.Duration {
 	if s.PassBudget <= 0 {
 		return 30 * time.Second
@@ -106,30 +139,36 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 	passCutoff := time.Now().UTC()
 	eligibleAt, tenantID, err := s.closureCursor(passCtx, guard)
 	if err != nil {
-		return err
+		return passError(ctx, passCtx, err)
 	}
 	work, scanned := 0, 0
 	for scanned < s.closureScan() && work < s.closureWork() {
+		if ended, err := passEnded(ctx, passCtx); ended {
+			return err
+		}
 		limit := s.batch()
 		if remaining := s.closureScan() - scanned; limit > remaining {
 			limit = remaining
 		}
 		due, err := s.closurePage(passCtx, guard, passCutoff, eligibleAt, tenantID, limit)
 		if err != nil {
-			return err
+			return passError(ctx, passCtx, err)
 		}
 		if len(due) == 0 {
-			return s.advanceClosureCursor(passCtx, guard, closureCandidate{}, true)
+			return passError(ctx, passCtx, s.advanceClosureCursor(passCtx, guard, closureCandidate{}, true))
 		}
 		for _, c := range due {
 			if scanned >= s.closureScan() || work >= s.closureWork() {
 				break
 			}
+			if ended, err := passEnded(ctx, passCtx); ended {
+				return err
+			}
 			scanned++
 			report.ClosuresChecked++
 			child, got, err := guard.TryTenant(passCtx, c.scope)
 			if err != nil {
-				return err
+				return passError(ctx, passCtx, err)
 			}
 			settle, budgetSpent, settleCancel := passCtx, false, func() {}
 			if got {
@@ -175,13 +214,20 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 			} else {
 				report.ClosuresBusy++
 			}
+			if !budgetSpent && passCtx.Err() != nil && ctx.Err() == nil {
+				// The step returned just as the pass budget ended. The tenant
+				// was fully handled, so the cursor moves past it with a short
+				// context of its own, and the pass ends cleanly.
+				settle, settleCancel = settleContext(ctx)
+				budgetSpent = true
+			}
 			if budgetSpent {
 				err := s.advanceClosureCursor(settle, guard, c, false)
 				settleCancel()
 				return err
 			}
 			if err := s.advanceClosureCursor(passCtx, guard, c, false); err != nil {
-				return err
+				return passError(ctx, passCtx, err)
 			}
 			settleCancel()
 			at := c.eligibleAt

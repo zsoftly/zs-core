@@ -119,8 +119,14 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (report SweepReport, err error)
 		report.Skipped = true
 		return report, nil
 	}
+	budgetEnded := false
 	defer func() {
 		if releaseErr := guard.Release(); releaseErr != nil {
+			// A pass whose budget ended in the middle of a statement has no
+			// capability left to release. That is how it ended, not a fault.
+			if budgetEnded && errors.Is(releaseErr, ErrLifecycleReleased) {
+				return
+			}
 			err = errors.Join(err, releaseErr)
 		}
 	}()
@@ -129,6 +135,12 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (report SweepReport, err error)
 		return report, err
 	}
 	if err := s.completeClosures(ctx, guard, correlationID, &report); err != nil {
+		if errors.Is(err, errClosurePassOver) {
+			// The closure budget ended in the middle of a statement, so the
+			// capability is spent. The pass ends here and the next one goes on.
+			budgetEnded = true
+			return report, nil
+		}
 		return report, err
 	}
 	brands, err := brand.List(ctx, guard, s.log())

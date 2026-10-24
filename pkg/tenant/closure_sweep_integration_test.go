@@ -21,10 +21,15 @@ type fakeClosureSteps struct {
 	prepareErr error
 	// onPrepare, when set, runs inside Prepare, for a step that is slow or stuck.
 	onPrepare func(ctx context.Context, sc scope.Scope)
-	block     bool
-	mu        sync.Mutex
-	prepare   []scope.Scope
-	blocks    atomic.Int64
+	// onBlock, when set, runs inside Block.
+	onBlock func(ctx context.Context)
+	// ignoreContext makes Prepare return its answer even when its context has
+	// ended, as a step that finished just as the budget ran out does.
+	ignoreContext bool
+	block         bool
+	mu            sync.Mutex
+	prepare       []scope.Scope
+	blocks        atomic.Int64
 }
 
 func (f *fakeClosureSteps) Prepare(ctx context.Context, _ tenant.DB, sc scope.Scope) (tenant.ClosurePrepared, error) {
@@ -35,7 +40,7 @@ func (f *fakeClosureSteps) Prepare(ctx context.Context, _ tenant.DB, sc scope.Sc
 	if hook != nil {
 		hook(ctx, sc)
 	}
-	if err := ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil && !f.ignoreContext {
 		return tenant.ClosurePrepared{}, err
 	}
 	if f.prepareErr != nil {
@@ -44,8 +49,14 @@ func (f *fakeClosureSteps) Prepare(ctx context.Context, _ tenant.DB, sc scope.Sc
 	return f.prepared, nil
 }
 
-func (f *fakeClosureSteps) Block(_ context.Context, _ tenant.DB, _ scope.Scope) (bool, error) {
+func (f *fakeClosureSteps) Block(ctx context.Context, _ tenant.DB, _ scope.Scope) (bool, error) {
 	f.blocks.Add(1)
+	if f.onBlock != nil {
+		f.onBlock(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	return f.block, nil
 }
 
@@ -462,5 +473,78 @@ func TestClosureSweepCursorWrapsWhenNoTenantIsDue(t *testing.T) {
 	var wrapped bool
 	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id IS NULL AND last_eligible_at IS NULL FROM sweep_cursor WHERE kind = 'closure'`).Scan(&wrapped); err != nil || !wrapped {
 		t.Fatalf("the cursor after an empty page: wrapped = %v, %v", wrapped, err)
+	}
+}
+
+// A step that returns just as the pass budget ends is not a failure of the
+// pass. The tenant was handled, the cursor moves past it, and the pass ends
+// without an error.
+func TestClosureSweepEndsCleanlyWhenTheBudgetRunsOutAtATenantBoundary(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	threeClosing(t, e)
+	steps := &fakeClosureSteps{ignoreContext: true, onPrepare: func(ctx context.Context, _ scope.Scope) { <-ctx.Done() }}
+	sweeper := &tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, PassBudget: 300 * time.Millisecond}
+	report, err := sweeper.SweepOnce(ctx)
+	if err != nil || report.ClosuresChecked != 1 || report.ClosuresWaiting != 1 {
+		t.Fatalf("pass = %+v %v, want one waiting tenant and no error", report, err)
+	}
+	first := prepareOrder(steps)
+	if _, err := sweeper.SweepOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	order := prepareOrder(steps)
+	if len(order) != 2 || order[1] == first[0] {
+		t.Fatalf("the next pass reached %v, want a tenant other than %s", order, first[0])
+	}
+}
+
+// A budget that is already spent when the pass starts is a pass that does
+// nothing, not an error.
+func TestClosureSweepWithASpentBudgetEndsCleanly(t *testing.T) {
+	e := newEnv(t)
+	threeClosing(t, e)
+	steps := &fakeClosureSteps{}
+	report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, PassBudget: time.Nanosecond}).SweepOnce(context.Background())
+	if err != nil || len(prepareOrder(steps)) != 0 {
+		t.Fatalf("pass = %+v %v steps %v, want no error and no step", report, err, prepareOrder(steps))
+	}
+}
+
+// The closing step has the call bound too. One that overruns it fails the
+// tenant with a timeout, and the tenant stays at blocking.
+func TestClosureSweepCallBudgetBoundsTheBlockStep(t *testing.T) {
+	m := &kbMode{noClaim: true, startCancelling: true}
+	var posts, lookups atomic.Int64
+	e, tn := claimedClosure(t, m, &posts, &lookups)
+	steps := &fakeClosureSteps{prepared: ready(), block: true, onBlock: func(ctx context.Context) { <-ctx.Done() }}
+	report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, CallBudget: 200 * time.Millisecond}).SweepOnce(context.Background())
+	if err != nil || report.ClosuresFailed != 1 {
+		t.Fatalf("pass = %+v %v, want the tenant failed by the call bound", report, err)
+	}
+	attempts, _, lastError := delaySeconds(t, e, tn)
+	if got := settlementStatus(t, e, tn); got != "blocking" || attempts != 1 || lastError != "step_timeout" {
+		t.Fatalf("status = %q attempts = %d last_error = %q, want blocking, 1 and step_timeout", got, attempts, lastError)
+	}
+}
+
+// When the caller stops the pass right after a step returned, the schedule of
+// the tenant is still written, because it is written with a context of its own.
+func TestClosureSweepWritesTheScheduleAfterTheCallerStopped(t *testing.T) {
+	e := newEnv(t)
+	threeClosing(t, e)
+	stopped, stop := context.WithCancel(context.Background())
+	defer stop()
+	steps := &fakeClosureSteps{ignoreContext: true, onPrepare: func(context.Context, scope.Scope) { stop() }}
+	if _, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, ClosureWork: 1}).SweepOnce(stopped); err == nil {
+		t.Fatal("a pass the caller stopped returned no error")
+	}
+	first := prepareOrder(steps)
+	if len(first) != 1 {
+		t.Fatalf("steps = %v, want one", first)
+	}
+	var rescheduled int
+	if err := e.db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM tenant_closure_settlements WHERE attempts = 0 AND next_attempt_at > now() + interval '290 seconds' AND next_attempt_at < now() + interval '301 seconds'`).Scan(&rescheduled); err != nil || rescheduled != 1 {
+		t.Fatalf("tenants rescheduled five minutes ahead after the stop = %d, %v, want 1", rescheduled, err)
 	}
 }

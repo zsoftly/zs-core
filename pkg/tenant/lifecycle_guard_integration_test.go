@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -632,6 +633,250 @@ func TestLifecycleSweepTryTenantSerializesSameParentChildren(t *testing.T) {
 	})
 	if independent, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, sc); err != nil || got || independent != nil {
 		t.Fatalf("independent child contender = %v %v %v", independent, got, err)
+	}
+}
+
+func TestLifecycleSweepSecondChildDefersWhileFirstRowsOpen(t *testing.T) {
+	db := postgrestest.New(t)
+	parent, got, err := tenant.AcquireLifecycleSweep(context.Background(), db.Pool)
+	if err != nil || !got {
+		t.Fatalf("parent = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = parent.Release() })
+	child, got, err := parent.TryTenant(context.Background(), lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("first child = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = child.Release() })
+	tx, err := child.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	rows, err := tx.Query(context.Background(), `SELECT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rows.Close)
+	if second, got, err := parent.TryTenant(context.Background(), lifecycleScope()); err != nil || got || second != nil {
+		t.Fatalf("second child = %v %v %v", second, got, err)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if second, got, err := parent.TryTenant(context.Background(), lifecycleScope()); err != nil || got || second != nil {
+		t.Fatalf("second child after completion = %v %v %v", second, got, err)
+	}
+	if err := child.Release(); err != nil {
+		t.Fatal(err)
+	}
+	again, got, err := parent.TryTenant(context.Background(), lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("child reacquire after release = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = again.Release() })
+}
+
+func TestLifecycleSweepSecondChildDefersDuringBlockedChildQuery(t *testing.T) {
+	db := postgrestest.New(t)
+	lockKey := int64(81234568)
+	blocker, err := db.Pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { blocker.Release() })
+	if _, err := blocker.Exec(context.Background(), `SELECT pg_advisory_lock($1::bigint)`, lockKey); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = blocker.Exec(context.Background(), `SELECT pg_advisory_unlock($1::bigint)`, lockKey) })
+	parent, got, err := tenant.AcquireLifecycleSweep(context.Background(), db.Pool)
+	if err != nil || !got {
+		t.Fatalf("parent = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = parent.Release() })
+	child, got, err := parent.TryTenant(context.Background(), lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("child = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = child.Release() })
+	var pid uint32
+	if err := child.QueryRow(context.Background(), `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	queryCtx, cancelQuery := context.WithTimeout(context.Background(), 10*time.Second)
+	queryDone := make(chan error, 1)
+	queryFinished := make(chan struct{})
+	secondFinished := make(chan struct{})
+	secondStarted := false
+	defer func() {
+		cancelQuery()
+		_, _ = blocker.Exec(context.Background(), `SELECT pg_advisory_unlock($1::bigint)`, lockKey)
+		<-queryFinished
+		if secondStarted {
+			<-secondFinished
+		}
+	}()
+	go func() {
+		rows, err := child.Query(queryCtx, `SELECT pg_advisory_xact_lock($1::bigint)`, lockKey)
+		if rows != nil {
+			rows.Close()
+		}
+		queryDone <- err
+		close(queryFinished)
+	}()
+	observer, err := db.Pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { observer.Release() })
+	waited := false
+	for range 1000 {
+		if err := observer.QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)`, pid).Scan(&waited); err != nil {
+			t.Fatal(err)
+		}
+		if waited {
+			break
+		}
+	}
+	if !waited {
+		t.Fatal("child query did not block")
+	}
+	result := make(chan struct {
+		child *tenant.LifecycleGuard
+		got   bool
+		err   error
+	}, 1)
+	secondStarted = true
+	go func() {
+		defer close(secondFinished)
+		second, got, err := parent.TryTenant(context.Background(), lifecycleScope())
+		result <- struct {
+			child *tenant.LifecycleGuard
+			got   bool
+			err   error
+		}{second, got, err}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	select {
+	case second := <-result:
+		if second.err != nil || second.got || second.child != nil {
+			t.Fatalf("second child = %+v", second)
+		}
+	case <-ctx.Done():
+		t.Fatal("second child blocked behind child query")
+	}
+	if _, err := blocker.Exec(context.Background(), `SELECT pg_advisory_unlock($1::bigint)`, lockKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-queryDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLifecycleSweepChildReleaseClosesOpenRows(t *testing.T) {
+	db := postgrestest.New(t)
+	parent, got, err := tenant.AcquireLifecycleSweep(context.Background(), db.Pool)
+	if err != nil || !got {
+		t.Fatalf("parent = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = parent.Release() })
+	sc := lifecycleScope()
+	child, got, err := parent.TryTenant(context.Background(), sc)
+	if err != nil || !got {
+		t.Fatalf("child = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = child.Release() })
+	rows, err := child.Query(context.Background(), `SELECT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rows.Close)
+	if err := child.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Err(); !errors.Is(err, tenant.ErrLifecycleReleased) {
+		t.Fatalf("rows after release = %v", err)
+	}
+	again, got, err := parent.TryTenant(context.Background(), sc)
+	if err != nil || !got {
+		t.Fatalf("child after release = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = again.Release() })
+}
+
+func TestLifecycleSweepConcurrentChildLifetimes(t *testing.T) {
+	db := postgrestest.New(t)
+	parent, got, err := tenant.AcquireLifecycleSweep(context.Background(), db.Pool)
+	if err != nil || !got {
+		t.Fatalf("parent = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = parent.Release() })
+	start := make(chan struct{})
+	type result struct {
+		completed int
+		err       error
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			completed := 0
+			for completed < 10 {
+				child, got, err := parent.TryTenant(ctx, lifecycleScope())
+				if err != nil {
+					results <- result{completed: completed, err: err}
+					return
+				}
+				if !got {
+					if err := ctx.Err(); err != nil {
+						results <- result{completed: completed, err: err}
+						return
+					}
+					continue
+				}
+				tx, err := child.Begin(context.Background())
+				if err == nil {
+					var rows pgx.Rows
+					rows, err = tx.Query(context.Background(), `SELECT 1`)
+					if err == nil {
+						for rows.Next() {
+							var value int
+							err = rows.Scan(&value)
+						}
+						rows.Close()
+						if err == nil {
+							err = rows.Err()
+						}
+					}
+					if err == nil {
+						err = tx.Commit(context.Background())
+					}
+				}
+				if releaseErr := child.Release(); err == nil {
+					err = releaseErr
+				}
+				if err != nil {
+					results <- result{completed: completed, err: err}
+					return
+				}
+				completed++
+			}
+			results <- result{completed: completed}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	for _, result := range []result{first, second} {
+		if result.err != nil || result.completed != 10 {
+			t.Fatalf("completed = %d %v", result.completed, result.err)
+		}
 	}
 }
 

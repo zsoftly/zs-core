@@ -45,6 +45,8 @@ type LifecycleGuard struct {
 	global           bool
 	released         bool
 	child            *LifecycleGuard
+	childSlot        chan struct{}
+	slotHeld         bool
 	parent           *LifecycleGuard
 	parentGeneration uint64
 	generation       uint64
@@ -86,7 +88,31 @@ func (g *LifecycleSweep) TryTenant(ctx context.Context, s scope.Scope) (*Lifecyc
 	if err := s.Validate(); err != nil {
 		return nil, false, err
 	}
-	return acquireLifecycle(ctx, nil, s, false, g.LifecycleGuard)
+	select {
+	case g.childSlot <- struct{}{}:
+	default:
+		return nil, false, nil
+	}
+	child, got, err := acquireLifecycle(ctx, nil, s, false, g.LifecycleGuard)
+	if err != nil || !got {
+		select {
+		case <-g.childSlot:
+		default:
+		}
+		return child, got, err
+	}
+	g.mu.Lock()
+	if g.released || *g.discarded || g.child != child {
+		g.mu.Unlock()
+		select {
+		case <-g.childSlot:
+		default:
+		}
+		return nil, false, ErrLifecycleReleased
+	}
+	child.slotHeld = true
+	g.mu.Unlock()
+	return child, true, nil
 }
 
 func acquireLifecycle(ctx context.Context, pool *pgxpool.Pool, s scope.Scope, global bool, parent *LifecycleGuard) (*LifecycleGuard, bool, error) {
@@ -122,11 +148,15 @@ func acquireLifecycle(ctx context.Context, pool *pgxpool.Pool, s scope.Scope, gl
 
 	discarded, hijacked := false, false
 	g := &LifecycleGuard{conn: conn, scope: s, global: global, parent: parent, generation: 1, mu: &sync.Mutex{}, discarded: &discarded, hijacked: &hijacked}
+	if global {
+		g.childSlot = make(chan struct{}, 1)
+	}
 	if parent != nil {
 		g.parentGeneration = parent.generation
 		g.mu = parent.mu
 		g.discarded = parent.discarded
 		g.hijacked = parent.hijacked
+		g.childSlot = parent.childSlot
 	}
 	var err error
 	if global {
@@ -650,6 +680,7 @@ func (g *LifecycleGuard) Release() error {
 	if g.parent != nil {
 		g.parent.mu.Lock()
 		g.parent.child = nil
+		g.parent.releaseChildSlotLocked(g)
 		g.parent.mu.Unlock()
 		return nil
 	}
@@ -684,6 +715,28 @@ func (g *LifecycleGuard) discardContext(cleanup context.Context) {
 	conn := g.conn
 	g.mu.Unlock()
 	_ = conn.Hijack().Close(cleanup)
+	if g.parent != nil {
+		g.parent.mu.Lock()
+		g.parent.releaseChildSlotLocked(g)
+		g.parent.mu.Unlock()
+		return
+	}
+	g.mu.Lock()
+	g.releaseChildSlotLocked(g.child)
+	g.mu.Unlock()
+}
+
+// releaseChildSlotLocked frees the sweep's one-child admission slot. The
+// caller holds g.mu, which is shared by the parent and all its children.
+func (g *LifecycleGuard) releaseChildSlotLocked(child *LifecycleGuard) {
+	if child == nil || !child.slotHeld || g.childSlot == nil {
+		return
+	}
+	child.slotHeld = false
+	select {
+	case <-g.childSlot:
+	default:
+	}
 }
 
 func lifecycleContext(ctx context.Context, limit time.Duration) (context.Context, context.CancelFunc) {

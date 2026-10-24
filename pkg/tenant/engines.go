@@ -37,6 +37,10 @@ const (
 	// BlockingSuspended and BlockingActive are its two states.
 	BlockingSuspended = "ZS_TENANT_SUSPENDED"
 	BlockingActive    = "ZS_TENANT_ACTIVE"
+	// BlockingClosed is the state of a closed tenant's Kill Bill account: it
+	// blocks changes and entitlements but not billing. The account is blocked,
+	// never closed, because closing it writes off the unpaid invoices.
+	BlockingClosed = "ZS_TENANT_CLOSED"
 )
 
 // brandEngines is what the engines need to act for one brand.

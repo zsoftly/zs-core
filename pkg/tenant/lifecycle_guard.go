@@ -331,18 +331,25 @@ func (r *lifecycleRow) Scan(dest ...any) error {
 		if err != nil {
 			return err
 		}
+		if err := r.rows.Err(); err != nil {
+			return err
+		}
 		return pgx.ErrNoRows
 	}
 	err := r.rows.Scan(dest...)
 	r.rows.Close()
+	if err == nil {
+		err = r.rows.Err()
+	}
 	return err
 }
 
 type lifecycleRows struct {
-	owner      *LifecycleGuard
-	generation uint64
-	rows       pgx.Rows
-	closed     bool
+	owner       *LifecycleGuard
+	generation  uint64
+	rows        pgx.Rows
+	closed      bool
+	terminalErr error
 }
 
 func (r *lifecycleRows) Next() bool {
@@ -357,7 +364,8 @@ func (r *lifecycleRows) Next() bool {
 	ok := r.rows.Next()
 	failed := false
 	if !ok {
-		failed = r.rows.Err() != nil
+		r.terminalErr = r.rows.Err()
+		failed = r.terminalErr != nil
 		r.closed = true
 		r.rows.Close()
 		if r.owner.rows == r {
@@ -385,6 +393,7 @@ func (r *lifecycleRows) Scan(dest ...any) error {
 	}
 	err := r.rows.Scan(dest...)
 	if err != nil {
+		r.terminalErr = err
 		r.owner.invalidateLocked()
 	}
 	r.owner.mu.Unlock()
@@ -395,14 +404,26 @@ func (r *lifecycleRows) Scan(dest ...any) error {
 }
 
 func (r *lifecycleRows) Err() error {
-	if r == nil || r.owner.ready(false) != nil || r.owner.generation != r.generation {
+	if r == nil {
+		return ErrLifecycleReleased
+	}
+	r.owner.mu.Lock()
+	if r.terminalErr != nil {
+		err := r.terminalErr
+		r.owner.mu.Unlock()
+		return err
+	}
+	if r.owner.readyLocked(false) != nil || r.owner.generation != r.generation {
+		r.owner.mu.Unlock()
 		return ErrLifecycleReleased
 	}
 	err := r.rows.Err()
 	if err != nil {
-		r.owner.mu.Lock()
+		r.terminalErr = err
 		r.owner.invalidateLocked()
-		r.owner.mu.Unlock()
+	}
+	r.owner.mu.Unlock()
+	if err != nil {
 		r.owner.discard()
 	}
 	return err
@@ -453,7 +474,8 @@ func (r *lifecycleRows) Close() {
 	r.owner.mu.Lock()
 	r.closed = true
 	r.rows.Close()
-	failed := r.rows.Err() != nil
+	r.terminalErr = r.rows.Err()
+	failed := r.terminalErr != nil
 	if r.owner.rows == r {
 		r.owner.rows = nil
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zsoftly/zs-core/internal/postgrestest"
@@ -379,6 +380,98 @@ func TestLifecycleGuardCancelsBlockedQueryAndInvalidatesCapability(t *testing.T)
 	}
 	if _, err := guard.Query(context.Background(), `SELECT 1`); !errors.Is(err, tenant.ErrLifecycleReleased) {
 		t.Fatalf("query after cancelled result = %v", err)
+	}
+}
+
+func TestLifecycleGuardQueryRowReturnsLateResultError(t *testing.T) {
+	db := postgrestest.New(t)
+	guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	var value int
+	err = guard.QueryRow(context.Background(), `SELECT i/(2-i) FROM generate_series(1,2) AS s(i)`).Scan(&value)
+	assertDivisionByZero(t, err)
+	if _, err := guard.Query(context.Background(), `SELECT 1`); !errors.Is(err, tenant.ErrLifecycleReleased) {
+		t.Fatalf("query after late result error = %v", err)
+	}
+}
+
+func TestLifecycleGuardRowsReturnLateResultError(t *testing.T) {
+	for _, completion := range []string{"next", "close"} {
+		t.Run(completion, func(t *testing.T) {
+			db := postgrestest.New(t)
+			guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+			if err != nil || !got {
+				t.Fatalf("guard = %v %v", got, err)
+			}
+			t.Cleanup(func() {
+				if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+					t.Error(err)
+				}
+			})
+			rows, err := guard.Query(context.Background(), `SELECT i/(2-i) FROM generate_series(1,2) AS s(i)`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(rows.Close)
+			if !rows.Next() {
+				t.Fatalf("first row = %v", rows.Err())
+			}
+			var value int
+			if err := rows.Scan(&value); err != nil || value != 1 {
+				t.Fatalf("first row value = %d %v", value, err)
+			}
+			if completion == "next" && rows.Next() {
+				t.Fatal("late division query returned a second row")
+			}
+			rows.Close()
+			assertDivisionByZero(t, rows.Err())
+			if _, err := guard.Query(context.Background(), `SELECT 1`); !errors.Is(err, tenant.ErrLifecycleReleased) {
+				t.Fatalf("query after late result error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLifecycleGuardTxQueryRowReturnsLateResultError(t *testing.T) {
+	db := postgrestest.New(t)
+	guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	tx, err := guard.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Error(err)
+		}
+	})
+	var value int
+	err = tx.QueryRow(context.Background(), `SELECT i/(2-i) FROM generate_series(1,2) AS s(i)`).Scan(&value)
+	assertDivisionByZero(t, err)
+	if _, err := guard.Query(context.Background(), `SELECT 1`); !errors.Is(err, tenant.ErrLifecycleReleased) {
+		t.Fatalf("query after late transaction result error = %v", err)
+	}
+}
+
+func assertDivisionByZero(t *testing.T, err error) {
+	t.Helper()
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "22012" {
+		t.Fatalf("division by zero error = %v", err)
 	}
 }
 

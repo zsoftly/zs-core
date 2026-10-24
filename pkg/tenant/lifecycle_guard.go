@@ -288,6 +288,13 @@ func (g *LifecycleGuard) readyLocked(child bool) error {
 	return nil
 }
 
+// targetErr is a positional check, not a proof about the SQL: it refuses a
+// statement whose first two arguments are the brand and tenant UUIDs of
+// another scope, and it cannot see a scope that the SQL names in some other
+// way. A statement that takes an attempt or outcome ID first is safe because
+// that ID came from a query that was itself scoped to this capability, so the
+// ID cannot belong to another tenant; callers that cannot say so put the
+// brand and the tenant first.
 func (g *LifecycleGuard) targetErr(ctx context.Context, args []any) error {
 	if g.global {
 		return nil

@@ -157,6 +157,9 @@ func (s *Service) ReassignRollup(ctx context.Context, sc scope.Scope, call Staff
     rejected_at = NULL, attempts = 0, next_attempt_at = $5, last_error = NULL, target_endpoint_fingerprint = NULL,
     target_killbill_tenant_id = NULL, target_killbill_account_id = NULL
 WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'rejected' RETURNING `+rollupColumns, args...))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotRejected
+		}
 		if err != nil {
 			return unavailable(err)
 		}

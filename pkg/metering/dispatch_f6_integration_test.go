@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"testing"
+	"time"
 
 	"github.com/zsoftly/zs-core/internal/enginetest"
 	"github.com/zsoftly/zs-core/internal/killbill"
@@ -208,4 +209,34 @@ func otherFingerprint(fp string) string {
 		return "1" + fp[1:]
 	}
 	return "0" + fp[1:]
+}
+
+// A forwarder stopped while its POST is in flight still sees the answer, and
+// the rollup is forwarded, not left unconfirmed.
+func TestStopDuringThePostStillForwardsTheRollup(t *testing.T) {
+	e, slug, tenantID := setupOneRollup(t, "zs-midpost")
+	ctx := context.Background()
+	e.fake.SetWriteDelay("/1.0/kb/usages", 1500*time.Millisecond)
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		for cctx.Err() == nil {
+			var started bool
+			if err := e.db.Pool.QueryRow(ctx, `SELECT bool_or(send_started_at IS NOT NULL) FROM usage_rollups WHERE tenant_id = $1`, tenantID).Scan(&started); err == nil && started {
+				cancel()
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	report, _ := e.svc.Forward(cctx)
+	if report.Forwarded != 1 || report.Unconfirmed != 0 {
+		t.Fatalf("forward = %+v", report)
+	}
+	if n := count(t, e.db, `SELECT count(*) FROM usage_rollups WHERE tenant_id = $1 AND status = 'forwarded' AND closure_unresolved_reason IS NULL`, tenantID); n != 1 {
+		t.Fatalf("forwarded rollups = %d, want 1", n)
+	}
+	if recs := e.fake.UsageRecords(slug); len(recs) != 1 {
+		t.Fatalf("records = %d, want 1", len(recs))
+	}
 }

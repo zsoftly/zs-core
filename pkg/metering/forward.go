@@ -744,6 +744,9 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 		// allows no way back from a started send.
 		reason := "usage_send_unconfirmed"
 		if res.Outcome == killbill.UsageNotSent {
+			// Kill Bill recorded nothing: the request never left, or a 4xx
+			// refused it. The start is already stored, so this is kept for
+			// staff like any other started send.
 			reason = "usage_transport_unconfirmed"
 		}
 		return s.markUnconfirmed(ctx, ro, reason, sendErr)

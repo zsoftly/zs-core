@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -100,6 +101,9 @@ type Fake struct {
 	// usageBodies are the exact bytes of every usage POST the fake received,
 	// by API key, oldest first.
 	usageBodies map[string][][]byte
+	// cancelRequests are the subscription cancels the fake received, by API
+	// key of the Kill Bill tenant.
+	cancelRequests map[string][]CancelRequest
 	// afterWrite is called after every Kill Bill write the fake took.
 	afterWrite func(method, path string)
 	// dryRunDown makes dry-run invoices answer 500.
@@ -190,6 +194,35 @@ func (f *Fake) UsageBodies(apiKey string) [][]byte {
 	out := make([][]byte, 0, len(f.usageBodies[apiKey]))
 	for _, b := range f.usageBodies[apiKey] {
 		out = append(out, append([]byte(nil), b...))
+	}
+	return out
+}
+
+// CancelRequest is one DELETE of a subscription that reached the fake.
+type CancelRequest struct {
+	Path   string
+	Query  url.Values
+	Header http.Header
+}
+
+func cloneValues(v url.Values) url.Values {
+	out := make(url.Values, len(v))
+	for k, vs := range v {
+		out[k] = append([]string(nil), vs...)
+	}
+	return out
+}
+
+// CancelRequests returns every subscription cancel the fake received with the
+// API key of a Kill Bill tenant, oldest first, with its path, query and
+// headers. A cancel the fake refused, lost or dropped is included, since it
+// reached the fake. The values are copies.
+func (f *Fake) CancelRequests(apiKey string) []CancelRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]CancelRequest, 0, len(f.cancelRequests[apiKey]))
+	for _, c := range f.cancelRequests[apiKey] {
+		out = append(out, CancelRequest{Path: c.Path, Query: cloneValues(c.Query), Header: c.Header.Clone()})
 	}
 	return out
 }
@@ -355,6 +388,13 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			key := r.Header.Get(killbill.HeaderAPIKey)
 			f.usageBodies[key] = append(f.usageBodies[key], append([]byte(nil), body...))
+		}
+		if r.Method == http.MethodDelete && strings.HasPrefix(path, "/1.0/kb/subscriptions/") {
+			if f.cancelRequests == nil {
+				f.cancelRequests = map[string][]CancelRequest{}
+			}
+			key := r.Header.Get(killbill.HeaderAPIKey)
+			f.cancelRequests[key] = append(f.cancelRequests[key], CancelRequest{Path: path, Query: cloneValues(r.URL.Query()), Header: r.Header.Clone()})
 		}
 		for prefix, fl := range f.fail {
 			if fl.n > 0 && r.Method != http.MethodGet && strings.HasPrefix(path, prefix) {

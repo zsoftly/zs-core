@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zsoftly/zs-core/pkg/scope"
 )
@@ -19,7 +20,7 @@ const (
 	// Global sweep keys use the nonnegative half of bigint; tenant lifecycle
 	// keys use the negative half. The class bit makes cross-class collisions
 	// impossible without claiming collision freedom within either hash class.
-	globalSweepNamespace    int64 = 0
+	globalSweepNamespace     int64 = 0
 	tenantLifecycleNamespace int64 = -9223372036854775808
 	lifecycleResourceMask    int64 = 9223372036854775807
 )
@@ -34,21 +35,21 @@ var _ pgx.Rows = (*lifecycleRows)(nil)
 // session advisory lock. It is intentionally not a general DB: callers may
 // use its short transactions, but cannot recover the pool or raw connection.
 type LifecycleGuard struct {
-	mu       *sync.Mutex
-	conn     *pgxpool.Conn
-	scope    scope.Scope
-	key      int64
-	schema   string
-	global   bool
-	released bool
-	child    *LifecycleGuard
-	parent   *LifecycleGuard
+	mu               *sync.Mutex
+	conn             *pgxpool.Conn
+	scope            scope.Scope
+	key              int64
+	schema           string
+	global           bool
+	released         bool
+	child            *LifecycleGuard
+	parent           *LifecycleGuard
 	parentGeneration uint64
-	generation uint64
-	activeTx *lifecycleTx
-	rows     *lifecycleRows
-	discarded *bool
-	hijacked *bool
+	generation       uint64
+	activeTx         *lifecycleTx
+	rows             *lifecycleRows
+	discarded        *bool
+	hijacked         *bool
 }
 
 // AcquireLifecycleGuard takes a tenant-scoped session lock. got is false when
@@ -318,6 +319,13 @@ func (r *lifecycleRows) RawValues() [][]byte {
 	return r.rows.RawValues()
 }
 
+func (r *lifecycleRows) TypeMap() *pgtype.Map {
+	if r == nil || r.owner.ready(false) != nil || r.owner.generation != r.generation {
+		return nil
+	}
+	return r.rows.TypeMap()
+}
+
 // Conn deliberately does not expose the guarded connection.
 func (r *lifecycleRows) Conn() *pgx.Conn { return nil }
 
@@ -342,7 +350,7 @@ type lifecycleTx struct {
 }
 
 func (t *lifecycleTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if err := t.ready(); err != nil {
+	if err := t.readyWithoutRows(); err != nil {
 		return pgconn.CommandTag{}, err
 	}
 	return t.tx.Exec(ctx, sql, args...)
@@ -363,7 +371,7 @@ func (t *lifecycleTx) SendBatch(context.Context, *pgx.Batch) pgx.BatchResults {
 func (t *lifecycleTx) LargeObjects() pgx.LargeObjects { return pgx.LargeObjects{} }
 
 func (t *lifecycleTx) Prepare(ctx context.Context, name, sql string) (*pgconn.StatementDescription, error) {
-	if err := t.ready(); err != nil {
+	if err := t.readyWithoutRows(); err != nil {
 		return nil, err
 	}
 	return t.tx.Prepare(ctx, name, sql)
@@ -401,18 +409,35 @@ func (t *lifecycleTx) Conn() *pgx.Conn { return nil }
 type lifecycleBatchResults struct{ err error }
 
 func (r lifecycleBatchResults) Exec() (pgconn.CommandTag, error) { return pgconn.CommandTag{}, r.err }
-func (r lifecycleBatchResults) Query() (pgx.Rows, error) { return nil, r.err }
-func (r lifecycleBatchResults) QueryRow() pgx.Row { return lifecycleErrorRow{r.err} }
-func (r lifecycleBatchResults) Close() error { return r.err }
+func (r lifecycleBatchResults) Query() (pgx.Rows, error)         { return nil, r.err }
+func (r lifecycleBatchResults) QueryRow() pgx.Row                { return lifecycleErrorRow{r.err} }
+func (r lifecycleBatchResults) Close() error                     { return r.err }
 
 type lifecycleErrorRow struct{ err error }
 
 func (r lifecycleErrorRow) Scan(...any) error { return r.err }
 
-func (t *lifecycleTx) Commit(ctx context.Context) error { return t.finish(ctx, true) }
+func (t *lifecycleTx) Commit(ctx context.Context) error   { return t.finish(ctx, true) }
 func (t *lifecycleTx) Rollback(ctx context.Context) error { return t.finish(ctx, false) }
 
 func (t *lifecycleTx) finish(ctx context.Context, commit bool) error {
+	if t == nil {
+		return ErrLifecycleReleased
+	}
+	t.owner.mu.Lock()
+	if t.done {
+		t.owner.mu.Unlock()
+		return pgx.ErrTxClosed
+	}
+	if t.owner.readyLocked(false) != nil || t.owner.generation != t.generation {
+		t.owner.mu.Unlock()
+		return ErrLifecycleReleased
+	}
+	if commit && t.owner.rows != nil {
+		t.owner.mu.Unlock()
+		return errors.New("tenant lifecycle operation already active")
+	}
+	t.owner.mu.Unlock()
 	if err := t.ready(); err != nil {
 		return err
 	}
@@ -436,8 +461,28 @@ func (t *lifecycleTx) finish(ctx context.Context, commit bool) error {
 }
 
 func (t *lifecycleTx) ready() error {
-	if t == nil || t.done || t.owner.ready(false) != nil || t.owner.generation != t.generation {
+	if t == nil {
 		return ErrLifecycleReleased
+	}
+	t.owner.mu.Lock()
+	defer t.owner.mu.Unlock()
+	if t.done {
+		return pgx.ErrTxClosed
+	}
+	if t.owner.readyLocked(false) != nil || t.owner.generation != t.generation {
+		return ErrLifecycleReleased
+	}
+	return nil
+}
+
+func (t *lifecycleTx) readyWithoutRows() error {
+	if err := t.ready(); err != nil {
+		return err
+	}
+	t.owner.mu.Lock()
+	defer t.owner.mu.Unlock()
+	if t.owner.rows != nil {
+		return errors.New("tenant lifecycle operation already active")
 	}
 	return nil
 }

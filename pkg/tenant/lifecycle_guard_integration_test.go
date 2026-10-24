@@ -5,8 +5,10 @@ package tenant_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zsoftly/zs-core/internal/postgrestest"
@@ -18,7 +20,6 @@ import (
 func lifecycleScope() scope.Scope {
 	return scope.Scope{Brand: idgen.MustNewV7(), Tenant: idgen.MustNewV7()}
 }
-
 func TestLifecycleGuardSameTenantIsBusyUntilVerifiedRelease(t *testing.T) {
 	db := postgrestest.New(t)
 	sc := lifecycleScope()
@@ -157,11 +158,151 @@ func TestLifecycleGuardStaleQueryRowRefusesAfterRelease(t *testing.T) {
 	if err != nil || !got {
 		t.Fatalf("guard = %v %v", got, err)
 	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
 	row := guard.QueryRow(context.Background(), `SELECT 1`)
 	if err := guard.Release(); err != nil {
 		t.Fatal(err)
 	}
 	if err := row.Scan(new(int)); !errors.Is(err, tenant.ErrLifecycleReleased) {
 		t.Fatalf("stale row error = %v", err)
+	}
+}
+
+func TestLifecycleGuardRowsTypeMap(t *testing.T) {
+	db := postgrestest.New(t)
+	guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	rows, err := guard.Query(context.Background(), `SELECT 1::int4`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rows.Close)
+	typeMap := rows.TypeMap()
+	if typeMap == nil {
+		t.Fatal("live rows have no type map")
+	}
+	if _, ok := typeMap.TypeForName("int4"); !ok {
+		t.Fatal("live rows type map cannot resolve int4")
+	}
+	if !rows.Next() {
+		t.Fatalf("live rows next = false: %v", rows.Err())
+	}
+	var value int32
+	if err := rows.Scan(&value); err != nil || value != 1 {
+		t.Fatalf("live rows scan = %d %v", value, err)
+	}
+	if err := guard.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if rows.TypeMap() != nil {
+		t.Fatal("stale rows retained a type map")
+	}
+}
+
+func TestLifecycleGuardBeginFuncPreservesTransactionSemantics(t *testing.T) {
+	db := postgrestest.New(t)
+	guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	if err := pgx.BeginFunc(context.Background(), guard, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `SELECT 1`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("callback failure")
+	if err := pgx.BeginFunc(context.Background(), guard, func(pgx.Tx) error { return want }); !errors.Is(err, want) {
+		t.Fatalf("callback error = %v", err)
+	}
+	tx, err := guard.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Error(err)
+		}
+	})
+	if err := tx.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(context.Background()); !errors.Is(err, pgx.ErrTxClosed) {
+		t.Fatalf("second rollback = %v", err)
+	}
+}
+
+func TestLifecycleGuardRejectsTxOperationsWithOpenRows(t *testing.T) {
+	for _, operation := range []string{"exec", "prepare", "commit"} {
+		t.Run(operation, func(t *testing.T) {
+			db := postgrestest.New(t)
+			guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+			if err != nil || !got {
+				t.Fatalf("guard = %v %v", got, err)
+			}
+			t.Cleanup(func() {
+				if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+					t.Error(err)
+				}
+			})
+			tx, err := guard.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) && !errors.Is(err, pgx.ErrTxClosed) {
+					t.Error(err)
+				}
+			})
+			rows, err := tx.Query(context.Background(), `SELECT 1`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(rows.Close)
+			switch operation {
+			case "exec":
+				_, err = tx.Exec(context.Background(), `SELECT 2`)
+			case "prepare":
+				_, err = tx.Prepare(context.Background(), "guard-open-rows", `SELECT 2`)
+			case "commit":
+				err = tx.Commit(context.Background())
+			}
+			if err == nil || !strings.Contains(err.Error(), "tenant lifecycle operation already active") {
+				t.Fatalf("%s with open rows = %v", operation, err)
+			}
+			if !rows.Next() {
+				t.Fatalf("rows next = false: %v", rows.Err())
+			}
+			var value int
+			if err := rows.Scan(&value); err != nil || value != 1 {
+				t.Fatalf("rows scan = %d %v", value, err)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				t.Fatalf("rows error after close = %v", err)
+			}
+			if _, err := tx.Exec(context.Background(), `SELECT 2`); err != nil {
+				t.Fatalf("exec after rows close = %v", err)
+			}
+			if err := tx.Rollback(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

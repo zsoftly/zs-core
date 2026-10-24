@@ -134,15 +134,6 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (report SweepReport, err error)
 	if err := s.completeCreations(ctx, guard, correlationID, &report); err != nil {
 		return report, err
 	}
-	if err := s.completeClosures(ctx, guard, correlationID, &report); err != nil {
-		if errors.Is(err, errClosurePassOver) {
-			// The closure budget ended in the middle of a statement, so the
-			// capability is spent. The pass ends here and the next one goes on.
-			budgetEnded = true
-			return report, nil
-		}
-		return report, err
-	}
 	brands, err := brand.List(ctx, guard, s.log())
 	if err != nil {
 		return report, err
@@ -154,6 +145,18 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (report SweepReport, err error)
 		if err := s.syncBrand(ctx, guard, b.ID, correlationID, &report); err != nil {
 			return report, err
 		}
+	}
+	// The closures come last. Their pass can end by its budget in the middle
+	// of a statement, which ends the whole sweep pass, and a long closure
+	// backlog must not keep the Organizations and recipients from being synced.
+	if err := s.completeClosures(ctx, guard, correlationID, &report); err != nil {
+		if errors.Is(err, errClosurePassOver) {
+			// The closure budget ended in the middle of a statement, so the
+			// capability is spent. The pass ends here and the next one goes on.
+			budgetEnded = true
+			return report, nil
+		}
+		return report, err
 	}
 	return report, nil
 }
@@ -208,13 +211,11 @@ func (s *Sweeper) completeCreations(ctx context.Context, guard *LifecycleSweep, 
 			if err == nil {
 				args, bindErr := p.scope().Bind(claim, fmt.Sprintf("%d seconds", int(ProvisioningLease.Seconds())))
 				if bindErr != nil {
-					_ = child.Release()
-					return bindErr
+					return errors.Join(bindErr, child.Release())
 				}
 				tx, beginErr := child.Begin(passCtx)
 				if beginErr != nil {
-					_ = child.Release()
-					return beginErr
+					return errors.Join(beginErr, child.Release())
 				}
 				var current bool
 				err = tx.QueryRow(passCtx, `SELECT true FROM tenant_provisioning
@@ -236,12 +237,8 @@ WHERE brand_id = $1 AND tenant_id = $2 AND status = 'pending' AND (claimed_until
 				p.Claim = claim
 				_, err = provision(passCtx, child, s.Engines, p, SystemActor, correlationID)
 			}
-			if releaseErr := child.Release(); err == nil && releaseErr != nil {
-				err = releaseErr
-			}
-			if advanceErr := s.advanceCreationCursor(passCtx, guard, p, false); err == nil && advanceErr != nil {
-				err = advanceErr
-			}
+			// A creation that failed and then failed to clean up reports both.
+			err = errors.Join(err, child.Release(), s.advanceCreationCursor(passCtx, guard, p, false))
 			at := p.EligibleAt
 			eligibleAt, tenantID = &at, p.TenantID
 			if err != nil {
@@ -338,6 +335,13 @@ func (s *Sweeper) syncBrand(ctx context.Context, guard *LifecycleSweep, brandID 
 			if !got {
 				continue
 			}
+			// The page was read before this capability was taken, so the
+			// status on it can be out of date. The Organization is synced
+			// with the status the tenant has now.
+			t, err = currentTenant(ctx, child, t)
+			if err != nil {
+				return errors.Join(err, child.Release())
+			}
 			r, err := SyncOrganization(ctx, child, s.Engines, t, correlationID)
 			report.OrganizationsChecked++
 			report.MembersAdded += r.MembersAdded
@@ -375,6 +379,19 @@ func (s *Sweeper) syncBrand(ctx context.Context, guard *LifecycleSweep, brandID 
 		}
 		after = list[len(list)-1].ID
 	}
+}
+
+// currentTenant reads t again under the capability db holds.
+func currentTenant(ctx context.Context, db DB, t Tenant) (Tenant, error) {
+	args, err := t.Scope().Bind()
+	if err != nil {
+		return t, err
+	}
+	fresh, err := scanTenant(db.QueryRow(ctx, `SELECT `+tenantColumns+` FROM tenants WHERE brand_id = $1 AND id = $2`, args...))
+	if err != nil {
+		return t, unavailable(err)
+	}
+	return fresh, nil
 }
 
 // SyncReport is what SyncOrganization changed.

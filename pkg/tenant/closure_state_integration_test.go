@@ -284,6 +284,9 @@ func TestClosureSettlementStartsEmpty(t *testing.T) {
 	for name, column := range map[string]string{
 		"cancellation_completed_at": "cancellation_completed_at = now()",
 		"drain_completed_at":        "drain_completed_at = now()",
+		"finance_requested_at":      "finance_requested_at = now()",
+		"finance_attempt_id":        "finance_attempt_id = gen_random_uuid()",
+		"finance_invoice_id":        "finance_invoice_id = gen_random_uuid()",
 		"finance_target_date":       "finance_target_date = current_date",
 		"finance_completed_at":      "finance_completed_at = now()",
 		"blocked_at":                "blocked_at = now()",
@@ -305,5 +308,34 @@ SELECT brand_id, tenant_id, now(), 'cancelling', `+set[strings.Index(set, "= ")+
 	tn := e.mustOrg(e.person("clean@example.test"), "Tenant clean")
 	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ($1, $2, now())`, tn.BrandID, tn.ID); err != nil {
 		t.Fatalf("an empty settlement at cancelling = %v", err)
+	}
+}
+
+// The rules of a settlement fire in every session replication role, so that
+// a session which sets it to replica does not skip them.
+func TestClosureSettlementRulesFireInEveryReplicationRole(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	postgrestest.EnableSettlementStartRule(t, e.db)
+	rows, err := e.db.Pool.Query(ctx, `SELECT tgname, tgenabled::text FROM pg_trigger
+WHERE tgrelid = 'tenant_closure_settlements'::regclass AND tgname = ANY($1) ORDER BY tgname`,
+		[]string{"tenant_closure_settlement_start", "tenant_closure_settlement_order", "tenant_closure_complete_guard", "tenant_closure_settlements_cutoff_immutable"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := 0
+	for rows.Next() {
+		var name, enabled string
+		if err := rows.Scan(&name, &enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled != "A" {
+			t.Errorf("trigger %s is enabled = %q, want A (always)", name, enabled)
+		}
+		seen++
+	}
+	if seen != 4 {
+		t.Fatalf("found %d of the 4 settlement rules", seen)
 	}
 }

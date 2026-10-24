@@ -457,7 +457,7 @@ func disableSettlementStartRule(ctx context.Context, pool *pgxpool.Pool) error {
 // deployment.
 func EnableSettlementStartRule(t testing.TB, db *DB) {
 	t.Helper()
-	if _, err := db.Pool.Exec(context.Background(), `ALTER TABLE tenant_closure_settlements ENABLE TRIGGER tenant_closure_settlement_start`); err != nil {
+	if _, err := db.Pool.Exec(context.Background(), `ALTER TABLE tenant_closure_settlements ENABLE ALWAYS TRIGGER tenant_closure_settlement_start`); err != nil {
 		t.Fatalf("enable the settlement start rule: %v", err)
 	}
 }

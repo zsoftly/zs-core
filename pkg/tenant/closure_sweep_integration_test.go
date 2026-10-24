@@ -548,3 +548,21 @@ func TestClosureSweepWritesTheScheduleAfterTheCallerStopped(t *testing.T) {
 		t.Fatalf("tenants rescheduled five minutes ahead after the stop = %d, %v, want 1", rescheduled, err)
 	}
 }
+
+// The closure pass comes after the Organization sync, so a closure pass that
+// ends at once by its budget does not keep the sync from happening.
+func TestSweepSyncsOrganizationsEvenWhenTheClosureBudgetIsSpent(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn := e.mustOrg(e.person("sync-first@example.test"), "Sync first")
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET name = 'Sync first renamed' WHERE id = $1`, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: &fakeClosureSteps{}, PassBudget: time.Nanosecond}).SweepOnce(ctx)
+	if err != nil || report.OrganizationsUpdated != 1 {
+		t.Fatalf("pass = %+v %v, want the Organization synced", report, err)
+	}
+	if org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID()); org.Name != "Sync first renamed" {
+		t.Fatalf("the Organization is named %q", org.Name)
+	}
+}

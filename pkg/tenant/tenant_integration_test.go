@@ -6,8 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1181,5 +1184,106 @@ func TestSweeperCorrectsOrganizationMembers(t *testing.T) {
 	got := actions(t, e.db, sc)
 	if !slices.Contains(got, "tenant.keycloak.member.removed:success") || !slices.Contains(got, "tenant.keycloak.organization.updated:success") {
 		t.Fatalf("audit = %v", got)
+	}
+}
+
+// The sweeper reads a page of tenants and then takes each one under its own
+// capability. A tenant that was suspended in between must be synced with the
+// status it has now, not the status the page showed, or the sweep would keep
+// its Keycloak Organization enabled.
+func TestSweeperSyncsTheOrganizationWithTheStatusInsideTheCapability(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	ownerA, ownerB := e.person("fresh-a@example.test"), e.person("fresh-b@example.test")
+	a, b := e.mustOrg(ownerA, "Fresh status A"), e.mustOrg(ownerB, "Fresh status B")
+	if a.ID.String() > b.ID.String() {
+		a, b, ownerA, ownerB = b, a, ownerB, ownerA
+	}
+	_ = ownerB
+	// A's recipient has drifted, so the sweep writes to Kill Bill while it is
+	// at A, after the page that holds B was read.
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE identities SET email = 'fresh-a-updated@example.test' WHERE id = $1`, ownerA.Identity.ID); err != nil {
+		t.Fatal(err)
+	}
+	var suspended atomic.Bool
+	e.fake.AfterWrite(func(method, path string) {
+		if method == http.MethodPut && path == "/1.0/kb/accounts/"+a.KillBillAccountID && suspended.CompareAndSwap(false, true) {
+			if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = 'suspended' WHERE id = $1`, b.ID); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	t.Cleanup(func() { e.fake.AfterWrite(nil) })
+	if _, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng}).SweepOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !suspended.Load() {
+		t.Fatal("the sweep never wrote A's billing account, so B was not changed in the middle of the pass")
+	}
+	if org, _, _ := e.fake.Organization(e.brand.Realm, b.PublicID()); org.Enabled {
+		t.Fatal("the Organization of a tenant suspended during the pass stayed enabled")
+	}
+	if org, _, _ := e.fake.Organization(e.brand.Realm, a.PublicID()); !org.Enabled {
+		t.Fatal("the Organization of the active tenant was disabled")
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// When a creation fails and the cleanup after it fails too, the sweep reports
+// both, not only the first.
+func TestSweeperCreationReportsTheCleanupFailureWithTheCreationFailure(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.fake.SetDown(false, true)
+	owner := e.person("cleanup-both@example.test")
+	if _, err := e.createOrg(owner, "Cleanup both", "cleanup-both-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("creation = %v", err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_provisioning SET next_attempt_at = now() WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	tracer := &sweepUnlockCancelTracer{child: true}
+	cfg, err := pgxpool.ParseConfig(e.db.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	cfg.ConnConfig.Tracer = tracer
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	tracer.enabled.Store(true)
+	logs := &lockedBuffer{}
+	sweeper := &tenant.Sweeper{DB: pool, Engines: e.eng, Log: slog.New(slog.NewTextHandler(logs, nil))}
+	_, _ = sweeper.SweepOnce(ctx)
+	if tracer.hits.Load() == 0 {
+		t.Fatal("the child release was never cancelled")
+	}
+	line := ""
+	for _, l := range strings.Split(logs.String(), "\n") {
+		if strings.Contains(l, "tenant creation is still incomplete") {
+			line = l
+		}
+	}
+	if line == "" || !strings.Contains(strings.ToLower(line), "billing") || !strings.Contains(line, "canceled") {
+		t.Fatalf("the creation failure was logged as %q, want both the billing failure and the release failure", line)
 	}
 }

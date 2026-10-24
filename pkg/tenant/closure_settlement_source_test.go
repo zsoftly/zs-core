@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -15,6 +16,8 @@ import (
 var settlementInsertAllowlist = map[string]bool{
 	// "pkg/tenant/closure_start.go": the code that starts a closure.
 }
+
+var settlementInsert = regexp.MustCompile(`(?is)insert\s+into\s+(\w+\.)?"?tenant_closure_settlements`)
 
 func TestOnlyTheStarterInsertsClosureSettlements(t *testing.T) {
 	root := filepath.Join("..", "..")
@@ -30,16 +33,19 @@ func TestOnlyTheStarterInsertsClosureSettlements(t *testing.T) {
 			}
 			return nil
 		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		goSource := strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go")
+		migration := strings.HasPrefix(rel, "migrations/") && strings.HasSuffix(path, ".sql")
+		if !goSource && !migration {
 			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		if strings.Contains(strings.ToLower(string(data)), "insert into tenant_closure_settlements") {
-			rel, _ := filepath.Rel(root, path)
-			found = append(found, filepath.ToSlash(rel))
+		if settlementInsert.Match(data) {
+			found = append(found, rel)
 		}
 		return nil
 	})
@@ -50,5 +56,22 @@ func TestOnlyTheStarterInsertsClosureSettlements(t *testing.T) {
 		if !settlementInsertAllowlist[rel] {
 			t.Errorf("%s inserts closure settlements and is not on the allowlist", rel)
 		}
+	}
+}
+
+func TestSettlementInsertPatternSeesEveryFormOfTheStatement(t *testing.T) {
+	for _, sql := range []string{
+		"INSERT INTO tenant_closure_settlements (a) VALUES (1)",
+		"insert   into\n\ttenant_closure_settlements(a)",
+		"INSERT INTO public.tenant_closure_settlements (a)",
+		`INSERT INTO "tenant_closure_settlements" (a)`,
+		"WITH t AS (SELECT 1) INSERT INTO tenant_closure_settlements SELECT 1",
+	} {
+		if !settlementInsert.MatchString(sql) {
+			t.Errorf("the pattern misses %q", sql)
+		}
+	}
+	if settlementInsert.MatchString("SELECT * FROM tenant_closure_settlements") {
+		t.Error("the pattern matches a select")
 	}
 }

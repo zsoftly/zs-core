@@ -75,8 +75,9 @@ var errClosurePassOver = errors.New("the closure pass budget ended")
 
 // passError is what a pass returns when err stopped it. A pass that the caller
 // stopped, as on shutdown, returns that stop. A pass whose own budget ran out
-// is over, which is not a failure, and a caller sees that as
-// errClosurePassOver. Anything else is a real failure.
+// is over, which is not a failure, when the error is the context's own, and a
+// caller sees that as errClosurePassOver. Anything else is a real failure, even
+// if it happened as the budget ended.
 func passError(ctx, passCtx context.Context, err error) error {
 	if err == nil {
 		return nil
@@ -84,7 +85,7 @@ func passError(ctx, passCtx context.Context, err error) error {
 	if stop := ctx.Err(); stop != nil {
 		return stop
 	}
-	if passCtx.Err() != nil {
+	if passCtx.Err() != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
 		return errClosurePassOver
 	}
 	return err

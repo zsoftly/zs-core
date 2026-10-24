@@ -790,6 +790,55 @@ paths:
         "404": {$ref: "#/components/responses/NotFound"}
         "409": {$ref: "#/components/responses/Conflict"}
         "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/closure:
+    post:
+      tags: [tenants]
+      operationId: startTenantClosure
+      summary: Start the closure of a tenant.
+      description: |
+        Staff with the `closure` grant in the tenant's brand only; anyone else
+        gets `404`. The tenant moves to `closing` and its closure settlement
+        starts at `cancelling`: the sweeper then cancels the subscriptions,
+        invoices the usage up to the cutoff, returns the unused prepaid credit
+        and blocks the account. Nothing is cancelled or invoiced by this call.
+        The route is idempotent on `request_id`: the same request ID and reason
+        return the stored closure with `200`, the same request ID with another
+        reason is `409 idempotency_key_conflict`, and another request ID on a
+        closure that has started returns the closure that exists with `200`.
+        A closed tenant is `409 tenant_closed`. A tenant that another change is
+        working on is `409 tenant_busy`, which is retryable and carries a
+        `Retry-After` header: retry. The request ID is scoped to the tenant.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TenantClosureRequest"}
+      responses:
+        "200":
+          description: The closure that already exists.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TenantClosure"}
+        "201":
+          description: The closure started.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TenantClosure"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
   /v1/tenants/{id}/api-keys:
     get:
       tags: [api-keys]
@@ -3091,8 +3140,8 @@ components:
         name: {type: string, minLength: 1, maxLength: 100}
         status:
           type: string
-          description: "`suspended` blocks every write and keeps reads. `closed` is terminal."
-          enum: [active, suspended, closed]
+          description: "`suspended` blocks every write and keeps reads. `closing` is a closure in progress: the tenant answers nothing to its own members and keys while its final billing is settled. `closed` is terminal."
+          enum: [active, suspended, closing, closed]
         activation: {type: string, enum: [pending, approved, rejected]}
         billing_country: {type: [string, "null"]}
         billing_recipient_status:
@@ -3301,6 +3350,33 @@ components:
         request_id:
           type: string
           description: Client-chosen ID that makes the decision safe to retry.
+          minLength: 8
+          maxLength: 255
+          pattern: "^[\\x21-\\x7E]+$"
+    TenantClosure:
+      type: object
+      required: [state, cutoff_at, reason, request_id]
+      additionalProperties: false
+      properties:
+        state:
+          type: string
+          description: Where the closure settlement is.
+          enum: [cancelling, finance_pending, blocking, completed]
+        cutoff_at:
+          type: string
+          format: date-time
+          description: Usage up to this moment is invoiced.
+        reason: {type: string}
+        request_id: {type: string}
+    TenantClosureRequest:
+      type: object
+      required: [reason, request_id]
+      additionalProperties: false
+      properties:
+        reason: {type: string, minLength: 1, maxLength: 1000}
+        request_id:
+          type: string
+          description: Client-chosen ID that makes the request safe to retry.
           minLength: 8
           maxLength: 255
           pattern: "^[\\x21-\\x7E]+$"

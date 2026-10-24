@@ -40,6 +40,9 @@ func (s *server) writeError(w http.ResponseWriter, r *http.Request, err error) {
 			"code", string(code),
 			"error", errString(err))
 	}
+	if envelope.Error.Code == zserrors.Lookup(zserrors.CodeTenantBusy).Name {
+		w.Header().Set("Retry-After", "1")
+	}
 	s.writeJSON(w, r, status, gen.ErrorEnvelope{Error: gen.Error{
 		Code:      envelope.Error.Code,
 		Message:   envelope.Error.Message,

@@ -420,8 +420,8 @@ func TestCloseIsTerminalUnderConcurrentReactivation(t *testing.T) {
 		closeDone <- err
 	}()
 	e.waitBlocked(pid, 1)
-	if _, err := tenant.Reactivate(ctx, e.db.Pool, e.eng, sc, operator, "paid", "test"); code(err) != "not_ready" {
-		t.Fatalf("reactivation racing a close: %v, want not_ready", err)
+	if _, err := tenant.Reactivate(ctx, e.db.Pool, e.eng, sc, operator, "paid", "test"); code(err) != "tenant_busy" {
+		t.Fatalf("reactivation racing a close: %v, want tenant_busy", err)
 	}
 	if err := holder.Commit(ctx); err != nil {
 		t.Fatal(err)

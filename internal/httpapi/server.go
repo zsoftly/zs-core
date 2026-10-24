@@ -155,6 +155,7 @@ func New(opts Options) http.Handler {
 	mux.Handle("POST /v1/tenants", s.authenticate(http.HandlerFunc(s.createTenant)))
 	mux.Handle("POST /v1/invitations/accept", s.authenticate(http.HandlerFunc(s.acceptInvitation)))
 	mux.Handle("POST /v1/staff/tenants/{id}/activation", s.authenticate(http.HandlerFunc(s.decideTenantActivation)))
+	mux.Handle("POST /v1/staff/tenants/{id}/closure", s.authenticate(http.HandlerFunc(s.startTenantClosure)))
 
 	mux.Handle("GET /v1/tenants/{id}", s.member(s.getTenant))
 	mux.Handle("PATCH /v1/tenants/{id}", s.member(s.updateTenant))

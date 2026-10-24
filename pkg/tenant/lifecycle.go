@@ -256,7 +256,7 @@ func errTenantClosed() error {
 }
 
 func errTenantBusy() error {
-	return zserrors.New(zserrors.CodeNotReady, "Another change to this tenant is in progress.")
+	return zserrors.New(zserrors.CodeTenantBusy, "")
 }
 
 // underTenantCapability takes the lifecycle capability of the tenant s and
@@ -289,7 +289,7 @@ func underTenantCapability(ctx context.Context, db DB, s scope.Scope) (DB, func(
 }
 
 func errTenantClosing() error {
-	return zserrors.New(zserrors.CodeNotReady, "The tenant is closing, and its closure settles it.")
+	return zserrors.New(zserrors.CodeTenantClosing, "")
 }
 
 func setOrganizationEnabled(ctx context.Context, kc *keycloak.Client, realm, id string, enabled bool) error {

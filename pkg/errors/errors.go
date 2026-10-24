@@ -91,6 +91,8 @@ const (
 	CodeTenantKindUnsupported   Code = "ZS-1608"
 	CodeRecentAuthRequired      Code = "ZS-1609"
 	CodeTenantClosed            Code = "ZS-1610"
+	CodeTenantBusy              Code = "ZS-1611"
+	CodeTenantClosing           Code = "ZS-1612"
 
 	CodeAPIKeyInvalid      Code = "ZS-1700"
 	CodeAPIKeyOwnerRemoved Code = "ZS-1701"
@@ -170,6 +172,8 @@ var definitions = []Definition{
 	{CodeTenantKindUnsupported, "tenant_kind_unsupported", http.StatusConflict, false, "This action is not available for this kind of tenant."},
 	{CodeRecentAuthRequired, "recent_auth_required", http.StatusForbidden, false, "Sign in again to continue."},
 	{CodeTenantClosed, "tenant_closed", http.StatusConflict, false, "The tenant is closed. Closing is final."},
+	{CodeTenantBusy, "tenant_busy", http.StatusConflict, true, "Another change to this tenant is in progress. Retry."},
+	{CodeTenantClosing, "tenant_closing", http.StatusConflict, false, "The tenant is closing, and its closure settles it."},
 	{CodeAPIKeyInvalid, "api_key_invalid", http.StatusUnauthorized, false, "The API key is invalid, expired or revoked."},
 	{CodeAPIKeyOwnerRemoved, "api_key_owner_removed", http.StatusUnauthorized, false, "The member who created this API key is no longer active."},
 	{CodeBillingRejected, "billing_rejected", http.StatusUnprocessableEntity, false, "The billing engine rejected the request."},

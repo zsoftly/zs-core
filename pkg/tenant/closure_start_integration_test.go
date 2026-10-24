@@ -4,10 +4,13 @@ package tenant_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/zsoftly/zs-core/internal/postgrestest"
 	"github.com/zsoftly/zs-core/pkg/idgen"
@@ -153,8 +156,8 @@ func TestClosingTenantRefusesSuspendReactivateAndClose(t *testing.T) {
 		},
 		"close": func() error { _, err := tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c"); return err },
 	} {
-		if err := run(); code(err) != "not_ready" {
-			t.Errorf("%s of a closing tenant = %v, want not_ready", name, err)
+		if err := run(); code(err) != "tenant_closing" {
+			t.Errorf("%s of a closing tenant = %v, want tenant_closing", name, err)
 		}
 	}
 	if got := tenantStatus(t, e, tn); got != "closing" {
@@ -255,7 +258,7 @@ func TestStartClosureConcurrentCallsStartItOnce(t *testing.T) {
 			switch {
 			case err == nil && got.Started:
 				started.Add(1)
-			case err == nil, code(err) == "not_ready":
+			case err == nil, code(err) == "tenant_busy":
 				answered.Add(1)
 			default:
 				t.Error(err)
@@ -309,8 +312,8 @@ func TestStartClosureDuringALifecycleCommandIsRefusedAndTheCommandCompletes(t *t
 			if code(err) != "ok" {
 				t.Fatalf("%s = %v, want it to complete", command, err)
 			}
-			if code(duringErr) != "not_ready" {
-				t.Fatalf("the closure start during %s = %v, want not_ready", command, duringErr)
+			if code(duringErr) != "tenant_busy" {
+				t.Fatalf("the closure start during %s = %v, want tenant_busy", command, duringErr)
 			}
 			want := map[string]tenant.Status{"suspend": tenant.StatusSuspended, "reactivate": tenant.StatusActive, "close": tenant.StatusClosed}[command]
 			account, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
@@ -365,8 +368,8 @@ func TestLifecycleCommandsAndStartClosureAreBusyWhileTheCapabilityIsHeld(t *test
 		"close":         func() error { _, err := tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c"); return err },
 		"start closure": func() error { _, err := startClosure(e, tn); return err },
 	} {
-		if err := run(); code(err) != "not_ready" {
-			t.Errorf("%s while the capability is held = %v, want not_ready", name, err)
+		if err := run(); code(err) != "tenant_busy" {
+			t.Errorf("%s while the capability is held = %v, want tenant_busy", name, err)
 		}
 	}
 	after, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
@@ -392,11 +395,120 @@ func TestCloseOfAClosingTenantDoesNotCloseTheKillBillAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
-	if _, err := tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), tenant.SystemActor, "hard close", "c"); code(err) != "not_ready" {
-		t.Fatalf("close of a closing tenant = %v, want not_ready", err)
+	if _, err := tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), tenant.SystemActor, "hard close", "c"); code(err) != "tenant_closing" {
+		t.Fatalf("close of a closing tenant = %v, want tenant_closing", err)
 	}
 	after, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
 	if after.Closed || len(after.Blocking) != len(before.Blocking) {
 		t.Fatalf("the Kill Bill account was touched: closed %v, blocking %d -> %d", after.Closed, len(before.Blocking), len(after.Blocking))
 	}
+}
+
+// A writer that does not hold the lifecycle capability changes the tenant
+// during the engine call of a command. The command is refused when it locks the
+// tenant, and the Organization it enabled is disabled again.
+func TestCommandsRefuseATenantChangedDuringTheirEngineCall(t *testing.T) {
+	for _, command := range []string{"suspend", "reactivate", "close"} {
+		for _, written := range []string{"closing", "closed"} {
+			t.Run(command+"/"+written, func(t *testing.T) {
+				e, tn := closureStartEnv(t)
+				ctx := context.Background()
+				actor := tenant.SystemActor
+				if command == "reactivate" {
+					if _, err := tenant.Suspend(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "overdue", "c"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var written1 atomic.Bool
+				e.fake.AfterWrite(func(string, string) {
+					if written1.CompareAndSwap(false, true) {
+						if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = $2 WHERE id = $1`, tn.ID, written); err != nil {
+							t.Error(err)
+						}
+					}
+				})
+				t.Cleanup(func() { e.fake.AfterWrite(nil) })
+				var err error
+				switch command {
+				case "suspend":
+					_, err = tenant.Suspend(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+				case "reactivate":
+					_, err = tenant.Reactivate(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+				case "close":
+					_, err = tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+				}
+				e.fake.AfterWrite(nil)
+				if !written1.Load() {
+					t.Fatal("the tenant was never written during the engine call")
+				}
+				want := map[string]string{"closing": "tenant_closing", "closed": "tenant_closed"}[written]
+				if code(err) != want {
+					t.Fatalf("%s of a tenant written to %s = %v, want %s", command, written, err, want)
+				}
+				if got := tenantStatus(t, e, tn); got != written {
+					t.Fatalf("status = %q, want %q", got, written)
+				}
+				var own int
+				if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = $2`, tn.ID,
+					map[string]string{"suspend": "tenant.suspended", "reactivate": "tenant.reactivated", "close": "tenant.closed"}[command]).Scan(&own); err != nil || own != 0 {
+					t.Fatalf("%d audit entries of the refused %s, %v", own, command, err)
+				}
+				if org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID()); org.Enabled {
+					t.Fatalf("the Organization is enabled after the refused %s", command)
+				}
+			})
+		}
+	}
+}
+
+// A request that finds the closure already started under another request ID is
+// ignored, and it is audited, so the second caller leaves a trace.
+func TestStartClosureAuditsAnIgnoredSecondRequest(t *testing.T) {
+	e, tn := closureStartEnv(t)
+	ctx := context.Background()
+	if _, err := startClosure(e, tn); err != nil {
+		t.Fatal(err)
+	}
+	count := func() (n int) {
+		if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.closure_start_ignored'`, tn.ID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if _, err := startClosure(e, tn); err != nil || count() != 0 {
+		t.Fatalf("a replay was audited as ignored: %d, %v", count(), err)
+	}
+	second := tenant.ClosureRequest{Reason: "second caller", RequestID: "closure-request-0002"}
+	if res, err := tenant.StartClosure(ctx, e.db.Pool, tn.Scope(), tenant.SystemActor, second, "c"); err != nil || res.Started || count() != 1 {
+		t.Fatalf("second request = %+v %v, ignored audits %d, want one", res, err, count())
+	}
+	var reason, request string
+	if err := e.db.Pool.QueryRow(ctx, `SELECT reason, details->>'request_id' FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.closure_start_ignored'`, tn.ID).Scan(&reason, &request); err != nil || reason != "second caller" || request != "closure-request-0002" {
+		t.Fatalf("ignored audit = %q %q, %v", reason, request, err)
+	}
+}
+
+// The start record is all there or all absent, and it cannot change.
+func TestClosureStartRecordIsAllOrNothingAndFixed(t *testing.T) {
+	e, tn := closureStartEnv(t)
+	ctx := context.Background()
+	for _, cols := range []string{"started_by", "start_reason", "start_request_id"} {
+		other := e.mustOrg(e.person(cols+"@example.test"), "Partial "+cols)
+		value := map[string]string{"started_by": "'someone'", "start_reason": "'a reason'", "start_request_id": "'some-request-id'"}[cols]
+		_, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, `+cols+`) VALUES ($1, $2, now(), `+value+`)`, other.BrandID, other.ID)
+		if !checkViolation(err) {
+			t.Errorf("a settlement with only %s = %v, want a check violation", cols, err)
+		}
+	}
+	if _, err := startClosure(e, tn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_closure_settlements SET start_reason = 'changed' WHERE tenant_id = $1`, tn.ID); !checkViolation(err) {
+		t.Fatalf("a changed start record = %v, want a check violation", err)
+	}
+}
+
+func checkViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23514"
 }

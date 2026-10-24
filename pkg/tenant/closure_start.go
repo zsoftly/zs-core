@@ -34,6 +34,9 @@ type ClosureStart struct {
 	// a closure that had already started are the stored ones.
 	Reason    string
 	RequestID string
+	// State is the state of the settlement: cancelling for a closure that has
+	// just started.
+	State ClosureState
 	// Started is false when the closure had already started.
 	Started bool
 }
@@ -84,8 +87,8 @@ func StartClosure(ctx context.Context, db DB, sc scope.Scope, actor events.Actor
 			return errTenantClosed()
 		case StatusClosing:
 			var stored ClosureStart
-			err := tx.QueryRow(ctx, `SELECT cutoff_at, coalesce(start_reason, ''), coalesce(start_request_id, '') FROM tenant_closure_settlements WHERE brand_id = $1 AND tenant_id = $2`,
-				sc.Brand, sc.Tenant).Scan(&stored.CutoffAt, &stored.Reason, &stored.RequestID)
+			err := tx.QueryRow(ctx, `SELECT cutoff_at, coalesce(start_reason, ''), coalesce(start_request_id, ''), status FROM tenant_closure_settlements WHERE brand_id = $1 AND tenant_id = $2`,
+				sc.Brand, sc.Tenant).Scan(&stored.CutoffAt, &stored.Reason, &stored.RequestID, &stored.State)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return zserrors.New(zserrors.CodeNotReady, "The tenant is closing without a settlement.")
 			}
@@ -97,6 +100,16 @@ func StartClosure(ctx context.Context, db DB, sc scope.Scope, actor events.Actor
 			}
 			stored.Tenant = locked
 			result = stored
+			if stored.RequestID != req.RequestID {
+				// Another request asked for a closure that has started. It gets
+				// the closure that exists, and leaves a trace.
+				if _, err := audit.Write(ctx, tx, sc, audit.Entry{
+					Actor: actor, Action: "tenant.closure_start_ignored", Reason: reason, Outcome: audit.OutcomeSuccess, CorrelationID: correlationID,
+					Details: map[string]any{"request_id": req.RequestID, "started_request_id": stored.RequestID},
+				}); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 		// A settlement that exists for a tenant that is not closing is
@@ -132,7 +145,7 @@ func StartClosure(ctx context.Context, db DB, sc scope.Scope, actor events.Actor
 		}); err != nil {
 			return err
 		}
-		result = ClosureStart{Tenant: updated, CutoffAt: cutoff, Reason: reason, RequestID: req.RequestID, Started: true}
+		result = ClosureStart{Tenant: updated, CutoffAt: cutoff, Reason: reason, RequestID: req.RequestID, State: ClosureCancelling, Started: true}
 		return nil
 	})
 	if err != nil {

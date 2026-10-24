@@ -800,6 +800,46 @@ func (s *server) decideTenantActivation(w http.ResponseWriter, r *http.Request) 
 	s.writeJSON(w, r, status, activationBody(a))
 }
 
+// startTenantClosure is a staff route: an active closure grant in the
+// tenant's brand, or 404. tenant.StartClosure takes the lifecycle capability
+// of the tenant itself, so it is given the pool and not a transaction.
+func (s *server) startTenantClosure(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	p, err := s.requireStaff(ctx, identity.StaffClosure)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	tenantID, err := pathID(r, "id", idgen.Tenant, tenant.ErrNotFound)
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	var body gen.TenantClosureRequest
+	if err := decodeBody(r, &body); err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	actorID := "sub:" + p.Subject
+	if ident, ok := callerIdentity(ctx); ok {
+		actorID = ident.PublicID()
+	}
+	res, err := tenant.StartClosure(ctx, s.db, scope.Scope{Brand: p.Brand.ID, Tenant: tenantID},
+		events.Actor{Type: events.ActorStaff, ID: actorID},
+		tenant.ClosureRequest{Reason: body.Reason, RequestID: body.RequestId}, RequestID(ctx))
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	status := http.StatusCreated
+	if !res.Started {
+		status = http.StatusOK
+	}
+	s.writeJSON(w, r, status, gen.TenantClosure{
+		State: gen.TenantClosureState(res.State), CutoffAt: res.CutoffAt.UTC(), Reason: res.Reason, RequestId: res.RequestID,
+	})
+}
+
 func (s *server) listAPIKeys(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if err := scope.Require(ctx, "apikey:read"); err != nil {

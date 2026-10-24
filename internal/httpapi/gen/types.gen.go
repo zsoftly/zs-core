@@ -714,6 +714,7 @@ func (e TenantKind) Valid() bool {
 const (
 	TenantStatusActive    TenantStatus = "active"
 	TenantStatusClosed    TenantStatus = "closed"
+	TenantStatusClosing   TenantStatus = "closing"
 	TenantStatusSuspended TenantStatus = "suspended"
 )
 
@@ -724,7 +725,33 @@ func (e TenantStatus) Valid() bool {
 		return true
 	case TenantStatusClosed:
 		return true
+	case TenantStatusClosing:
+		return true
 	case TenantStatusSuspended:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for TenantClosureState.
+const (
+	TenantClosureStateBlocking       TenantClosureState = "blocking"
+	TenantClosureStateCancelling     TenantClosureState = "cancelling"
+	TenantClosureStateCompleted      TenantClosureState = "completed"
+	TenantClosureStateFinancePending TenantClosureState = "finance_pending"
+)
+
+// Valid indicates whether the value is a known member of the TenantClosureState enum.
+func (e TenantClosureState) Valid() bool {
+	switch e {
+	case TenantClosureStateBlocking:
+		return true
+	case TenantClosureStateCancelling:
+		return true
+	case TenantClosureStateCompleted:
+		return true
+	case TenantClosureStateFinancePending:
 		return true
 	default:
 		return false
@@ -2045,7 +2072,7 @@ type Tenant struct {
 	Name string     `json:"name"`
 	Slug string     `json:"slug"`
 
-	// Status `suspended` blocks every write and keeps reads. `closed` is terminal.
+	// Status `suspended` blocks every write and keeps reads. `closing` is a closure in progress: the tenant answers nothing to its own members and keys while its final billing is settled. `closed` is terminal.
 	Status    TenantStatus `json:"status"`
 	UpdatedAt time.Time    `json:"updated_at"`
 }
@@ -2059,8 +2086,30 @@ type TenantBillingRecipientStatus string
 // TenantKind defines model for Tenant.Kind.
 type TenantKind string
 
-// TenantStatus `suspended` blocks every write and keeps reads. `closed` is terminal.
+// TenantStatus `suspended` blocks every write and keeps reads. `closing` is a closure in progress: the tenant answers nothing to its own members and keys while its final billing is settled. `closed` is terminal.
 type TenantStatus string
+
+// TenantClosure defines model for TenantClosure.
+type TenantClosure struct {
+	// CutoffAt Usage up to this moment is invoiced.
+	CutoffAt  time.Time `json:"cutoff_at"`
+	Reason    string    `json:"reason"`
+	RequestId string    `json:"request_id"`
+
+	// State Where the closure settlement is.
+	State TenantClosureState `json:"state"`
+}
+
+// TenantClosureState Where the closure settlement is.
+type TenantClosureState string
+
+// TenantClosureRequest defines model for TenantClosureRequest.
+type TenantClosureRequest struct {
+	Reason string `json:"reason"`
+
+	// RequestId Client-chosen ID that makes the request safe to retry.
+	RequestId string `json:"request_id"`
+}
 
 // TenantCreate defines model for TenantCreate.
 type TenantCreate struct {
@@ -2583,6 +2632,9 @@ type AcceptInvitationJSONRequestBody = InvitationAccept
 
 // DecideTenantActivationJSONRequestBody defines body for DecideTenantActivation for application/json ContentType.
 type DecideTenantActivationJSONRequestBody = ActivationDecisionRequest
+
+// StartTenantClosureJSONRequestBody defines body for StartTenantClosure for application/json ContentType.
+type StartTenantClosureJSONRequestBody = TenantClosureRequest
 
 // GrantCreditJSONRequestBody defines body for GrantCredit for application/json ContentType.
 type GrantCreditJSONRequestBody = CreditGrant

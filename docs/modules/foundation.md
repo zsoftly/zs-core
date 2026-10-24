@@ -90,6 +90,8 @@ Clients branch on `code`. `message` is safe to show. It never carries database, 
 | ZS-1608 | `tenant_kind_unsupported` | 409 | no |
 | ZS-1609 | `recent_auth_required` | 403 | no |
 | ZS-1610 | `tenant_closed` | 409 | no |
+| ZS-1611 | `tenant_busy` | 409 | yes |
+| ZS-1612 | `tenant_closing` | 409 | no |
 | ZS-1700 | `api_key_invalid` | 401 | no |
 | ZS-1701 | `api_key_owner_removed` | 401 | no |
 | ZS-1800 | `billing_rejected` | 422 | no |
@@ -192,7 +194,7 @@ Every response carries `Cache-Control: no-store`, `X-Content-Type-Options: nosni
 | `GET /v1/me` | The caller's identity; see [identity-and-tenants.md](identity-and-tenants.md). |
 | `GET /v1/brands/{id}`, `POST /v1/brands/{id}/apply` | A brand and brand apply, staff `operator` only; see [brands.md](brands.md). |
 | `GET /v1/audit/events` | Audit events of the caller's brand or one of its tenants, staff `operator` only; see [audit.md](audit.md). |
-| `POST /v1/tenants/personal`, `POST /v1/tenants`, `/v1/tenants/{id}/...`, `POST /v1/invitations/accept`, `POST /v1/staff/tenants/{id}/activation` | Tenants, members, teams, invitations, activation, API keys and the tenant audit trail. See [tenants.md](tenants.md), [api-keys.md](api-keys.md) and `api/openapi.yaml`. |
+| `POST /v1/tenants/personal`, `POST /v1/tenants`, `/v1/tenants/{id}/...`, `POST /v1/invitations/accept`, `POST /v1/staff/tenants/{id}/activation`, `POST /v1/staff/tenants/{id}/closure` | Tenants, members, teams, invitations, activation, closure, API keys and the tenant audit trail. See [tenants.md](tenants.md), [api-keys.md](api-keys.md) and `api/openapi.yaml`. |
 | `GET /v1/brands/{id}/catalogue`, the billing routes under `/v1/tenants/{id}/...`, `POST /v1/staff/tenants/{id}/credits`, `POST /v1/billing/webhooks/killbill/{brand}/{token}` | The billing surface on Kill Bill. See [billing.md](billing.md). |
 | `GET /v1/tenants/{id}/wallet`, `/v1/tenants/{id}/reservations/...` | The wallet view and reservations. See [wallet.md](wallet.md). |
 | `/v1/tenants/{id}/usage/...`, `GET, PUT /v1/brands/{id}/meters` | Metering. See [metering.md](metering.md). |

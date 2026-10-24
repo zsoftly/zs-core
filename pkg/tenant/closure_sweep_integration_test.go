@@ -16,16 +16,25 @@ import (
 // fakeClosureSteps stands in for the Kill Bill cancellation and block.
 type fakeClosureSteps struct {
 	prepared tenant.ClosurePrepared
-	block    bool
-	mu       sync.Mutex
-	prepare  []scope.Scope
-	blocks   atomic.Int64
+	// onPrepare, when set, runs inside Prepare, for a step that is slow or stuck.
+	onPrepare func(ctx context.Context, sc scope.Scope)
+	block     bool
+	mu        sync.Mutex
+	prepare   []scope.Scope
+	blocks    atomic.Int64
 }
 
-func (f *fakeClosureSteps) Prepare(_ context.Context, _ tenant.DB, sc scope.Scope) (tenant.ClosurePrepared, error) {
+func (f *fakeClosureSteps) Prepare(ctx context.Context, _ tenant.DB, sc scope.Scope) (tenant.ClosurePrepared, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.prepare = append(f.prepare, sc)
+	hook := f.onPrepare
+	f.mu.Unlock()
+	if hook != nil {
+		hook(ctx, sc)
+	}
+	if err := ctx.Err(); err != nil {
+		return tenant.ClosurePrepared{}, err
+	}
 	return f.prepared, nil
 }
 
@@ -178,4 +187,123 @@ func TestClosureSweepResumesFromItsCursorWithinTheWorkBudget(t *testing.T) {
 		t.Fatalf("pass 4 = %+v %v, want none due", report, err)
 	}
 	_ = tenants
+}
+
+// threeClosing creates three closing tenants waiting at cancelling.
+func threeClosing(t *testing.T, e *env) []tenant.Tenant {
+	t.Helper()
+	ctx := context.Background()
+	var out []tenant.Tenant
+	for i := 0; i < 3; i++ {
+		tn := e.mustOrg(e.person("owner"+string(rune('a'+i))+"@example.test"), "Tenant "+string(rune('A'+i)))
+		if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = 'closing' WHERE brand_id = $1 AND id = $2`, tn.BrandID, tn.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status) VALUES ($1, $2, now(), 'cancelling')`, tn.BrandID, tn.ID); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, tn)
+	}
+	return out
+}
+
+func prepareOrder(f *fakeClosureSteps) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var ids []string
+	for _, sc := range f.prepare {
+		ids = append(ids, sc.TenantID())
+	}
+	return ids
+}
+
+// The pass budget ends the pass. A tenant whose step uses it up is the one
+// that pays: it is backed off and the cursor moves past it, so the next pass
+// reaches the next tenant and a stuck tenant cannot starve the others.
+func TestClosureSweepPassBudgetEndsThePassAndMovesPastTheTenantThatUsedIt(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tenants := threeClosing(t, e)
+	steps := &fakeClosureSteps{onPrepare: func(ctx context.Context, _ scope.Scope) { <-ctx.Done() }}
+	sweeper := &tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, PassBudget: 400 * time.Millisecond}
+	seen := map[string]bool{}
+	for pass := 1; pass <= 3; pass++ {
+		began := time.Now()
+		report, err := sweeper.SweepOnce(ctx)
+		if elapsed := time.Since(began); err != nil || elapsed > 3*time.Second || report.ClosuresFailed != 1 {
+			t.Fatalf("pass %d = %+v %v after %v, want one failed tenant and the pass ended near its budget", pass, report, err, elapsed)
+		}
+		order := prepareOrder(steps)
+		last := order[len(order)-1]
+		if seen[last] {
+			t.Fatalf("pass %d reached %s again; order %v", pass, last, order)
+		}
+		seen[last] = true
+	}
+	for _, tn := range tenants {
+		var attempts int
+		var lastErr string
+		if err := e.db.Pool.QueryRow(ctx, `SELECT attempts, coalesce(last_error, '') FROM tenant_closure_settlements WHERE tenant_id = $1`, tn.ID).Scan(&attempts, &lastErr); err != nil || attempts != 1 || lastErr != "step_timeout" {
+			t.Fatalf("tenant %s: attempts = %d last_error = %q, %v, want 1 and step_timeout", tn.ID, attempts, lastErr, err)
+		}
+	}
+}
+
+// A closure step has its own bound. One that overruns it fails that tenant
+// with a timeout and the pass goes on to the next tenant.
+func TestClosureSweepCallBudgetFailsOneTenantAndGoesOn(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	threeClosing(t, e)
+	steps := &fakeClosureSteps{onPrepare: func(ctx context.Context, _ scope.Scope) { <-ctx.Done() }}
+	sweeper := &tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, CallBudget: 100 * time.Millisecond}
+	began := time.Now()
+	report, err := sweeper.SweepOnce(ctx)
+	if err != nil || report.ClosuresChecked != 3 || report.ClosuresFailed != 3 || time.Since(began) > 5*time.Second {
+		t.Fatalf("pass = %+v %v after %v, want three tenants each failed by its call bound", report, err, time.Since(began))
+	}
+	var timeouts int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_settlements WHERE last_error = 'step_timeout' AND attempts = 1`).Scan(&timeouts); err != nil || timeouts != 3 {
+		t.Fatalf("step_timeout settlements = %d, %v", timeouts, err)
+	}
+}
+
+// A pass stopped by its caller, as on shutdown, is not a failure of the tenant
+// it was in. The tenant keeps its place: after the restart it is the first one
+// looked at again.
+func TestClosureSweepStoppedByItsCallerResumesAtTheSameTenant(t *testing.T) {
+	e := newEnv(t)
+	threeClosing(t, e)
+	stopped, stop := context.WithCancel(context.Background())
+	defer stop()
+	steps := &fakeClosureSteps{onPrepare: func(ctx context.Context, _ scope.Scope) {
+		stop()
+		<-ctx.Done()
+	}}
+	sweeper := &tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps}
+	began := time.Now()
+	report, err := sweeper.SweepOnce(stopped)
+	if err == nil || time.Since(began) > 5*time.Second || report.ClosuresFailed != 0 {
+		t.Fatalf("stopped pass = %+v %v after %v, want an error, no failed tenant and a prompt return", report, err, time.Since(began))
+	}
+	interrupted := prepareOrder(steps)
+	if len(interrupted) != 1 {
+		t.Fatalf("the stopped pass reached %d tenants, want 1", len(interrupted))
+	}
+	var attempts int
+	if err := e.db.Pool.QueryRow(context.Background(), `SELECT coalesce(max(attempts), 0) FROM tenant_closure_settlements`).Scan(&attempts); err != nil || attempts != 0 {
+		t.Fatalf("attempts after the stop = %d, %v, want none recorded", attempts, err)
+	}
+	// The restart: nothing is stuck now, and the first tenant looked at is the
+	// one that was interrupted.
+	steps.mu.Lock()
+	steps.onPrepare = nil
+	steps.mu.Unlock()
+	if _, err := sweeper.SweepOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	order := prepareOrder(steps)
+	if len(order) < 2 || order[1] != interrupted[0] {
+		t.Fatalf("after the restart the first tenant was %v, want %s again; order %v", order, interrupted[0], order)
+	}
 }

@@ -58,6 +58,26 @@ type closureCandidate struct {
 	attempts   int
 }
 
+// settleContext is a short context of its own for what a pass records after
+// its own context is spent.
+func settleContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), lifecycleCleanupLimit)
+}
+
+func (s *Sweeper) passBudget() time.Duration {
+	if s.PassBudget <= 0 {
+		return 30 * time.Second
+	}
+	return s.PassBudget
+}
+
+func (s *Sweeper) callBudget() time.Duration {
+	if s.CallBudget <= 0 {
+		return 5 * time.Second
+	}
+	return s.CallBudget
+}
+
 func (s *Sweeper) closureWork() int {
 	if s.ClosureWork <= 0 {
 		return closureWorkBudget
@@ -71,7 +91,7 @@ func (s *Sweeper) closureWork() int {
 // another owner holds is skipped. The cursor moves past every tenant looked
 // at, and wraps when none is left, so every closing tenant is reached in turn.
 func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, correlationID string, report *SweepReport) error {
-	passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	passCtx, cancel := context.WithTimeout(ctx, s.passBudget())
 	defer cancel()
 	passCutoff := time.Now().UTC()
 	eligibleAt, tenantID, err := s.closureCursor(passCtx, guard)
@@ -101,6 +121,7 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 			if err != nil {
 				return err
 			}
+			settle, budgetSpent, settleCancel := passCtx, false, func() {}
 			if got {
 				work++
 				outcome, driveErr := s.driveClosure(passCtx, child, c, correlationID)
@@ -108,10 +129,25 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 					driveErr = releaseErr
 				}
 				if driveErr != nil {
+					if ctx.Err() != nil {
+						// The caller stopped the pass, as on shutdown. That is not
+						// this tenant's failure: nothing is recorded and the cursor
+						// stays, so after the restart it is looked at first.
+						return ctx.Err()
+					}
 					outcome = closureFailed
+					if passCtx.Err() != nil {
+						// This tenant used up the pass budget. It pays for it, with
+						// a backoff, and the cursor moves past it, so a tenant that
+						// is stuck cannot keep the others from being reached. The
+						// pass ends, and what it records uses a short context of its
+						// own, because the pass context is spent.
+						settle, settleCancel = settleContext(ctx)
+						budgetSpent = true
+					}
 					s.log().Warn("closure step failed", "tenant_id", c.scope.TenantID(), "error", driveErr.Error())
 				}
-				s.recordClosureOutcome(passCtx, guard, c, outcome, driveErr)
+				s.recordClosureOutcome(settle, guard, c, outcome, driveErr)
 				switch outcome {
 				case closureAdvanced, closureDone:
 					report.ClosuresAdvanced++
@@ -125,9 +161,15 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 			} else {
 				report.ClosuresBusy++
 			}
+			if budgetSpent {
+				err := s.advanceClosureCursor(settle, guard, c, false)
+				settleCancel()
+				return err
+			}
 			if err := s.advanceClosureCursor(passCtx, guard, c, false); err != nil {
 				return err
 			}
+			settleCancel()
 			at := c.eligibleAt
 			eligibleAt, tenantID = &at, c.scope.Tenant
 		}
@@ -152,7 +194,9 @@ func (s *Sweeper) driveClosure(ctx context.Context, child *LifecycleGuard, c clo
 			if s.Closure == nil {
 				return waitOrAdvanced(advanced), nil
 			}
-			prepared, err := s.Closure.Prepare(ctx, child, c.scope)
+			callCtx, cancelCall := context.WithTimeout(ctx, s.callBudget())
+			prepared, err := s.Closure.Prepare(callCtx, child, c.scope)
+			cancelCall()
 			if err != nil {
 				return closureFailed, err
 			}
@@ -185,7 +229,9 @@ func (s *Sweeper) driveClosure(ctx context.Context, child *LifecycleGuard, c clo
 			if s.Closure == nil {
 				return waitOrAdvanced(advanced), nil
 			}
-			blocked, err := s.Closure.Block(ctx, child, c.scope)
+			callCtx, cancelCall := context.WithTimeout(ctx, s.callBudget())
+			blocked, err := s.Closure.Block(callCtx, child, c.scope)
+			cancelCall()
 			if err != nil {
 				return closureFailed, err
 			}
@@ -248,7 +294,9 @@ func (s *Sweeper) recordClosureOutcome(ctx context.Context, guard *LifecycleSwee
 		attempts++
 		lastError = "internal_error"
 		var zsErr *zserrors.Error
-		if errors.As(cause, &zsErr) {
+		if errors.Is(cause, context.DeadlineExceeded) {
+			lastError = "step_timeout"
+		} else if errors.As(cause, &zsErr) {
 			lastError = zserrors.Lookup(zsErr.Code).Name
 		}
 	default:

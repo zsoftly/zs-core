@@ -206,3 +206,61 @@ func (c *Client) CreateAddOn(ctx context.Context, creds TenantCredentials, cc Ca
 	}
 	return s.SubscriptionID, nil
 }
+
+// CancelFailure is one subscription that does not satisfy the closure
+// receipt. Day is empty when the subscription has no readable cancelled date.
+type CancelFailure struct {
+	SubscriptionID string
+	Category       string
+	State          string
+	Day            string
+}
+
+// CancelReceipt is what CancelledOn found in the bundles of an account.
+type CancelReceipt struct {
+	// Subscriptions is how many subscriptions of the account were looked at.
+	Subscriptions int
+	// Failing lists, in bundle order, every one that does not satisfy the
+	// receipt.
+	Failing []CancelFailure
+}
+
+// OK reports whether every subscription satisfied the receipt. An account
+// with no subscriptions is OK: there was nothing to cancel, and Subscriptions
+// is 0 for a caller that cares.
+func (r CancelReceipt) OK() bool { return len(r.Failing) == 0 }
+
+// CancelledOn is the receipt of a closure that cancels every subscription of
+// an account IMMEDIATELY. It reads the bundles the caller already has and
+// does no I/O. A subscription of the account, a base subscription or an
+// add-on, satisfies it when its state is CANCELLED and the day its
+// cancellation took effect (CancelEffectiveDate) is readable and is not after
+// today, a day written YYYY-MM-DD in UTC. There is no lower bound: a
+// subscription cancelled long before the closure is cancelled.
+//
+// Everything else is listed in Failing with its state and day: an ACTIVE one,
+// with a scheduled cancel or none, a PENDING or BLOCKED one, a CANCELLED one
+// whose day cannot be read, and a CANCELLED one dated after today. A pending
+// cancel is not a receipt. Subscriptions whose AccountID is set and is not
+// accountID, compared without regard to case, are skipped. This is not the
+// receipt of an END_OF_TERM or requested-day cancel.
+func CancelledOn(bundles []Bundle, accountID, today string) CancelReceipt {
+	var r CancelReceipt
+	for _, b := range bundles {
+		for _, s := range b.Subscriptions {
+			if s.AccountID != "" && !strings.EqualFold(s.AccountID, accountID) {
+				continue
+			}
+			r.Subscriptions++
+			day, err := CancelEffectiveDate(s)
+			if err != nil {
+				day = ""
+			}
+			if s.State == "CANCELLED" && day != "" && day <= today {
+				continue
+			}
+			r.Failing = append(r.Failing, CancelFailure{SubscriptionID: s.SubscriptionID, Category: s.ProductCategory, State: s.State, Day: day})
+		}
+	}
+	return r
+}

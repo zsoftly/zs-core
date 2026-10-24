@@ -491,3 +491,90 @@ func TestFakeCancelAnswerLossAndCapture(t *testing.T) {
 		t.Fatalf("another tenant's captures = %+v", other)
 	}
 }
+
+func TestCancelledOn(t *testing.T) {
+	const account = "11111111-1111-4111-8111-111111111111"
+	sub := func(id, category, state, cancelled string) killbill.Subscription {
+		return killbill.Subscription{AccountID: account, SubscriptionID: id, ProductCategory: category, State: state, CancelledDate: cancelled}
+	}
+	bundle := func(subs ...killbill.Subscription) killbill.Bundle {
+		return killbill.Bundle{AccountID: account, BundleID: "b", Subscriptions: subs}
+	}
+	for _, tc := range []struct {
+		name     string
+		bundles  []killbill.Bundle
+		wantOK   bool
+		wantSeen int
+		wantFail []killbill.CancelFailure
+	}{
+		{"cancelled on the day, a timestamp", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", "2026-11-03T20:47:15.000Z"), sub("b", "ADD_ON", "CANCELLED", "2026-11-03T20:47:15.000Z"))}, true, 2, nil},
+		{"cancelled long before, a bare date", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", "2026-01-15"))}, true, 1, nil},
+		{"two bundles", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", "2026-11-03")), bundle(sub("b", "BASE", "CANCELLED", "2026-11-01"))}, true, 2, nil},
+		{"an empty account", nil, true, 0, nil},
+		{"a bundle without subscriptions", []killbill.Bundle{bundle()}, true, 0, nil},
+		{"one active with no cancel", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", "2026-11-03"), sub("b", "ADD_ON", "ACTIVE", ""))}, false, 2,
+			[]killbill.CancelFailure{{SubscriptionID: "b", Category: "ADD_ON", State: "ACTIVE", Day: ""}}},
+		{"a scheduled future cancel is not a receipt", []killbill.Bundle{bundle(sub("a", "BASE", "ACTIVE", "2026-12-03T00:00:00.000Z"))}, false, 1,
+			[]killbill.CancelFailure{{SubscriptionID: "a", Category: "BASE", State: "ACTIVE", Day: "2026-12-03"}}},
+		{"cancelled with a day after today", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", "2026-11-04"))}, false, 1,
+			[]killbill.CancelFailure{{SubscriptionID: "a", Category: "BASE", State: "CANCELLED", Day: "2026-11-04"}}},
+		{"cancelled with an unreadable day", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", "soon"))}, false, 1,
+			[]killbill.CancelFailure{{SubscriptionID: "a", Category: "BASE", State: "CANCELLED", Day: ""}}},
+		{"cancelled with no day", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", ""))}, false, 1,
+			[]killbill.CancelFailure{{SubscriptionID: "a", Category: "BASE", State: "CANCELLED", Day: ""}}},
+		{"pending and blocked states", []killbill.Bundle{bundle(sub("a", "BASE", "PENDING", ""), sub("b", "ADD_ON", "BLOCKED", "2026-11-03"))}, false, 2,
+			[]killbill.CancelFailure{{SubscriptionID: "a", Category: "BASE", State: "PENDING", Day: ""}, {SubscriptionID: "b", Category: "ADD_ON", State: "BLOCKED", Day: "2026-11-03"}}},
+		{"another account's subscription is skipped", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", "2026-11-03"),
+			killbill.Subscription{AccountID: "99999999-9999-4999-8999-999999999999", SubscriptionID: "x", State: "ACTIVE"})}, true, 1, nil},
+		{"the account is compared without case", []killbill.Bundle{bundle(sub("a", "BASE", "CANCELLED", "2026-11-03"))}, true, 1, nil},
+		{"a subscription without an account ID counts", []killbill.Bundle{bundle(killbill.Subscription{SubscriptionID: "a", State: "ACTIVE"})}, false, 1,
+			[]killbill.CancelFailure{{SubscriptionID: "a", State: "ACTIVE"}}},
+	} {
+		account := account
+		if tc.name == "the account is compared without case" {
+			account = strings.ToUpper(account)
+		}
+		got := killbill.CancelledOn(tc.bundles, account, "2026-11-03")
+		if got.OK() != tc.wantOK || got.Subscriptions != tc.wantSeen || len(got.Failing) != len(tc.wantFail) {
+			t.Errorf("%s: %+v, want ok=%v seen=%d failing=%v", tc.name, got, tc.wantOK, tc.wantSeen, tc.wantFail)
+			continue
+		}
+		for i, f := range tc.wantFail {
+			if got.Failing[i] != f {
+				t.Errorf("%s: failing[%d] = %+v, want %+v", tc.name, i, got.Failing[i], f)
+			}
+		}
+	}
+}
+
+// The receipt reads what the fake serves after an immediate cancel of the
+// base subscription: the add-on is cancelled with it on the same day.
+func TestCancelledOnAgainstTheFake(t *testing.T) {
+	ctx := context.Background()
+	_, kb, creds, acct := fakeTenant(t)
+	base, err := kb.CreateSubscription(ctx, creds, cc, acct, enginetest.PlanUsage, "zs-receipt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseSub, _ := kb.Subscription(ctx, creds, base)
+	addOn, err := kb.CreateAddOn(ctx, creds, cc, acct, baseSub.BundleID, enginetest.PlanUsage, "zs-receipt-addon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundles, _ := kb.AccountBundles(ctx, creds, acct)
+	if r := killbill.CancelledOn(bundles, acct, enginetest.CancelDay); r.OK() || r.Subscriptions != 2 || len(r.Failing) != 2 {
+		t.Fatalf("before the cancel = %+v", r)
+	}
+	if res, err := kb.CancelSubscriptionOnce(ctx, creds, cc, acct, base, immediate); err != nil || res.Outcome != killbill.Cancelled {
+		t.Fatalf("cancel = %+v %v", res, err)
+	}
+	bundles, _ = kb.AccountBundles(ctx, creds, acct)
+	if r := killbill.CancelledOn(bundles, acct, enginetest.CancelDay); !r.OK() || r.Subscriptions != 2 {
+		t.Fatalf("after the cancel = %+v (add-on %s)", r, addOn)
+	}
+	// A day before the cancel makes the same subscriptions fail: they are
+	// dated after "today".
+	if r := killbill.CancelledOn(bundles, acct, "2026-11-02"); r.OK() {
+		t.Fatalf("a cancel dated after today passed: %+v", r)
+	}
+}

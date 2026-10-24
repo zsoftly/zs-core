@@ -5,10 +5,14 @@ package tenant_test
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zsoftly/zs-core/pkg/scope"
 	"github.com/zsoftly/zs-core/pkg/tenant"
@@ -564,5 +568,41 @@ func TestSweepSyncsOrganizationsEvenWhenTheClosureBudgetIsSpent(t *testing.T) {
 	}
 	if org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID()); org.Name != "Sync first renamed" {
 		t.Fatalf("the Organization is named %q", org.Name)
+	}
+}
+
+// When a closure step fails and the release of the tenant capability fails
+// too, the step failure stays the classified cause, and the release failure is
+// logged on its own and counted.
+func TestClosureSweepLogsAndCountsAReleaseFailureBesideAStepFailure(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn := threeClosing(t, e)[0]
+	_ = tn
+	tracer := &sweepUnlockCancelTracer{child: true}
+	cfg, err := pgxpool.ParseConfig(e.db.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	cfg.ConnConfig.Tracer = tracer
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	logs := &lockedBuffer{}
+	// The release is cancelled only from the closure step on, so the sync
+	// before it runs as usual.
+	steps := &fakeClosureSteps{prepareErr: errors.New("step failed"), onPrepare: func(context.Context, scope.Scope) { tracer.enabled.Store(true) }}
+	report, _ := (&tenant.Sweeper{DB: pool, Engines: e.eng, Closure: steps, ClosureWork: 1, Log: slog.New(slog.NewTextHandler(logs, nil))}).SweepOnce(ctx)
+	if tracer.hits.Load() == 0 {
+		t.Fatal("the child release was never cancelled")
+	}
+	if report.Errors != 1 || !strings.Contains(logs.String(), "closure capability release failed") {
+		t.Fatalf("report = %+v, log = %q, want one counted error and the release failure logged", report, logs.String())
+	}
+	if strings.Contains(logs.String(), "closure step failed") && !strings.Contains(logs.String(), "step failed") {
+		t.Fatal("the step failure lost its own entry")
 	}
 }

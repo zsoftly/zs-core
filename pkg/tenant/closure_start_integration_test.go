@@ -150,8 +150,8 @@ func TestStartClosureIsAllOrNothing(t *testing.T) {
 	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ($1, $2, now() - interval '1 day')`, tn.BrandID, tn.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := startClosure(e, tn); err == nil {
-		t.Fatal("a start over an existing settlement succeeded")
+	if _, err := startClosure(e, tn); code(err) != "conflict" {
+		t.Fatalf("a start over an existing settlement = %v, want conflict", err)
 	}
 	var audits int
 	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.closure_started'`, tn.ID).Scan(&audits); err != nil || audits != 0 || tenantStatus(t, e, tn) != "active" {
@@ -201,5 +201,63 @@ func TestStartedClosureIsPickedUpBySweeper(t *testing.T) {
 	}
 	if org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID()); org.Enabled {
 		t.Fatal("the Organization of a closing tenant stayed enabled after the sweep")
+	}
+}
+
+// A closure that starts while Suspend, Reactivate or Close is calling the
+// engines wins. The command is refused, the tenant stays closing with its
+// settlement, nothing is audited as the command's own change, and the
+// Organization the command may have enabled is disabled again.
+func TestStartClosureDuringALifecycleCommandWins(t *testing.T) {
+	for _, command := range []string{"suspend", "reactivate", "close"} {
+		t.Run(command, func(t *testing.T) {
+			e, tn := closureStartEnv(t)
+			ctx := context.Background()
+			actor := tenant.SystemActor
+			if command == "reactivate" {
+				if _, err := tenant.Suspend(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "overdue", "c"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var started atomic.Bool
+			e.fake.AfterWrite(func(string, string) {
+				if started.CompareAndSwap(false, true) {
+					if _, err := startClosure(e, tn); err != nil {
+						t.Error(err)
+					}
+				}
+			})
+			t.Cleanup(func() { e.fake.AfterWrite(nil) })
+			var err error
+			switch command {
+			case "suspend":
+				_, err = tenant.Suspend(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+			case "reactivate":
+				_, err = tenant.Reactivate(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+			case "close":
+				_, err = tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+			}
+			e.fake.AfterWrite(nil)
+			if !started.Load() {
+				t.Fatal("the closure was never started in the middle of the command")
+			}
+			if code(err) != "not_ready" {
+				t.Fatalf("%s during a closure start = %v, want not_ready", command, err)
+			}
+			if got := tenantStatus(t, e, tn); got != "closing" || settlementRows(t, e, tn) != 1 {
+				t.Fatalf("status = %q settlements = %d, want closing and one", got, settlementRows(t, e, tn))
+			}
+			var own int
+			if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = $2`, tn.ID,
+				map[string]string{"suspend": "tenant.suspended", "reactivate": "tenant.reactivated", "close": "tenant.closed"}[command]).Scan(&own); err != nil {
+				t.Fatal(err)
+			}
+			if own != 0 {
+				t.Fatalf("%d audit entries of the refused %s command, want none", own, command)
+			}
+			if org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID()); org.Enabled {
+				t.Fatalf("the Organization is enabled after a refused %s", command)
+			}
+		})
 	}
 }

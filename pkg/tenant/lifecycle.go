@@ -192,8 +192,11 @@ func transition(ctx context.Context, db DB, eng Engines, s scope.Scope, actor ev
 	if locked.Status == StatusClosed || locked.Status == StatusClosing {
 		// A close, or the start of a closure, committed while this change
 		// called the engines. Closed is terminal and a closing tenant is
-		// settled by its closure alone: put the Organization back to disabled
-		// and refuse. The sweeper corrects it if this call fails.
+		// settled by its closure alone, so this change is refused. A change to
+		// active has just enabled the Organization: it is restored to disabled
+		// here, as in the closed case, before the refusal returns. The sweeper
+		// corrects it if that call fails. A Kill Bill blocking state set by the
+		// change stays: the closure blocks the account itself at its last step.
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 		if to == StatusActive {
 			_ = setOrganizationEnabled(context.WithoutCancel(ctx), eng.Keycloak, be.realm, t.KeycloakOrganizationID, false)

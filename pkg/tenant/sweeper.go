@@ -340,7 +340,15 @@ func (s *Sweeper) syncBrand(ctx context.Context, guard *LifecycleSweep, brandID 
 			// with the status the tenant has now.
 			t, err = currentTenant(ctx, child, t)
 			if err != nil {
-				return errors.Join(err, child.Release())
+				// This tenant could not be read again: it costs the pass this
+				// tenant, not the brand. If the read ended the capability, the
+				// release says so and the pass ends with that error.
+				report.Errors++
+				s.log().Warn("tenant could not be read before its sync", "tenant_id", t.PublicID(), "error_code", codeName(err))
+				if releaseErr := child.Release(); releaseErr != nil {
+					return errors.Join(err, releaseErr)
+				}
+				continue
 			}
 			r, err := SyncOrganization(ctx, child, s.Engines, t, correlationID)
 			report.OrganizationsChecked++
@@ -388,6 +396,9 @@ func currentTenant(ctx context.Context, db DB, t Tenant) (Tenant, error) {
 		return t, err
 	}
 	fresh, err := scanTenant(db.QueryRow(ctx, `SELECT `+tenantColumns+` FROM tenants WHERE brand_id = $1 AND id = $2`, args...))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return t, ErrNotFound
+	}
 	if err != nil {
 		return t, unavailable(err)
 	}

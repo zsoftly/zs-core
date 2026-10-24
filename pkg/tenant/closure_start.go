@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/zsoftly/zs-core/pkg/audit"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
@@ -69,6 +70,10 @@ func StartClosure(ctx context.Context, db DB, sc scope.Scope, actor events.Actor
 		var cutoff time.Time
 		if err := tx.QueryRow(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ($1, $2, now()) RETURNING cutoff_at`,
 			sc.Brand, sc.Tenant).Scan(&cutoff); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return zserrors.New(zserrors.CodeConflict, "A closure settlement already exists for this tenant.")
+			}
 			return unavailable(err)
 		}
 		args, err := sc.Bind()

@@ -175,8 +175,15 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 			if got {
 				work++
 				outcome, driveErr := s.driveClosure(passCtx, child, c, correlationID)
-				if releaseErr := child.Release(); driveErr == nil && releaseErr != nil {
-					driveErr = releaseErr
+				if releaseErr := child.Release(); releaseErr != nil {
+					if driveErr == nil {
+						driveErr = releaseErr
+					} else {
+						// The step failure stays the classified cause. The release
+						// failure is reported on its own, not joined into it.
+						report.Errors++
+						s.log().Warn("closure capability release failed", "tenant_id", c.scope.TenantID(), "error_code", codeName(releaseErr))
+					}
 				}
 				if driveErr != nil {
 					if ctx.Err() != nil {

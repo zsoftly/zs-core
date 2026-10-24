@@ -509,3 +509,35 @@ func jsonOf(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
 }
+
+// A tenant whose closure has started answers nothing: its members and its API
+// keys are refused on reads and on writes alike.
+func TestClosingTenantRefusesMembersAndAPIKeys(t *testing.T) {
+	a := newTenantAPI(t)
+	postgrestest.EnableSettlementStartRule(t, a.db)
+	b := a.fake.InsertBrand(t, a.db.Pool, "zs-api")
+	owner := a.person(b, "owner@example.test")
+	id := a.createTenant(owner, "Closing")
+	base := "/v1/tenants/" + id
+	key := a.call(http.MethodPost, base+"/api-keys", a.token(owner, mfa()), map[string]any{"name": "ci", "permissions": []string{"team:manage", "member:read"}})
+	secret := key.str("secret")
+	tid, _ := idgen.ParseAs(idgen.Tenant, id)
+	if r := a.call(http.MethodGet, base+"/members", secret, nil); r.status != http.StatusOK {
+		t.Fatalf("key before the closure = %d %v", r.status, r.body)
+	}
+	if _, err := tenant.StartClosure(context.Background(), a.db.Pool, scope.Scope{Brand: b.ID, Tenant: tid},
+		events.Actor{Type: events.ActorService, ID: "test"}, "customer left", "test"); err != nil {
+		t.Fatal(err)
+	}
+	tok := a.token(owner, mfa())
+	for name, r := range map[string]reply{
+		"member read":  a.call(http.MethodGet, base, tok, nil),
+		"member write": a.call(http.MethodPatch, base, tok, map[string]any{"name": "x"}),
+		"key read":     a.call(http.MethodGet, base+"/members", secret, nil),
+		"key write":    a.call(http.MethodPost, base+"/teams", secret, map[string]any{"name": "Ops"}),
+	} {
+		if r.status != http.StatusNotFound || r.code() != "tenant_not_found" {
+			t.Errorf("%s of a closing tenant = %d %v, want tenant_not_found", name, r.status, r.body)
+		}
+	}
+}

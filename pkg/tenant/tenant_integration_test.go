@@ -1287,3 +1287,49 @@ func TestSweeperCreationReportsTheCleanupFailureWithTheCreationFailure(t *testin
 		t.Fatalf("the creation failure was logged as %q, want both the billing failure and the release failure", line)
 	}
 }
+
+// A tenant that is gone when its capability is taken costs the pass that
+// tenant only: it is counted as an error and the rest of the brand is synced.
+func TestSweeperSkipsATenantThatVanishedBeforeItsCapability(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	ownerA, ownerB := e.person("vanish-a@example.test"), e.person("vanish-b@example.test")
+	a, b := e.mustOrg(ownerA, "Vanish A"), e.mustOrg(ownerB, "Vanish B")
+	c := e.mustOrg(e.person("vanish-c@example.test"), "Vanish C")
+	trio := []tenant.Tenant{a, b, c}
+	slices.SortFunc(trio, func(x, y tenant.Tenant) int { return strings.Compare(x.ID.String(), y.ID.String()) })
+	first, middle, last := trio[0], trio[1], trio[2]
+	owners := map[idgen.UUID]enginetest.Person{a.ID: ownerA, b.ID: ownerB}
+	if owner, ok := owners[first.ID]; ok {
+		if _, err := e.db.Pool.Exec(ctx, `UPDATE identities SET email = 'vanish-first-updated@example.test' WHERE id = $1`, owner.Identity.ID); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		t.Skip("the first tenant is not one with a known owner")
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET name = 'Vanish last renamed' WHERE id = $1`, last.ID); err != nil {
+		t.Fatal(err)
+	}
+	var gone atomic.Bool
+	e.fake.AfterWrite(func(method, path string) {
+		if method == http.MethodPut && path == "/1.0/kb/accounts/"+first.KillBillAccountID && gone.CompareAndSwap(false, true) {
+			if err := pgx.BeginFunc(ctx, e.db.Pool, func(tx pgx.Tx) error {
+				if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
+					return err
+				}
+				_, err := tx.Exec(ctx, `DELETE FROM tenants WHERE id = $1`, middle.ID)
+				return err
+			}); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	t.Cleanup(func() { e.fake.AfterWrite(nil) })
+	report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng}).SweepOnce(ctx)
+	if err != nil || !gone.Load() || report.Errors != 1 {
+		t.Fatalf("sweep = %+v %v (middle tenant removed: %v), want no error and one counted error", report, err, gone.Load())
+	}
+	if org, _, _ := e.fake.Organization(e.brand.Realm, last.PublicID()); org.Name != "Vanish last renamed" {
+		t.Fatalf("the tenant after the vanished one was not synced: %q", org.Name)
+	}
+}

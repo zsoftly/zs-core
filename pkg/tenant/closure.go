@@ -106,12 +106,18 @@ func ExecuteClosureInvoiceOnce(ctx context.Context, db DB, eng Engines, sc scope
 		attemptID        idgen.UUID
 		accountID        string
 		targetDate       time.Time
+		attemptTenant    string
 		started          bool
+		recorded         bool
 		invoiceID        string
 		expectedCurrency string
 	)
-	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
-		var status, settlement, attemptTenant string
+	manualReview := zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is pending manual review.")
+	// lock reads the attempt under its row lock and refuses it unless the
+	// tenant is closing, the settlement waits for finance, and the brand still
+	// stores the Kill Bill tenant the attempt was claimed against.
+	lock := func(tx pgx.Tx) error {
+		var status, settlement string
 		err := tx.QueryRow(ctx, `SELECT a.id, a.killbill_account_id::text, a.target_date, t.status, s.status, a.killbill_tenant_id::text
 FROM tenant_closure_invoice_attempts a
 JOIN tenants t ON t.brand_id = a.brand_id AND t.id = a.tenant_id
@@ -126,39 +132,72 @@ WHERE a.brand_id = $1 AND a.tenant_id = $2 FOR UPDATE`, sc.Brand, sc.Tenant).Sca
 		if status != "closing" || settlement != "finance_pending" {
 			return zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is not ready.")
 		}
-		// The attempt was claimed against one Kill Bill tenant. If the brand now
-		// stores another, nothing is started and nothing reaches Kill Bill.
 		if !strings.EqualFold(attemptTenant, rec.KillBillTenantID) {
-			return zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is pending manual review.")
+			return manualReview
 		}
-		expectedCurrency = rec.Manifest.Billing.Currencies[0]
-		tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, expected_currency)
-VALUES ($1, $2, 'started', $3)
-ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expectedCurrency)
-		if err != nil {
-			return unavailable(err)
+		return nil
+	}
+	// First read what is already recorded. Nothing is started yet.
+	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		if err := lock(tx); err != nil {
+			return err
 		}
-		started = tag.RowsAffected() == 1
-		if !started {
-			err = tx.QueryRow(ctx, `SELECT started.expected_currency, coalesce(invoice.invoice_id::text, '')
+		err := tx.QueryRow(ctx, `SELECT started.expected_currency, coalesce(invoice.invoice_id::text, '')
 FROM tenant_closure_invoice_outcomes started
 LEFT JOIN tenant_closure_invoice_outcomes invoice ON invoice.attempt_id = started.attempt_id AND invoice.kind = 'invoice_id'
 WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&expectedCurrency, &invoiceID)
-			if err != nil {
-				return unavailable(err)
-			}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
 		}
+		if err != nil {
+			return unavailable(err)
+		}
+		recorded = true
 		return nil
 	})
 	if err != nil {
 		return ClosureExecutionResult{}, err
 	}
-	if !started && invoiceID == "" {
-		return ClosureExecutionResult{}, zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is pending manual review.")
+	if recorded && invoiceID == "" {
+		return ClosureExecutionResult{}, manualReview
 	}
+	// Preflight, before anything is started: the credentials resolve, Kill
+	// Bill answers, and the tenant its API key resolves to is the one the
+	// brand stores and the attempt was claimed against. A failure here leaves
+	// nothing to review.
 	be, err := eng.forBillingBrand(ctx, db, sc.Brand)
 	if err != nil {
 		return ClosureExecutionResult{}, err
+	}
+	live, err := eng.KillBill.TenantByAPIKey(ctx, be.creds.APIKey)
+	if err != nil {
+		return ClosureExecutionResult{}, engineError(err)
+	}
+	if !strings.EqualFold(live.TenantID, rec.KillBillTenantID) || !strings.EqualFold(live.TenantID, attemptTenant) {
+		return ClosureExecutionResult{}, manualReview
+	}
+	if !recorded {
+		err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+			if err := lock(tx); err != nil {
+				return err
+			}
+			expectedCurrency = rec.Manifest.Billing.Currencies[0]
+			tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, expected_currency)
+VALUES ($1, $2, 'started', $3)
+ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expectedCurrency)
+			if err != nil {
+				return unavailable(err)
+			}
+			started = tag.RowsAffected() == 1
+			return nil
+		})
+		if err != nil {
+			return ClosureExecutionResult{}, err
+		}
+		if !started {
+			// Another executor started it between the read and now.
+			return ClosureExecutionResult{}, manualReview
+		}
 	}
 	if started {
 		invoiceID, err = eng.KillBill.TriggerInvoice(ctx, be.creds, callContext("", "closure invoice"), accountID, targetDate.Format(time.DateOnly))

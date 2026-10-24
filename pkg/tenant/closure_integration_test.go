@@ -4,6 +4,7 @@ package tenant_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -247,6 +248,9 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 	var responseMu sync.Mutex
 	var invoiceID, targetDate string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerTenantLookup(w, r, tn.BrandID) {
+			return
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
 			posts.Add(1)
 			var openTransactions int
@@ -332,6 +336,9 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 	}
 	var posts atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerTenantLookup(w, r, tn.BrandID) {
+			return
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
 			posts.Add(1)
 			http.Error(w, "lost reply", http.StatusServiceUnavailable)
@@ -376,6 +383,9 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 	}
 	var posts atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerTenantLookup(w, r, tn.BrandID) {
+			return
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
 			posts.Add(1)
 			hijacker, ok := w.(http.Hijacker)
@@ -560,6 +570,9 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 			wrongTargetDate := tc.targetDate == "wrong"
 			var invoiceID, targetDate string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if answerTenantLookup(w, r, tn.BrandID) {
+					return
+				}
 				if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
 					posts.Add(1)
 					responseMu.Lock()
@@ -651,5 +664,119 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 				t.Fatalf("repeated evidenced outcomes = %d, %v", outcomes, err)
 			}
 		})
+	}
+}
+
+// answerTenantLookup answers Kill Bill's tenant lookup with the given tenant.
+func answerTenantLookup(w http.ResponseWriter, r *http.Request, tenantID idgen.UUID) bool {
+	if r.Method != http.MethodGet || r.URL.Path != "/1.0/kb/tenants" {
+		return false
+	}
+	body, _ := json.Marshal(killbill.Tenant{TenantID: tenantID.String(), ExternalKey: "closure", APIKey: r.URL.Query().Get("apiKey")})
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body)
+	return true
+}
+
+// claimedClosure is a closing tenant with a claimed, not yet executed,
+// closure invoice, and a Kill Bill whose tenant lookup answers as lookup
+// says: 0 the stored tenant, 1 another tenant, 2 unavailable.
+func claimedClosure(t *testing.T, lookup *atomic.Int32, posts, lookups *atomic.Int64) (*env, tenant.Tenant) {
+	t.Helper()
+	e := newEnv(t)
+	ctx := context.Background()
+	p := e.person("owner@example.test")
+	tn := e.mustOrg(p, "Tenant A")
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = 'closing' WHERE brand_id = $1 AND id = $2`, tn.BrandID, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements
+    (brand_id, tenant_id, cutoff_at, status, cancellation_completed_at, finance_target_date, drain_completed_at)
+VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.BrandID, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := tenant.ProcessClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err != nil || !claim.Claimed {
+		t.Fatalf("claim = %+v %v", claim, err)
+	}
+	var mu sync.Mutex
+	var invoiceID, targetDate string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/1.0/kb/tenants" {
+			lookups.Add(1)
+			switch lookup.Load() {
+			case 1:
+				answerTenantLookup(w, r, idgen.MustNewV7())
+			case 2:
+				http.Error(w, "tenant lookup unavailable", http.StatusServiceUnavailable)
+			default:
+				answerTenantLookup(w, r, tn.BrandID)
+			}
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
+			posts.Add(1)
+			mu.Lock()
+			invoiceID = idgen.MustNewV7().String()
+			targetDate = r.URL.Query().Get("targetDate")
+			mu.Unlock()
+			w.Header().Set("Location", "/1.0/kb/invoices/"+invoiceID)
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		mu.Lock()
+		id, date := invoiceID, targetDate
+		mu.Unlock()
+		if r.Method == http.MethodGet && id != "" && r.URL.Path == "/1.0/kb/invoices/"+id {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"invoiceId":"` + id + `","accountId":"` + tn.KillBillAccountID + `","status":"COMMITTED","currency":"CAD","targetDate":"` + date + `"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	kb, err := killbill.New(killbill.Config{URL: server.URL, AdminUser: "admin", AdminPassword: "pw", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.eng.KillBill = kb
+	return e, tn
+}
+
+// A Kill Bill tenant rebuilt under the same API key is not the tenant the
+// brand stores. The live lookup catches it before anything is started.
+func TestClosureInvoiceExecutionRefusesARebuiltKillBillTenant(t *testing.T) {
+	var lookup atomic.Int32
+	var posts, lookups atomic.Int64
+	lookup.Store(1)
+	e, tn := claimedClosure(t, &lookup, &posts, &lookups)
+	ctx := context.Background()
+	if _, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || posts.Load() != 0 {
+		t.Fatalf("rebuilt tenant = %v posts=%d", err, posts.Load())
+	}
+	var outcomes int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_invoice_outcomes`).Scan(&outcomes); err != nil || outcomes != 0 {
+		t.Fatalf("outcomes after a refused tenant = %d, %v", outcomes, err)
+	}
+}
+
+// A lookup that fails leaves nothing started, so the attempt is not stuck
+// for manual review: once Kill Bill answers, it starts and posts once.
+func TestClosureInvoiceExecutionLeavesNothingStartedWhenTheLookupFails(t *testing.T) {
+	var lookup atomic.Int32
+	var posts, lookups atomic.Int64
+	lookup.Store(2)
+	e, tn := claimedClosure(t, &lookup, &posts, &lookups)
+	ctx := context.Background()
+	if _, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || posts.Load() != 0 {
+		t.Fatalf("failed lookup = %v posts=%d", err, posts.Load())
+	}
+	var outcomes int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_invoice_outcomes`).Scan(&outcomes); err != nil || outcomes != 0 {
+		t.Fatalf("outcomes after a failed lookup = %d, %v", outcomes, err)
+	}
+	lookup.Store(0)
+	result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
+	if err != nil || !result.Posted || !result.Evidenced || posts.Load() != 1 {
+		t.Fatalf("after the lookup recovered = %+v %v posts=%d", result, err, posts.Load())
 	}
 }

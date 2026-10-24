@@ -89,6 +89,8 @@ type Fake struct {
 	nodes []killbill.NodeInfo
 	// requests records the audit headers of every Kill Bill write.
 	requests []KillBillWrite
+	// reads records the path of every Kill Bill read.
+	reads []string
 	// lose counts the next writes, by path prefix, that take effect and
 	// then answer 503, as a lost answer looks to Core.
 	lose map[string]int
@@ -523,6 +525,9 @@ func (f *Fake) serveTenantLookup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *Fake) serveKillBill(w http.ResponseWriter, r *http.Request, path string, body []byte) {
+	if r.Method == http.MethodGet {
+		f.reads = append(f.reads, path)
+	}
 	if r.Method != http.MethodGet {
 		f.requests = append(f.requests, KillBillWrite{Method: r.Method, Path: path, APIKey: r.Header.Get(killbill.HeaderAPIKey),
 			CreatedBy: r.Header.Get(killbill.HeaderCreatedBy), Reason: r.Header.Get(killbill.HeaderReason), Comment: r.Header.Get(killbill.HeaderComment)})

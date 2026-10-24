@@ -39,6 +39,14 @@ type KillBillWrite struct {
 	Method, Path, APIKey, CreatedBy, Reason, Comment string
 }
 
+// Reads returns the paths of the Kill Bill reads the fake served, oldest
+// first, so a test can count the calls a piece of code makes.
+func (f *Fake) Reads() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.reads...)
+}
+
 // Writes returns the Kill Bill writes the fake received, oldest first.
 func (f *Fake) Writes() []KillBillWrite {
 	f.mu.Lock()

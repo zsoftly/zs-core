@@ -61,6 +61,29 @@ func (s *Service) TenantAccount(ctx context.Context, q Querier, sc scope.Scope) 
 	return &TenantAccount{s: s, a: account{tenant: t, brand: rec, creds: killbill.TenantCredentials{APIKey: rec.KillBillAPIKey, APISecret: secret}}}, nil
 }
 
+// KillBillTenantID looks up the Kill Bill tenant of the brand's API key. It
+// is the same for every tenant of the brand, so a caller that sends many
+// rollups in one pass reads it once.
+func (k *TenantAccount) KillBillTenantID(ctx context.Context) (string, error) {
+	t, err := k.s.KillBill.TenantByAPIKey(ctx, k.a.creds.APIKey)
+	if err != nil {
+		return "", kbError(err)
+	}
+	return t.TenantID, nil
+}
+
+// UsageTargetOf is where usage lands for a subscription that UsageSubscriptionAt
+// just confirmed, built from the Kill Bill tenant ID of KillBillTenantID. It
+// reads nothing from Kill Bill, so the subscription is not read a second
+// time, and it refuses a subscription that is not this account's own. For
+// any other subscription use UsageTarget.
+func (k *TenantAccount) UsageTargetOf(tenantID string, confirmed killbill.Subscription) (killbill.UsageTarget, error) {
+	if confirmed.AccountID == "" || !strings.EqualFold(confirmed.AccountID, k.ID()) {
+		return killbill.UsageTarget{}, zserrors.New(zserrors.CodeBillingRejected, "The subscription does not belong to the tenant's account.")
+	}
+	return killbill.UsageTarget{EndpointFingerprint: k.s.KillBill.EndpointFingerprint(), TenantID: tenantID, AccountID: k.ID()}, nil
+}
+
 // UsageTarget returns the Kill Bill endpoint, tenant and account that usage
 // for the subscription lands in, as the tenant's own credentials see it.
 func (k *TenantAccount) UsageTarget(ctx context.Context, subscriptionID string) (killbill.UsageTarget, error) {

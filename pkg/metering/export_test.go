@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/zsoftly/zs-core/internal/killbill"
+	"github.com/zsoftly/zs-core/pkg/billing"
 	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/scope"
 )
@@ -57,4 +58,12 @@ func (s *Service) BindTargetTo(ctx context.Context, c Claimed, subscription stri
 // ReleaseClaim gives the claimed rollup back unsent.
 func (s *Service) ReleaseClaim(ctx context.Context, c Claimed) error {
 	return s.releaseClaim(ctx, c.ro)
+}
+
+// NewTenantIDs is an empty per-pass cache of Kill Bill tenants.
+func NewTenantIDs() tenantIDs { return tenantIDs{} }
+
+// Get returns the Kill Bill tenant of the account's brand through the cache.
+func (c tenantIDs) Get(ctx context.Context, acct *billing.TenantAccount) (string, error) {
+	return c.get(ctx, acct)
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -477,11 +478,36 @@ RETURNING r.id, r.brand_id, r.tenant_id, r.killbill_unit, r.tracking_id, coalesc
 	return due, nil
 }
 
+// tenantIDs holds the Kill Bill tenant of each API key for one pass, so the
+// lookup is made once per key and not once per rollup. Every use still
+// compares it with the tenant stored for the brand: a brand whose stored
+// tenant is not the one its key resolves to is held, never bound or sent.
+type tenantIDs map[string]string
+
+var errStoredTenantMismatch = errors.New("the brand's stored Kill Bill tenant is not the one its API key resolves to")
+
+func (c tenantIDs) get(ctx context.Context, acct *billing.TenantAccount) (string, error) {
+	rec := acct.Brand()
+	id, ok := c[rec.KillBillAPIKey]
+	if !ok {
+		var err error
+		if id, err = acct.KillBillTenantID(ctx); err != nil {
+			return "", err
+		}
+		c[rec.KillBillAPIKey] = id
+	}
+	if !strings.EqualFold(rec.KillBillTenantID, id) {
+		return "", errStoredTenantMismatch
+	}
+	return id, nil
+}
+
 // sendDue claims due rollups, of one tenant when only is set, a batch at a
 // time under a claim token, and sends each to Kill Bill. Before each send
 // it renews its claim. A rollup whose claim it lost, because the claim ran
 // out and another forwarder took the rollup, is skipped and never sent.
 func (s *Service) sendDue(ctx context.Context, only *scope.Scope, report *ForwardReport) error {
+	tenants := tenantIDs{}
 	for {
 		due, err := s.claimDue(ctx, only)
 		if err != nil {
@@ -507,7 +533,7 @@ func (s *Service) sendDue(ctx context.Context, only *scope.Scope, report *Forwar
 				report.Skipped++
 				continue
 			}
-			outcome, err := s.send(ctx, ro)
+			outcome, err := s.send(ctx, ro, tenants)
 			switch {
 			case err != nil:
 				report.Failed++
@@ -679,7 +705,7 @@ const (
 // whose period starts before the subscription started, or whose
 // subscription is cancelled, is rejected instead, because Kill Bill would
 // record it and never bill it.
-func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
+func (s *Service) send(ctx context.Context, ro rollup, tenants tenantIDs) (sendOutcome, error) {
 	acct, err := s.Billing.TenantAccount(ctx, s.DB, ro.sc)
 	if err != nil {
 		return 0, preflight(reasonPreflight, err)
@@ -700,7 +726,11 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	if subscription == "" {
 		subscription = target.Subscription.SubscriptionID
 	}
-	kbTarget, err := acct.UsageTarget(ctx, subscription)
+	tenantID, err := tenants.get(ctx, acct)
+	if err != nil {
+		return 0, preflight(reasonTarget, err)
+	}
+	kbTarget, err := acct.UsageTargetOf(tenantID, target.Subscription)
 	if err != nil {
 		return 0, preflight(reasonTarget, err)
 	}

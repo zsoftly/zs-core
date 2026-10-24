@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zsoftly/zs-core/internal/keycloak"
 	"github.com/zsoftly/zs-core/pkg/audit"
@@ -81,29 +82,32 @@ func (s *Sweeper) Run(ctx context.Context, interval time.Duration) {
 
 // SweepOnce runs one pass. It returns Skipped when another pass holds the
 // lock.
-func (s *Sweeper) SweepOnce(ctx context.Context) (SweepReport, error) {
-	var report SweepReport
+func (s *Sweeper) SweepOnce(ctx context.Context) (report SweepReport, err error) {
 	if !s.Engines.Ready() {
 		return report, fmt.Errorf("tenant sweep: the engines are not configured")
 	}
-	lock, err := s.DB.Begin(ctx)
-	if err != nil {
-		return report, unavailable(err)
+	pool, ok := s.DB.(*pgxpool.Pool)
+	if !ok {
+		return report, fmt.Errorf("tenant sweep: lifecycle pool is required")
 	}
-	defer func() { _ = lock.Rollback(context.WithoutCancel(ctx)) }()
-	var locked bool
-	if err := lock.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('zs-core.tenant.sweep:' || current_schema(), 0))`).Scan(&locked); err != nil {
-		return report, unavailable(err)
+	guard, locked, err := AcquireLifecycleSweep(ctx, pool)
+	if err != nil {
+		return report, err
 	}
 	if !locked {
 		report.Skipped = true
 		return report, nil
 	}
+	defer func() {
+		if releaseErr := guard.Release(); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+	}()
 	correlationID := idgen.MustNewV7().String()
-	if err := s.completeCreations(ctx, correlationID, &report); err != nil {
+	if err := s.completeCreations(ctx, guard, correlationID, &report); err != nil {
 		return report, err
 	}
-	brands, err := brand.List(ctx, s.DB, s.log())
+	brands, err := brand.List(ctx, guard, s.log())
 	if err != nil {
 		return report, err
 	}
@@ -111,7 +115,7 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (SweepReport, error) {
 		if b.Status != brand.StatusActive || b.AppliedAt.IsZero() {
 			continue
 		}
-		if err := s.syncBrand(ctx, b.ID, correlationID, &report); err != nil {
+		if err := s.syncBrand(ctx, guard, b.ID, correlationID, &report); err != nil {
 			return report, err
 		}
 	}
@@ -126,39 +130,162 @@ func (s *Sweeper) batch() int {
 }
 
 // completeCreations claims due creations and runs each again.
-func (s *Sweeper) completeCreations(ctx context.Context, correlationID string, report *SweepReport) error {
-	claim, err := newClaim()
+func (s *Sweeper) completeCreations(ctx context.Context, guard *LifecycleSweep, correlationID string, report *SweepReport) error {
+	passCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	passCutoff := time.Now().UTC()
+	eligibleAt, tenantID, err := s.creationCursor(passCtx, guard)
 	if err != nil {
 		return err
 	}
-	rows, err := s.DB.Query(ctx, `UPDATE tenant_provisioning SET claim_token = $1, claimed_until = now() + $2::interval, updated_at = now()
-WHERE tenant_id IN (
-    SELECT tenant_id FROM tenant_provisioning
-    WHERE status = 'pending' AND next_attempt_at <= now() AND (claimed_until IS NULL OR claimed_until <= now())
-    ORDER BY next_attempt_at LIMIT $3 FOR UPDATE SKIP LOCKED)
-RETURNING `+provisioningColumns, claim, fmt.Sprintf("%d seconds", int(ProvisioningLease.Seconds())), s.batch())
-	if err != nil {
-		return unavailable(err)
-	}
-	due, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (provisioning, error) { return scanProvisioning(r) })
-	if err != nil {
-		return unavailable(err)
-	}
-	for _, p := range due {
-		if _, err := provision(ctx, s.DB, s.Engines, p, SystemActor, correlationID); err != nil {
-			report.Failed++
-			s.log().Warn("tenant creation is still incomplete", "tenant_id", p.publicID(), "error", err.Error())
-			continue
+	work, scanned := 0, 0
+	for scanned < 500 && work < 50 {
+		limit := s.batch()
+		if remaining := 500 - scanned; limit > remaining {
+			limit = remaining
 		}
-		report.Completed++
+		due, err := s.creationPage(passCtx, guard, passCutoff, eligibleAt, tenantID, limit)
+		if err != nil {
+			return err
+		}
+		if len(due) == 0 {
+			return s.advanceCreationCursor(passCtx, guard, provisioning{}, true)
+		}
+		for _, p := range due {
+			if scanned >= 500 || work >= 50 {
+				break
+			}
+			scanned++
+			child, got, err := guard.TryTenant(passCtx, p.scope())
+			if err != nil {
+				return err
+			}
+			if !got {
+				if err := s.advanceCreationCursor(passCtx, guard, p, false); err != nil {
+					return err
+				}
+				at := p.EligibleAt
+				eligibleAt, tenantID = &at, p.TenantID
+				continue
+			}
+			claim, err := newClaim()
+			if err == nil {
+				args, bindErr := p.scope().Bind(claim, fmt.Sprintf("%d seconds", int(ProvisioningLease.Seconds())))
+				if bindErr != nil {
+					_ = child.Release()
+					return bindErr
+				}
+				tx, beginErr := child.Begin(passCtx)
+				if beginErr != nil {
+					_ = child.Release()
+					return beginErr
+				}
+				var current bool
+				err = tx.QueryRow(passCtx, `SELECT true FROM tenant_provisioning
+WHERE brand_id = $1 AND tenant_id = $2 AND status = 'pending' AND (claimed_until IS NULL OR claimed_until <= now())
+FOR UPDATE SKIP LOCKED`, args[:2]...).Scan(&current)
+				if err == nil {
+					var claimed bool
+					err = tx.QueryRow(passCtx, `UPDATE tenant_provisioning SET claim_token = $3, claimed_until = now() + $4::interval, updated_at = now()
+WHERE brand_id = $1 AND tenant_id = $2 AND status = 'pending' AND (claimed_until IS NULL OR claimed_until <= now()) RETURNING true`, args...).Scan(&claimed)
+				}
+				if err == nil {
+					err = tx.Commit(passCtx)
+				} else {
+					_ = tx.Rollback(context.WithoutCancel(ctx))
+				}
+			}
+			if err == nil {
+				work++
+				p.Claim = claim
+				_, err = provision(passCtx, child, s.Engines, p, SystemActor, correlationID)
+			}
+			if releaseErr := child.Release(); err == nil && releaseErr != nil {
+				err = releaseErr
+			}
+			if advanceErr := s.advanceCreationCursor(passCtx, guard, p, false); err == nil && advanceErr != nil {
+				err = advanceErr
+			}
+			at := p.EligibleAt
+			eligibleAt, tenantID = &at, p.TenantID
+			if err != nil {
+				report.Failed++
+				s.log().Warn("tenant creation is still incomplete", "tenant_id", p.publicID(), "error", err.Error())
+				continue
+			}
+			report.Completed++
+		}
 	}
 	return nil
 }
 
-func (s *Sweeper) syncBrand(ctx context.Context, brandID idgen.UUID, correlationID string, report *SweepReport) error {
+func (s *Sweeper) creationCursor(ctx context.Context, guard *LifecycleSweep) (*time.Time, idgen.UUID, error) {
+	var at *time.Time
+	var id *idgen.UUID
+	err := guard.QueryRow(ctx, `SELECT last_eligible_at, last_tenant_id FROM sweep_cursor WHERE kind = 'creation'`).Scan(&at, &id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, idgen.Nil, nil
+	}
+	if err != nil {
+		return nil, idgen.Nil, err
+	}
+	if id == nil {
+		return nil, idgen.Nil, nil
+	}
+	return at, *id, nil
+}
+
+func (s *Sweeper) creationPage(ctx context.Context, guard *LifecycleSweep, cutoff time.Time, afterAt *time.Time, afterID idgen.UUID, limit int) ([]provisioning, error) {
+	tx, err := guard.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout = '5s'`); err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT `+provisioningColumns+` FROM tenant_provisioning
+WHERE status = 'pending' AND next_attempt_at <= $1 AND (claimed_until IS NULL OR claimed_until <= $1)
+  AND ($2::timestamptz IS NULL OR (next_attempt_at, tenant_id) > ($2, $3))
+ORDER BY next_attempt_at, tenant_id LIMIT $4`, cutoff, afterAt, afterID, limit)
+	if err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, unavailable(err)
+	}
+	list, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (provisioning, error) { return scanProvisioning(r) })
+	if err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return nil, unavailable(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, unavailable(err)
+	}
+	return list, nil
+}
+
+func (s *Sweeper) advanceCreationCursor(ctx context.Context, guard *LifecycleSweep, p provisioning, wrap bool) error {
+	tx, err := guard.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if wrap {
+		_, err = tx.Exec(ctx, `INSERT INTO sweep_cursor (kind, last_eligible_at, last_tenant_id, updated_at)
+VALUES ('creation', NULL, NULL, now()) ON CONFLICT (kind) DO UPDATE SET last_eligible_at = NULL, last_tenant_id = NULL, updated_at = now()`)
+	} else {
+		_, err = tx.Exec(ctx, `INSERT INTO sweep_cursor (kind, last_eligible_at, last_tenant_id, updated_at)
+VALUES ('creation', $1, $2, now()) ON CONFLICT (kind) DO UPDATE SET last_eligible_at = EXCLUDED.last_eligible_at, last_tenant_id = EXCLUDED.last_tenant_id, updated_at = now()`, p.EligibleAt, p.TenantID)
+	}
+	if err != nil {
+		_ = tx.Rollback(context.WithoutCancel(ctx))
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Sweeper) syncBrand(ctx context.Context, guard *LifecycleSweep, brandID idgen.UUID, correlationID string, report *SweepReport) error {
 	after := idgen.Nil
 	for {
-		rows, err := s.DB.Query(ctx, `SELECT `+tenantColumns+` FROM tenants WHERE brand_id = $1 AND id > $2 ORDER BY id LIMIT $3`,
+		rows, err := guard.Query(ctx, `SELECT `+tenantColumns+` FROM tenants WHERE brand_id = $1 AND id > $2 ORDER BY id LIMIT $3`,
 			brandID, after, s.batch())
 		if err != nil {
 			return unavailable(err)
@@ -168,7 +295,14 @@ func (s *Sweeper) syncBrand(ctx context.Context, brandID idgen.UUID, correlation
 			return unavailable(err)
 		}
 		for _, t := range list {
-			r, err := SyncOrganization(ctx, s.DB, s.Engines, t, correlationID)
+			child, got, err := guard.TryTenant(ctx, t.Scope())
+			if err != nil {
+				return err
+			}
+			if !got {
+				continue
+			}
+			r, err := SyncOrganization(ctx, child, s.Engines, t, correlationID)
 			report.OrganizationsChecked++
 			report.MembersAdded += r.MembersAdded
 			report.MembersRemoved += r.MembersRemoved
@@ -182,7 +316,7 @@ func (s *Sweeper) syncBrand(ctx context.Context, brandID idgen.UUID, correlation
 			// Recipient repair is independent of the Organization outcome. Ready
 			// rows are checked too, including legacy accounts and email drift.
 			recipientCtx, cancel := context.WithTimeout(ctx, mirrorTimeout)
-			recipient, recipientErr := ReconcileBillingRecipient(recipientCtx, s.DB, s.Engines, t.Scope(), correlationID)
+			recipient, recipientErr := ReconcileBillingRecipient(recipientCtx, child, s.Engines, t.Scope(), correlationID)
 			cancel()
 			if recipient.Deferred {
 				report.RecipientsDeferred++
@@ -195,6 +329,9 @@ func (s *Sweeper) syncBrand(ctx context.Context, brandID idgen.UUID, correlation
 			if recipientErr != nil {
 				report.Errors++
 				s.log().Warn("billing recipient not in step with Core", "tenant_id", t.PublicID(), "error_code", codeName(recipientErr))
+			}
+			if releaseErr := child.Release(); releaseErr != nil {
+				return errors.Join(err, recipientErr, releaseErr)
 			}
 		}
 		if len(list) < s.batch() {

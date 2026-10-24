@@ -102,6 +102,49 @@ func TestCreditsChargesAndBalance(t *testing.T) {
 	}
 }
 
+func TestTriggerInvoiceRequiresCreatedLocation(t *testing.T) {
+	ctx := context.Background()
+	for name, response := range map[string]struct {
+		status   int
+		location string
+		wantErr  bool
+	}{
+		"created location":   {status: http.StatusCreated, location: "/1.0/kb/invoices/018f7d96-5ce7-7b9e-8f21-5a67a10d0001"},
+		"nothing to do":      {status: http.StatusNotFound, wantErr: true},
+		"no content":         {status: http.StatusNoContent, wantErr: true},
+		"missing location":   {status: http.StatusCreated, wantErr: true},
+		"malformed location": {status: http.StatusCreated, location: "/1.0/kb/invoices/not-a-uuid", wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/1.0/kb/invoices" || r.URL.Query().Get("accountId") != "018f7d96-5ce7-7b9e-8f21-5a67a10d0002" || r.URL.Query().Get("targetDate") != "2026-10-24" {
+					t.Errorf("request = %s %s", r.Method, r.URL.String())
+					http.Error(w, "unexpected request", http.StatusBadRequest)
+					return
+				}
+				if response.location != "" {
+					w.Header().Set("Location", response.location)
+				}
+				w.WriteHeader(response.status)
+			}))
+			t.Cleanup(server.Close)
+			client, err := killbill.New(killbill.Config{URL: server.URL, AdminUser: "admin", AdminPassword: "pw", HTTPClient: server.Client()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := client.TriggerInvoice(ctx, killbill.TenantCredentials{APIKey: "key", APISecret: "secret"}, cc,
+				"018f7d96-5ce7-7b9e-8f21-5a67a10d0002", "2026-10-24")
+			if response.wantErr {
+				if err == nil || id != "" {
+					t.Fatalf("trigger = %q %v", id, err)
+				}
+			} else if err != nil || id != "018f7d96-5ce7-7b9e-8f21-5a67a10d0001" {
+				t.Fatalf("trigger = %q %v", id, err)
+			}
+		})
+	}
+}
+
 func TestPaymentsRefundsAndPaymentMethods(t *testing.T) {
 	ctx := context.Background()
 	f, kb, creds, acct := fakeTenant(t)

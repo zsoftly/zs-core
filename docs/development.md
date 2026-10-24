@@ -105,7 +105,7 @@ Migrations use unqualified names, so they apply to the first schema on the conne
 
 Unit tests sit next to the code and need nothing but Go.
 
-Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. Tests in different packages therefore run in parallel against one server without seeing each other's rows. Run the suite in parallel, without `-p 1`.
+Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. On a container server the harness is faster: the first test of a binary migrates one template database, and every test then gets a clone of it, a database of its own named `zs_test_<random>`, which is dropped when the test ends. A server named by `ZS_TEST_POSTGRES_URL` keeps the schema per test, because its user may not be allowed to create databases. A test whose subject is state that the schemas of one database share, such as a server-wide advisory lock, calls `postgrestest.NewSchema`, which gives schemas of the same database. Tests in different packages therefore run in parallel against one server without seeing each other's rows. Run the suite in parallel, without `-p 1`.
 
 Two rules keep parallel schemas apart on one server:
 

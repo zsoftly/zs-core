@@ -10,6 +10,14 @@
 // When ZS_TEST_POSTGRES_URL is unset and Docker is not reachable, New skips
 // the test with a message that says how to run it.
 //
+// A container server is faster still. The first call to New migrates one
+// template database; every later call clones it with CREATE DATABASE ...
+// TEMPLATE, which copies the files instead of running every migration and
+// then dropping a schema with its partitions under the lock below. Each test
+// then has a database of its own, not a schema, and DB.Schema names it. A
+// server named by ZS_TEST_POSTGRES_URL keeps the schema mode, because it may
+// not let the test user create databases, and a failed clone falls back to it.
+//
 // Migrating a schema and dropping it lock every table, index and partition
 // of the schema. Many test binaries doing that at once on one server run
 // out of Postgres's shared lock table, so the harness runs those two steps
@@ -32,6 +40,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	postgrescontainer "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -63,10 +72,11 @@ type DB struct {
 }
 
 type server struct {
-	url   string
-	admin *pgxpool.Pool
-	skip  string
-	err   error
+	url      string
+	admin    *pgxpool.Pool
+	skip     string
+	err      error
+	external bool
 }
 
 var (
@@ -76,6 +86,18 @@ var (
 
 // New returns a migrated, isolated schema for t.
 func New(t testing.TB) *DB {
+	t.Helper()
+	if db := newFromTemplate(t); db != nil {
+		return db
+	}
+	return NewSchema(t)
+}
+
+// NewSchema returns a migrated schema in the one database of the server, for
+// the tests whose subject is state that the schemas of one database share,
+// such as a server-wide advisory lock. Two calls give two schemas of the same
+// database, where New gives two databases that share nothing.
+func NewSchema(t testing.TB) *DB {
 	t.Helper()
 	db := NewEmpty(t)
 	err := withDDLLock(func() error {
@@ -172,6 +194,7 @@ func start() server {
 				return
 			}
 			shared.url = raw
+			shared.external = true
 		} else {
 			if reason := dockerUnavailable(ctx); reason != "" {
 				shared.skip = "integration test skipped: " + EnvURL + " is not set and Docker is not reachable (" + reason +
@@ -279,4 +302,118 @@ func randomHex(t testing.TB, n int) string {
 		t.Fatal(err)
 	}
 	return hex.EncodeToString(b)
+}
+
+var (
+	templateOnce sync.Once
+	templateName string
+	templateErr  error
+	// cloneMu serializes CREATE DATABASE ... TEMPLATE: Postgres refuses a
+	// copy of a template that another copy is reading.
+	cloneMu sync.Mutex
+)
+
+// newFromTemplate returns a migrated database cloned from the template of
+// this test binary, or nil when the schema mode is to be used: on a server
+// named by EnvURL, or when the template or the clone could not be made.
+func newFromTemplate(t testing.TB) *DB {
+	t.Helper()
+	srv := start()
+	if srv.skip != "" {
+		t.Skip(srv.skip)
+	}
+	if srv.err != nil {
+		t.Fatalf("start test Postgres: %v", srv.err)
+	}
+	if srv.external {
+		return nil
+	}
+	ctx := context.Background()
+	templateOnce.Do(func() { templateName, templateErr = buildTemplate(ctx, srv) })
+	if templateErr != nil {
+		t.Logf("template database unavailable, using a schema per test: %v", templateErr)
+		return nil
+	}
+	name := schemaPrefix + randomHex(t, 8)
+	if err := cloneDatabase(ctx, srv, name); err != nil {
+		t.Logf("cloning the template failed, using a schema per test: %v", err)
+		return nil
+	}
+	dbURL, err := withDatabase(srv.url, name)
+	if err != nil {
+		t.Fatalf("build database URL: %v", err)
+	}
+	cfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		t.Fatalf("parse test URL: %v", err)
+	}
+	cfg.MaxConns = 8
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("connect test database: %v", err)
+	}
+	t.Cleanup(func() {
+		pool.Close()
+		if _, err := srv.admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop test database %s: %v", name, err)
+		}
+	})
+	return &DB{Pool: pool, Schema: name, URL: dbURL}
+}
+
+// buildTemplate migrates the template database once.
+func buildTemplate(ctx context.Context, srv server) (string, error) {
+	name := "zs_tmpl_" + hex.EncodeToString(randomBytes(8))
+	if _, err := srv.admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		return "", fmt.Errorf("create template database: %w", err)
+	}
+	dbURL, err := withDatabase(srv.url, name)
+	if err != nil {
+		return "", err
+	}
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		return "", fmt.Errorf("connect template database: %w", err)
+	}
+	// The pool must be closed before the template is copied: Postgres does
+	// not copy a database that has sessions.
+	defer pool.Close()
+	if _, err := database.Migrate(ctx, pool, migrations.FS); err != nil {
+		return "", fmt.Errorf("migrate template database: %w", err)
+	}
+	return name, nil
+}
+
+// cloneDatabase copies the template into a new database, retrying while
+// Postgres still sees a session on the template.
+func cloneDatabase(ctx context.Context, srv server, name string) error {
+	cloneMu.Lock()
+	defer cloneMu.Unlock()
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		_, err = srv.admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{templateName}.Sanitize())
+		var pgErr *pgconn.PgError
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "55006" {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return err
+}
+
+func withDatabase(raw, name string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	u.Path = "/" + name
+	return u.String(), nil
+}
+
+func randomBytes(n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return b
 }

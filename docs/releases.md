@@ -49,6 +49,14 @@ The notes list, in this order:
 - the upgrade runbooks that apply, and the rehearsal rows added;
 - known issues, including upstream faults Core works around, each with the upstream issue link and the version that lets you remove the workaround.
 
+## Migrations that need a quiet window
+
+Most migrations apply while the service runs. List these in the release notes, with the window they need:
+
+| Migration | Why | What to do |
+| --- | --- | --- |
+| `000026_tenant_closure_review` | It creates a partial index on `usage_events`, which is partitioned by month. Postgres builds the index on every partition and holds a write lock on each while it does, so usage recording waits. | Run `zs-core migrate` in a quiet window, before the new version serves. |
+
 ## Taking a release in a product
 
 A product upgrades by moving to the new tag. It runs the runbooks for the components that changed, in the order the notes give, on a staging copy first. It never changes a component version on its own.

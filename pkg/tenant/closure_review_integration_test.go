@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/events"
 	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/tenant"
@@ -166,7 +167,7 @@ func TestClosureCompletesWithoutReviewWhenThereIsNoLegacyUsage(t *testing.T) {
 	}
 }
 
-// Review items and their resolutions are immutable.
+// Review items and their resolutions are immutable, each with its own message.
 func TestClosureReviewRecordsAreImmutable(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -181,18 +182,140 @@ func TestClosureReviewRecordsAreImmutable(t *testing.T) {
 	if err := tenant.ResolveClosureReview(ctx, e.db.Pool, tn.Scope(), items[0].ID, reviewActor, "reviewed", "corr-resolve"); err != nil {
 		t.Fatal(err)
 	}
-	for name, statement := range map[string]string{
-		"update item":         `UPDATE tenant_closure_review_items SET reason = reason`,
-		"delete item":         `DELETE FROM tenant_closure_review_items`,
-		"truncate item":       `TRUNCATE tenant_closure_review_items, tenant_closure_review_resolutions`,
-		"update resolution":   `UPDATE tenant_closure_review_resolutions SET note = 'changed'`,
-		"delete resolution":   `DELETE FROM tenant_closure_review_resolutions`,
-		"truncate resolution": `TRUNCATE tenant_closure_review_resolutions`,
+	// The items table is referenced by the resolutions table, so Postgres only
+	// lets a truncate of it through to the guard when both are named, and the
+	// first one named answers.
+	const item, resolution = "closure review item is immutable", "closure review resolution is immutable"
+	for _, tc := range []struct{ name, statement, message string }{
+		{"update item", `UPDATE tenant_closure_review_items SET reason = reason`, item},
+		{"delete item", `DELETE FROM tenant_closure_review_items`, item},
+		{"truncate both, item first", `TRUNCATE tenant_closure_review_items, tenant_closure_review_resolutions`, item},
+		{"update resolution", `UPDATE tenant_closure_review_resolutions SET note = 'changed'`, resolution},
+		{"delete resolution", `DELETE FROM tenant_closure_review_resolutions`, resolution},
+		{"truncate resolution", `TRUNCATE tenant_closure_review_resolutions`, resolution},
+		{"truncate both, resolution first", `TRUNCATE tenant_closure_review_resolutions, tenant_closure_review_items`, resolution},
 	} {
-		_, err := e.db.Pool.Exec(ctx, statement)
+		_, err := e.db.Pool.Exec(ctx, tc.statement)
 		var pgErr *pgconn.PgError
-		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != "closure review is immutable" {
-			t.Fatalf("%s = %v, want the immutable error", name, err)
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != tc.message {
+			t.Fatalf("%s = %v, want %q", tc.name, err, tc.message)
 		}
+	}
+}
+
+// Another tenant can neither list nor resolve this tenant's review items.
+func TestClosureReviewsAreScopedToTheirTenant(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn, _, _ := closingWithLegacyUsage(t, e, true, false)
+	if _, err := tenant.RecordClosureReviews(ctx, e.db.Pool, tn.Scope(), reviewActor, "corr"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := tenant.ListClosureReviews(ctx, e.db.Pool, tn.Scope())
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items = %+v %v", items, err)
+	}
+	other := e.mustOrg(e.person("other@example.test"), "Tenant B")
+	if listed, err := tenant.ListClosureReviews(ctx, e.db.Pool, other.Scope()); err != nil || len(listed) != 0 {
+		t.Fatalf("another tenant lists %+v %v", listed, err)
+	}
+	if err := tenant.ResolveClosureReview(ctx, e.db.Pool, other.Scope(), items[0].ID, reviewActor, "not mine", "corr-other"); !zserrors.IsCode(err, zserrors.CodeNotFound) {
+		t.Fatalf("another tenant resolves = %v, want not found", err)
+	}
+	if again, err := tenant.ListClosureReviews(ctx, e.db.Pool, tn.Scope()); err != nil || len(again) != 1 || again[0].Resolved {
+		t.Fatalf("the item changed: %+v %v", again, err)
+	}
+}
+
+// A rollup of protocol 0 that was rejected is unbilled usage too: it blocks
+// completion until staff review it.
+func TestClosureRejectedLegacyRollupBlocksCompletion(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn, _, _ := closingWithLegacyUsage(t, e, false, false)
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO usage_rollups (id, brand_id, tenant_id, killbill_unit, day, period_start, record_at,
+    quantity_micro, events, tracking_id, status, reject_reason, rejected_at)
+VALUES ($1, $2, $3, 'api-call', current_date, now(), now(), 9, 1, 'legacy-rejected', 'rejected', 'before_subscription_start', now())`,
+		idgen.MustNewV7(), tn.BrandID, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	var pgErr *pgconn.PgError
+	if err := complete(e, tn); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("completion with a rejected legacy rollup = %v, want a check violation", err)
+	}
+	if result, err := tenant.RecordClosureReviews(ctx, e.db.Pool, tn.Scope(), reviewActor, "corr"); err != nil || result.Recorded != 1 {
+		t.Fatalf("record = %+v %v", result, err)
+	}
+	items, err := tenant.ListClosureReviews(ctx, e.db.Pool, tn.Scope())
+	if err != nil || len(items) != 1 || items[0].Kind != "legacy_usage_rollups" || items[0].Count != 1 {
+		t.Fatalf("items = %+v %v", items, err)
+	}
+	if err := complete(e, tn); err == nil {
+		t.Fatal("completion with an unresolved review succeeded")
+	}
+	if err := tenant.ResolveClosureReview(ctx, e.db.Pool, tn.Scope(), items[0].ID, reviewActor, "rejected usage reviewed with finance", "corr-resolve"); err != nil {
+		t.Fatal(err)
+	}
+	if err := complete(e, tn); err != nil {
+		t.Fatalf("completion after the review = %v", err)
+	}
+}
+
+// A review pins what was reviewed. Legacy usage that appears after it needs
+// another review, for the larger count.
+func TestClosureLegacyUsageThatGrowsAfterReviewNeedsAnotherReview(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn, _, _ := closingWithLegacyUsage(t, e, true, false)
+	if _, err := tenant.RecordClosureReviews(ctx, e.db.Pool, tn.Scope(), reviewActor, "corr"); err != nil {
+		t.Fatal(err)
+	}
+	items, err := tenant.ListClosureReviews(ctx, e.db.Pool, tn.Scope())
+	if err != nil || len(items) != 1 || items[0].Count != 1 {
+		t.Fatalf("items = %+v %v", items, err)
+	}
+	if err := tenant.ResolveClosureReview(ctx, e.db.Pool, tn.Scope(), items[0].ID, reviewActor, "one event reviewed", "corr-resolve"); err != nil {
+		t.Fatal(err)
+	}
+	var meterID idgen.UUID
+	if err := e.db.Pool.QueryRow(ctx, `SELECT id FROM meters WHERE brand_id = $1 AND slug = 'legacy-meter'`, tn.BrandID).Scan(&meterID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO usage_events (id, brand_id, tenant_id, meter_id, event_id, killbill_unit, quantity_micro,
+    dimensions, dimensions_key, occurred_at, received_at) VALUES ($1, $2, $3, $4, 'legacy-b', 'api-call', 3, '{}'::jsonb, '{}', now(), now())`,
+		idgen.MustNewV7(), tn.BrandID, tn.ID, meterID); err != nil {
+		t.Fatal(err)
+	}
+	var pgErr *pgconn.PgError
+	if err := complete(e, tn); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("completion after the usage grew = %v, want a check violation", err)
+	}
+	if result, err := tenant.RecordClosureReviews(ctx, e.db.Pool, tn.Scope(), reviewActor, "corr-2"); err != nil || result.Recorded != 1 {
+		t.Fatalf("second record = %+v %v", result, err)
+	}
+	if again, err := tenant.RecordClosureReviews(ctx, e.db.Pool, tn.Scope(), reviewActor, "corr-3"); err != nil || again.Recorded != 0 {
+		t.Fatalf("a third record = %+v %v, want none", again, err)
+	}
+	items, err = tenant.ListClosureReviews(ctx, e.db.Pool, tn.Scope())
+	if err != nil || len(items) != 2 {
+		t.Fatalf("items = %+v %v", items, err)
+	}
+	var fresh tenant.ClosureReview
+	for _, it := range items {
+		if it.Count == 2 {
+			fresh = it
+		}
+	}
+	if fresh.Count != 2 || fresh.Resolved {
+		t.Fatalf("items = %+v", items)
+	}
+	if err := complete(e, tn); err == nil {
+		t.Fatal("completion before the new review was resolved succeeded")
+	}
+	if err := tenant.ResolveClosureReview(ctx, e.db.Pool, tn.Scope(), fresh.ID, reviewActor, "both events reviewed", "corr-resolve-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := complete(e, tn); err != nil {
+		t.Fatalf("completion after the second review = %v", err)
 	}
 }

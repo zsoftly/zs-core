@@ -47,7 +47,7 @@ type ClosureReviewResult struct {
 
 // RecordClosureReviews records a required manual review item for each kind of
 // legacy usage a closing tenant holds that was never forwarded: raw events in
-// no rollup, and rollups still pending. It is idempotent, audits each item it
+// no rollup, and rollups still pending or rejected. It is idempotent, audits each item it
 // records as tenant.closure_review_required, and never changes the usage.
 func RecordClosureReviews(ctx context.Context, db DB, sc scope.Scope, actor events.Actor, correlationID string) (ClosureReviewResult, error) {
 	if _, ok := db.(pgx.Tx); ok {
@@ -72,7 +72,7 @@ WHERE s.brand_id = $1 AND s.tenant_id = $2 FOR UPDATE OF s`, sc.Brand, sc.Tenant
 			{ClosureReviewLegacyUsageEvents, closureReasonLegacyUsageUnbilled, `SELECT count(*), coalesce(sum(quantity_micro), 0) FROM usage_events
 WHERE brand_id = $1 AND tenant_id = $2 AND acceptance_protocol = 0 AND reservation_id IS NULL AND rollup_id IS NULL`},
 			{ClosureReviewLegacyUsageRollups, closureReasonLegacyRollupUnsent, `SELECT count(*), coalesce(sum(quantity_micro), 0) FROM usage_rollups
-WHERE brand_id = $1 AND tenant_id = $2 AND send_protocol = 0 AND status = 'pending'`},
+WHERE brand_id = $1 AND tenant_id = $2 AND send_protocol = 0 AND status IN ('pending', 'rejected')`},
 		} {
 			var count, quantity int64
 			if err := tx.QueryRow(ctx, k.count, sc.Brand, sc.Tenant).Scan(&count, &quantity); err != nil {
@@ -82,9 +82,12 @@ WHERE brand_id = $1 AND tenant_id = $2 AND send_protocol = 0 AND status = 'pendi
 				continue
 			}
 			itemID := idgen.MustNewV7()
-			tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_review_items (brand_id, tenant_id, id, kind, reason, evidence, correlation_id)
-VALUES ($1, $2, $3, $4, $5, jsonb_build_object('count', $6::bigint, 'quantity_micro', $7::bigint), $8)
-ON CONFLICT (brand_id, tenant_id, kind) DO NOTHING`, sc.Brand, sc.Tenant, itemID, k.kind, k.reason, count, quantity, correlationID)
+			// An item already covers the usage held now when one exists for at
+			// least this count. Usage that grew since needs a new item.
+			tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_review_items (brand_id, tenant_id, id, kind, reason, item_count, evidence, correlation_id)
+SELECT $1, $2, $3, $4, $5, $6::bigint, jsonb_build_object('count', $6::bigint, 'quantity_micro', $7::bigint), $8
+WHERE NOT EXISTS (SELECT 1 FROM tenant_closure_review_items WHERE brand_id = $1 AND tenant_id = $2 AND kind = $4 AND item_count >= $6::bigint)
+ON CONFLICT (brand_id, tenant_id, kind, item_count) DO NOTHING`, sc.Brand, sc.Tenant, itemID, k.kind, k.reason, count, quantity, correlationID)
 			if err != nil {
 				return unavailable(err)
 			}
@@ -151,7 +154,7 @@ func ListClosureReviews(ctx context.Context, q Querier, sc scope.Scope) ([]Closu
 	if err != nil {
 		return nil, err
 	}
-	rows, err := q.Query(ctx, `SELECT i.id, i.kind, i.reason, coalesce((i.evidence->>'count')::bigint, 0), i.recorded_at,
+	rows, err := q.Query(ctx, `SELECT i.id, i.kind, i.reason, i.item_count, i.recorded_at,
     r.item_id IS NOT NULL, coalesce(r.resolved_by, ''), coalesce(r.note, '')
 FROM tenant_closure_review_items i
 LEFT JOIN tenant_closure_review_resolutions r ON r.item_id = i.id

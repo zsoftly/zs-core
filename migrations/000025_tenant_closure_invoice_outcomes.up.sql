@@ -39,3 +39,21 @@ END;
 $$;
 CREATE TRIGGER tenant_closure_invoice_outcome_tie BEFORE INSERT ON tenant_closure_invoice_outcomes
 FOR EACH ROW EXECUTE FUNCTION tenant_closure_invoice_outcome_tie();
+
+CREATE FUNCTION tenant_closure_invoice_outcome_exclusive() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.kind = 'no_invoice' AND EXISTS (
+        SELECT 1 FROM tenant_closure_invoice_outcomes o WHERE o.attempt_id = NEW.attempt_id AND o.kind IN ('started', 'invoice_id', 'post_unknown')
+    ) THEN
+        RAISE EXCEPTION 'closure invoice already started, so it cannot have nothing to invoice' USING ERRCODE = 'check_violation';
+    END IF;
+    IF NEW.kind IN ('started', 'invoice_id') AND EXISTS (
+        SELECT 1 FROM tenant_closure_invoice_outcomes o WHERE o.attempt_id = NEW.attempt_id AND o.kind = 'no_invoice'
+    ) THEN
+        RAISE EXCEPTION 'closure invoice has nothing to invoice, so it cannot start' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER tenant_closure_invoice_outcome_exclusive BEFORE INSERT ON tenant_closure_invoice_outcomes
+FOR EACH ROW EXECUTE FUNCTION tenant_closure_invoice_outcome_exclusive();

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -722,7 +723,15 @@ func answerPreflight(w http.ResponseWriter, r *http.Request, tn tenant.Tenant, d
 // kbMode says how the Kill Bill of claimedClosure answers.
 // lookup: 0 the stored tenant, 1 another tenant, 2 unavailable.
 // post: 0 created, 2 slow, 3 a bare 404. dry and account are as for answerPreflight.
-type kbMode struct{ lookup, post, dry, account atomic.Int32 }
+type kbMode struct {
+	lookup, post, dry, account atomic.Int32
+	// holdFirstDry, when set, makes the first dry run say it signalled on
+	// dryHeld and then wait for dryRelease before it answers 204.
+	holdFirstDry bool
+	dryHeld      chan struct{}
+	dryRelease   chan struct{}
+	dryOnce      sync.Once
+}
 
 // claimedClosure is a closing tenant with a claimed, not yet executed,
 // closure invoice, and a Kill Bill whose tenant lookup answers as lookup
@@ -758,6 +767,16 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 				answerTenantLookup(w, r, tn.BrandID)
 			}
 			return
+		}
+		if m.holdFirstDry && r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices/dryRun" {
+			first := false
+			m.dryOnce.Do(func() { first = true })
+			if first {
+				close(m.dryHeld)
+				<-m.dryRelease
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 		}
 		if answerPreflight(w, r, tn, m.dry.Load(), m.account.Load()) {
 			return
@@ -1008,5 +1027,131 @@ FOR EACH ROW WHEN (NEW.kind = 'invoice_id') EXECUTE FUNCTION closure_outcome_fai
 	result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
 	if err != nil || !result.Posted || !result.Evidenced || posts.Load() != 1 {
 		t.Fatalf("execution = %+v %v posts=%d", result, err, posts.Load())
+	}
+}
+
+// A started attempt and a no_invoice outcome exclude each other, in both
+// directions, so a real invoice can never be hidden by an answer of nothing.
+func TestClosureInvoiceNoInvoiceAndStartExcludeEachOther(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	p := e.person("owner@example.test")
+	tn := e.mustOrg(p, "Tenant A")
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status)
+VALUES ($1, $2, now(), 'finance_pending')`, tn.BrandID, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	newAttempt := func(date string) idgen.UUID {
+		id := idgen.MustNewV7()
+		// An attempt per target date lets one tenant hold two attempts in the test only if the
+		// table allows it; it holds one, so the second case below uses a fresh tenant.
+		if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_attempts (id, brand_id, tenant_id, killbill_tenant_id, killbill_account_id, target_date)
+VALUES ($1, $2, $3, $2, $4::uuid, $5::date)`, id, tn.BrandID, tn.ID, tn.KillBillAccountID, date); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	insert := func(attempt idgen.UUID, kind string, invoice, currency any) error {
+		_, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, invoice_id, expected_currency) VALUES ($1, $2, $3, $4, $5)`,
+			idgen.MustNewV7(), attempt, kind, invoice, currency)
+		return err
+	}
+	violation := func(err error, what string) {
+		t.Helper()
+		var pgErr *pgconn.PgError
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("%s = %v, want a check violation", what, err)
+		}
+	}
+	attempt := newAttempt("2026-12-31")
+	if err := insert(attempt, "started", nil, "CAD"); err != nil {
+		t.Fatal(err)
+	}
+	violation(insert(attempt, "no_invoice", nil, nil), "no_invoice after started")
+	recorded := idgen.MustNewV7()
+	if err := insert(attempt, "invoice_id", recorded, nil); err != nil {
+		t.Fatal(err)
+	}
+	violation(insert(attempt, "no_invoice", nil, nil), "no_invoice after invoice_id")
+}
+
+// The other direction, with its own tenant: no_invoice first, then started.
+func TestClosureInvoiceStartIsRefusedAfterNoInvoice(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	p := e.person("owner@example.test")
+	tn := e.mustOrg(p, "Tenant A")
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status)
+VALUES ($1, $2, now(), 'finance_pending')`, tn.BrandID, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	attempt := idgen.MustNewV7()
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_attempts (id, brand_id, tenant_id, killbill_tenant_id, killbill_account_id, target_date)
+VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, attempt, tn.BrandID, tn.ID, tn.KillBillAccountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind) VALUES ($1, $2, 'no_invoice')`, idgen.MustNewV7(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, expected_currency) VALUES ($1, $2, 'started', 'CAD')`, idgen.MustNewV7(), attempt)
+	var pgErr *pgconn.PgError
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Fatalf("started after no_invoice = %v, want a check violation", err)
+	}
+}
+
+// The timeline that hid a real invoice: executor Y reads that nothing is
+// recorded, executor X starts and posts, and only then Y's dry run answers
+// 204. Y must not record no_invoice.
+func TestClosureInvoiceStaleDryRunCannotHideARealInvoice(t *testing.T) {
+	m := &kbMode{holdFirstDry: true, dryHeld: make(chan struct{}), dryRelease: make(chan struct{})}
+	var posts, lookups atomic.Int64
+	e, tn := claimedClosure(t, m, &posts, &lookups)
+	ctx := context.Background()
+	type outcome struct {
+		result tenant.ClosureExecutionResult
+		err    error
+	}
+	yDone := make(chan outcome, 1)
+	go func() {
+		result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
+		yDone <- outcome{result, err}
+	}()
+	<-m.dryHeld
+	// Executor X runs to the end while Y waits in its dry run.
+	if result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err != nil || !result.Posted || !result.Evidenced {
+		t.Fatalf("executor X = %+v %v", result, err)
+	}
+	close(m.dryRelease)
+	y := <-yDone
+	if y.err == nil || y.result.NoInvoice {
+		t.Fatalf("executor Y = %+v %v, want a refusal", y.result, y.err)
+	}
+	var noInvoice, started, evidenced int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'no_invoice'), count(*) FILTER (WHERE kind = 'started'), count(*) FILTER (WHERE kind = 'evidenced')
+FROM tenant_closure_invoice_outcomes`).Scan(&noInvoice, &started, &evidenced); err != nil || noInvoice != 0 || started != 1 || evidenced != 1 || posts.Load() != 1 {
+		t.Fatalf("no_invoice = %d started = %d evidenced = %d posts = %d, %v", noInvoice, started, evidenced, posts.Load(), err)
+	}
+}
+
+// When every try to record the invoice ID fails, the error names the
+// invoice, so staff can find it in Kill Bill.
+func TestClosureInvoiceFinalizeFailureNamesTheInvoice(t *testing.T) {
+	var m kbMode
+	var posts, lookups atomic.Int64
+	e, tn := claimedClosure(t, &m, &posts, &lookups)
+	ctx := context.Background()
+	for _, sql := range []string{
+		`CREATE FUNCTION closure_outcome_always_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected failure'; END; $$`,
+		`CREATE TRIGGER a_closure_outcome_always_fail BEFORE INSERT ON tenant_closure_invoice_outcomes
+FOR EACH ROW WHEN (NEW.kind = 'invoice_id') EXECUTE FUNCTION closure_outcome_always_fail()`,
+	} {
+		if _, err := e.db.Pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
+	if err == nil || !regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`).MatchString(err.Error()) {
+		t.Fatalf("error = %v, want it to name the invoice ID", err)
 	}
 }

@@ -3,6 +3,7 @@ package tenant
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -178,7 +179,8 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 	if err != nil {
 		return ClosureExecutionResult{}, err
 	}
-	if noInvoice {
+	// A recorded start or invoice always wins: a real invoice is never hidden.
+	if noInvoice && !recorded {
 		return ClosureExecutionResult{NoInvoice: true}, nil
 	}
 	if recorded && invoiceID == "" {
@@ -221,7 +223,30 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 			return ClosureExecutionResult{}, engineError(err)
 		}
 		if !found {
-			if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "no_invoice", ""); err != nil {
+			// The dry run may be stale: another executor can have started and
+			// posted since this one read. So no_invoice is recorded under the
+			// attempt lock, and only while nothing has been started.
+			err := withClosureWriteRetries(func() error {
+				return pgx.BeginFunc(context.WithoutCancel(ctx), db, func(tx pgx.Tx) error {
+					if err := lock(tx); err != nil {
+						return err
+					}
+					var begun bool
+					if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes
+WHERE attempt_id = $1 AND kind IN ('started', 'invoice_id', 'post_unknown'))`, attemptID).Scan(&begun); err != nil {
+						return unavailable(err)
+					}
+					if begun {
+						return manualReview
+					}
+					if _, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind) VALUES ($1, $2, 'no_invoice')
+ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID); err != nil {
+						return unavailable(err)
+					}
+					return nil
+				})
+			})
+			if err != nil {
 				return ClosureExecutionResult{}, err
 			}
 			return ClosureExecutionResult{NoInvoice: true}, nil
@@ -230,8 +255,16 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 			if err := lock(tx); err != nil {
 				return err
 			}
-			if rec.KillBillTenantID != read.KillBillTenantID || rec.KillBillAPIKey != read.KillBillAPIKey {
+			if rec.KillBillTenantID != read.KillBillTenantID || rec.KillBillAPIKey != read.KillBillAPIKey ||
+				rec.KillBillAPISecretRef != read.KillBillAPISecretRef || rec.Status != read.Status {
 				return manualReview
+			}
+			var nothing bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes WHERE attempt_id = $1 AND kind = 'no_invoice')`, attemptID).Scan(&nothing); err != nil {
+				return unavailable(err)
+			}
+			if nothing {
+				return errClosureNothingToInvoice
 			}
 			tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, expected_currency)
 VALUES ($1, $2, 'started', $3)
@@ -242,6 +275,9 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expect
 			started = tag.RowsAffected() == 1
 			return nil
 		})
+		if errors.Is(err, errClosureNothingToInvoice) {
+			return ClosureExecutionResult{NoInvoice: true}, nil
+		}
 		if err != nil {
 			return ClosureExecutionResult{}, err
 		}
@@ -282,17 +318,37 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expect
 	return ClosureExecutionResult{Posted: started, Evidenced: true}, nil
 }
 
-// recordClosureInvoiceOutcome writes one outcome apart from the caller's
-// context, because it often records what Kill Bill just answered. A database
-// failure is retried a few times; a refusal is not.
-func recordClosureInvoiceOutcome(ctx context.Context, db DB, sc scope.Scope, attemptID idgen.UUID, kind, invoiceID string) error {
-	ctx = context.WithoutCancel(ctx)
+// errClosureNothingToInvoice stops a start that finds nothing-to-invoice
+// already recorded for the attempt.
+var errClosureNothingToInvoice = errors.New("closure invoice has nothing to invoice")
+
+// withClosureWriteRetries runs a database write, trying it up to
+// closureWriteAttempts times when it fails because the database is
+// unavailable, and waiting longer between tries, but not after the last.
+func withClosureWriteRetries(write func() error) error {
 	var err error
 	for attempt := 0; attempt < closureWriteAttempts; attempt++ {
-		if err = recordClosureInvoiceOutcomeOnce(ctx, db, sc, attemptID, kind, invoiceID); err == nil || !zserrors.IsCode(err, zserrors.CodeDatabaseUnavailable) {
+		if err = write(); err == nil || !zserrors.IsCode(err, zserrors.CodeDatabaseUnavailable) {
 			return err
 		}
-		time.Sleep(time.Duration(attempt+1) * closureWriteBackoff)
+		if attempt < closureWriteAttempts-1 {
+			time.Sleep(time.Duration(attempt+1) * closureWriteBackoff)
+		}
+	}
+	return err
+}
+
+// recordClosureInvoiceOutcome writes one outcome apart from the caller's
+// context, because it often records what Kill Bill just answered. A database
+// failure is retried a few times; a refusal is not. When every try fails the
+// error names the invoice, so staff can find it in Kill Bill.
+func recordClosureInvoiceOutcome(ctx context.Context, db DB, sc scope.Scope, attemptID idgen.UUID, kind, invoiceID string) error {
+	ctx = context.WithoutCancel(ctx)
+	err := withClosureWriteRetries(func() error {
+		return recordClosureInvoiceOutcomeOnce(ctx, db, sc, attemptID, kind, invoiceID)
+	})
+	if err != nil && invoiceID != "" {
+		return fmt.Errorf("closure invoice %s outcome %q not recorded: %w", invoiceID, kind, err)
 	}
 	return err
 }

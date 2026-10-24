@@ -4,6 +4,7 @@ package tenant_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,8 @@ import (
 // fakeClosureSteps stands in for the Kill Bill cancellation and block.
 type fakeClosureSteps struct {
 	prepared tenant.ClosurePrepared
+	// prepareErr, when set, is what Prepare returns.
+	prepareErr error
 	// onPrepare, when set, runs inside Prepare, for a step that is slow or stuck.
 	onPrepare func(ctx context.Context, sc scope.Scope)
 	block     bool
@@ -34,6 +37,9 @@ func (f *fakeClosureSteps) Prepare(ctx context.Context, _ tenant.DB, sc scope.Sc
 	}
 	if err := ctx.Err(); err != nil {
 		return tenant.ClosurePrepared{}, err
+	}
+	if f.prepareErr != nil {
+		return tenant.ClosurePrepared{}, f.prepareErr
 	}
 	return f.prepared, nil
 }
@@ -305,5 +311,156 @@ func TestClosureSweepStoppedByItsCallerResumesAtTheSameTenant(t *testing.T) {
 	order := prepareOrder(steps)
 	if len(order) < 2 || order[1] != interrupted[0] {
 		t.Fatalf("after the restart the first tenant was %v, want %s again; order %v", order, interrupted[0], order)
+	}
+}
+
+func delaySeconds(t *testing.T, e *env, tn tenant.Tenant) (attempts int, delay float64, lastError string) {
+	t.Helper()
+	if err := e.db.Pool.QueryRow(context.Background(), `SELECT attempts, extract(epoch FROM next_attempt_at - now()), coalesce(last_error, '')
+FROM tenant_closure_settlements WHERE tenant_id = $1`, tn.ID).Scan(&attempts, &delay, &lastError); err != nil {
+		t.Fatal(err)
+	}
+	return attempts, delay, lastError
+}
+
+func makeDue(t *testing.T, e *env, tn tenant.Tenant) {
+	t.Helper()
+	if _, err := e.db.Pool.Exec(context.Background(), `UPDATE tenant_closure_settlements SET next_attempt_at = now() - interval '1 second' WHERE tenant_id = $1`, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A failing step backs the tenant off: ten seconds, then twice as long each
+// time, up to an hour, and the settlement keeps the name of the error and
+// never its text.
+func TestClosureSweepBacksOffAFailingTenantAndKeepsOnlyTheErrorName(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn := threeClosing(t, e)[0]
+	for _, other := range threeClosing(t, e)[1:] {
+		_ = other
+	}
+	steps := &fakeClosureSteps{prepareErr: errors.New("secret-marker: Kill Bill said the token is hunter2")}
+	sweeper := &tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, ClosureWork: 1}
+	within := func(what string, got, low, high float64) {
+		t.Helper()
+		if got < low || got > high {
+			t.Fatalf("%s = %.1f seconds, want %.0f to %.0f", what, got, low, high)
+		}
+	}
+	for i, want := range []float64{10, 20, 40} {
+		makeDue(t, e, tn)
+		// ClosureWork 1 and the cursor: reach the tenant under test first.
+		if _, err := e.db.Pool.Exec(ctx, `DELETE FROM sweep_cursor WHERE kind = 'closure'`); err != nil {
+			t.Fatal(err)
+		}
+		report, err := sweeper.SweepOnce(ctx)
+		if err != nil || report.ClosuresFailed != 1 {
+			t.Fatalf("pass %d = %+v %v", i+1, report, err)
+		}
+		attempts, delay, lastError := delaySeconds(t, e, tn)
+		if attempts != i+1 || lastError != "internal_error" {
+			t.Fatalf("pass %d: attempts = %d last_error = %q", i+1, attempts, lastError)
+		}
+		within("backoff after attempt "+string(rune('1'+i)), delay, want-3, want+1)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_closure_settlements SET attempts = 20, next_attempt_at = now() - interval '1 second' WHERE tenant_id = $1`, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `DELETE FROM sweep_cursor WHERE kind = 'closure'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sweeper.SweepOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_, delay, _ := delaySeconds(t, e, tn)
+	within("the capped backoff", delay, 3590, 3601)
+	var leaked bool
+	if err := e.db.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_settlements WHERE last_error ILIKE '%hunter2%' OR last_error ILIKE '%secret-marker%')`).Scan(&leaked); err != nil || leaked {
+		t.Fatalf("the error text reached the settlement: %v %v", leaked, err)
+	}
+}
+
+// A tenant that waits for a step, or for a person, is looked at again after
+// five minutes, not on the next pass.
+func TestClosureSweepRechecksAWaitingTenantAfterFiveMinutes(t *testing.T) {
+	m := &kbMode{noClaim: true, startCancelling: true}
+	var posts, lookups atomic.Int64
+	e, tn := claimedClosure(t, m, &posts, &lookups)
+	steps := &fakeClosureSteps{}
+	if report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps}).SweepOnce(context.Background()); err != nil || report.ClosuresWaiting != 1 {
+		t.Fatalf("pass = %+v %v", report, err)
+	}
+	attempts, delay, _ := delaySeconds(t, e, tn)
+	if attempts != 0 || delay < 290 || delay > 301 {
+		t.Fatalf("waiting: attempts = %d recheck in %.0f seconds, want 0 and about 300", attempts, delay)
+	}
+	// A pass right after does not look at it again.
+	if report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps}).SweepOnce(context.Background()); err != nil || report.ClosuresChecked != 0 {
+		t.Fatalf("second pass = %+v %v, want none due", report, err)
+	}
+}
+
+// Manual review waits five minutes too.
+func TestClosureSweepRechecksAManualReviewTenantAfterFiveMinutes(t *testing.T) {
+	m := &kbMode{noClaim: true, startCancelling: true}
+	var posts, lookups atomic.Int64
+	e, tn := claimedClosure(t, m, &posts, &lookups)
+	addLegacyEvent(t, e, tn)
+	steps := &fakeClosureSteps{prepared: ready(), block: true}
+	if report, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps}).SweepOnce(context.Background()); err != nil || report.ClosuresManualReview != 1 {
+		t.Fatalf("pass = %+v %v", report, err)
+	}
+	attempts, delay, _ := delaySeconds(t, e, tn)
+	if attempts != 0 || delay < 290 || delay > 301 {
+		t.Fatalf("manual review: attempts = %d recheck in %.0f seconds, want 0 and about 300", attempts, delay)
+	}
+}
+
+// The scan budget stops a pass, and one pass looks at no tenant twice.
+func TestClosureSweepScanBudgetAndNoTenantTwiceInAPass(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tenants := threeClosing(t, e)
+	steps := &fakeClosureSteps{}
+	scanned, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, ClosureScan: 2}).SweepOnce(ctx)
+	if err != nil || scanned.ClosuresChecked != 2 || len(prepareOrder(steps)) != 2 {
+		t.Fatalf("pass with a scan budget of 2 = %+v %v, steps %v", scanned, err, prepareOrder(steps))
+	}
+	// A plain pass reaches the rest, each tenant once.
+	if _, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps}).SweepOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	order := prepareOrder(steps)
+	seen := map[string]int{}
+	for _, id := range order {
+		seen[id]++
+	}
+	if len(order) != 3 || len(seen) != 3 {
+		t.Fatalf("steps ran %v, want each of the %d tenants once", order, len(tenants))
+	}
+}
+
+// When no tenant is due, the cursor wraps to the start.
+func TestClosureSweepCursorWrapsWhenNoTenantIsDue(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	threeClosing(t, e)
+	sweeper := &tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: &fakeClosureSteps{}, ClosureWork: 1}
+	for i := 0; i < 3; i++ {
+		if _, err := sweeper.SweepOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var positioned bool
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id IS NOT NULL FROM sweep_cursor WHERE kind = 'closure'`).Scan(&positioned); err != nil || !positioned {
+		t.Fatalf("the cursor after three passes: positioned = %v, %v", positioned, err)
+	}
+	if report, err := sweeper.SweepOnce(ctx); err != nil || report.ClosuresChecked != 0 {
+		t.Fatalf("pass with none due = %+v %v", report, err)
+	}
+	var wrapped bool
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id IS NULL AND last_eligible_at IS NULL FROM sweep_cursor WHERE kind = 'closure'`).Scan(&wrapped); err != nil || !wrapped {
+		t.Fatalf("the cursor after an empty page: wrapped = %v, %v", wrapped, err)
 	}
 }

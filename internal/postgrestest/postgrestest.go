@@ -449,3 +449,15 @@ func disableSettlementStartRule(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	return nil
 }
+
+// EnableSettlementStartRule turns the closure settlement start rule back on
+// for db, which the harness turns off on its databases so that fixtures can
+// insert a settlement at a later state. A test of code that creates a
+// settlement calls it, so the code runs under the rule it will meet in a
+// deployment.
+func EnableSettlementStartRule(t testing.TB, db *DB) {
+	t.Helper()
+	if _, err := db.Pool.Exec(context.Background(), `ALTER TABLE tenant_closure_settlements ENABLE TRIGGER tenant_closure_settlement_start`); err != nil {
+		t.Fatalf("enable the settlement start rule: %v", err)
+	}
+}

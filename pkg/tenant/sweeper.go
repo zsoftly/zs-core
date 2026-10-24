@@ -39,6 +39,8 @@ type Sweeper struct {
 	Closure ClosureSteps
 	// ClosureWork is how many closing tenants one pass drives. Zero means 50.
 	ClosureWork int
+	// ClosureScan is how many closing tenants one pass looks at. Zero means 500.
+	ClosureScan int
 	// PassBudget is how long one closure pass may run. Zero means 30 seconds.
 	PassBudget time.Duration
 	// CallBudget is how long one closure step call may run. Zero means 5

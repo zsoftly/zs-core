@@ -21,7 +21,10 @@ type ClosurePrepared struct {
 }
 
 // ClosureSteps are the closure steps the sweep cannot do itself. The real Kill
-// Bill cancellation and account block plug in here.
+// Bill cancellation and account block plug in here. Both steps must be
+// idempotent: a pass can be stopped or fail at any point, and the next pass
+// calls the same step again, so a step reads what is already done before it
+// does anything and does only what is missing.
 type ClosureSteps interface {
 	// Prepare cancels what must be cancelled and reports whether the
 	// cancellation and the usage drain are complete, and the date finance
@@ -78,6 +81,13 @@ func (s *Sweeper) callBudget() time.Duration {
 	return s.CallBudget
 }
 
+func (s *Sweeper) closureScan() int {
+	if s.ClosureScan <= 0 {
+		return closureScanBudget
+	}
+	return s.ClosureScan
+}
+
 func (s *Sweeper) closureWork() int {
 	if s.ClosureWork <= 0 {
 		return closureWorkBudget
@@ -99,9 +109,9 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 		return err
 	}
 	work, scanned := 0, 0
-	for scanned < closureScanBudget && work < s.closureWork() {
+	for scanned < s.closureScan() && work < s.closureWork() {
 		limit := s.batch()
-		if remaining := closureScanBudget - scanned; limit > remaining {
+		if remaining := s.closureScan() - scanned; limit > remaining {
 			limit = remaining
 		}
 		due, err := s.closurePage(passCtx, guard, passCutoff, eligibleAt, tenantID, limit)
@@ -112,7 +122,7 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 			return s.advanceClosureCursor(passCtx, guard, closureCandidate{}, true)
 		}
 		for _, c := range due {
-			if scanned >= closureScanBudget || work >= s.closureWork() {
+			if scanned >= s.closureScan() || work >= s.closureWork() {
 				break
 			}
 			scanned++
@@ -147,7 +157,11 @@ func (s *Sweeper) completeClosures(ctx context.Context, guard *LifecycleSweep, c
 					}
 					s.log().Warn("closure step failed", "tenant_id", c.scope.TenantID(), "error", driveErr.Error())
 				}
-				s.recordClosureOutcome(settle, guard, c, outcome, driveErr)
+				// The schedule is written with a short context of its own, so
+				// that a pass context that ends right now cannot lose it.
+				scheduleCtx, scheduleCancel := settleContext(ctx)
+				s.recordClosureOutcome(scheduleCtx, guard, c, outcome, driveErr)
+				scheduleCancel()
 				switch outcome {
 				case closureAdvanced, closureDone:
 					report.ClosuresAdvanced++

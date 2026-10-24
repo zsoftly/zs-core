@@ -5,10 +5,12 @@ package tenant_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/zsoftly/zs-core/internal/postgrestest"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/tenant"
@@ -271,5 +273,37 @@ func TestClosureSettlementFreezesRecordedStepsAndCompletedRows(t *testing.T) {
 	var pgErr *pgconn.PgError
 	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != "a completed closure settlement is frozen" {
 		t.Fatalf("changing a completed settlement = %v, want it frozen", err)
+	}
+}
+
+// The start rule needs every evidence column empty, not only the status.
+func TestClosureSettlementStartsEmpty(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	postgrestest.EnableSettlementStartRule(t, e.db)
+	for name, column := range map[string]string{
+		"cancellation_completed_at": "cancellation_completed_at = now()",
+		"drain_completed_at":        "drain_completed_at = now()",
+		"finance_target_date":       "finance_target_date = current_date",
+		"finance_completed_at":      "finance_completed_at = now()",
+		"blocked_at":                "blocked_at = now()",
+		"completed_at":              "completed_at = now()",
+		"last_error":                "last_error = 'x'",
+		"attempts":                  "attempts = 3",
+	} {
+		tn := e.mustOrg(e.person(name+"@example.test"), "Tenant "+name)
+		set := column
+		col := set[:strings.Index(set, " =")]
+		_, err := e.db.Pool.Exec(ctx, `WITH t AS (SELECT $1::uuid AS brand_id, $2::uuid AS tenant_id)
+INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status, `+col+`)
+SELECT brand_id, tenant_id, now(), 'cancelling', `+set[strings.Index(set, "= ")+2:]+` FROM t`, tn.BrandID, tn.ID)
+		var pgErr *pgconn.PgError
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("a settlement started with %s set = %v, want a check violation", name, err)
+		}
+	}
+	tn := e.mustOrg(e.person("clean@example.test"), "Tenant clean")
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ($1, $2, now())`, tn.BrandID, tn.ID); err != nil {
+		t.Fatalf("an empty settlement at cancelling = %v", err)
 	}
 }

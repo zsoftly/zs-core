@@ -96,6 +96,9 @@ type Service struct {
 	Log     *slog.Logger
 	// Now defaults to time.Now.
 	Now func() time.Time
+	// ClaimTTL is how long a forwarder holds a claim; it defaults to two
+	// minutes.
+	ClaimTTL time.Duration
 }
 
 func (s *Service) now() time.Time {

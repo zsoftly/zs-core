@@ -44,5 +44,17 @@ func (s *Service) BindTarget(ctx context.Context, c Claimed, subscription string
 	if t, err = acct.UsageTarget(ctx, subscription); err != nil {
 		return false, err
 	}
+	bound, _, err := s.bindTarget(ctx, c.ro, subscription, t)
+	return bound, err
+}
+
+// BindTargetTo binds the claimed rollup to the given target and reports
+// whether it bound and whether the rollup is bound to another target.
+func (s *Service) BindTargetTo(ctx context.Context, c Claimed, subscription string, t killbill.UsageTarget) (bound, mismatch bool, err error) {
 	return s.bindTarget(ctx, c.ro, subscription, t)
+}
+
+// ReleaseClaim gives the claimed rollup back unsent.
+func (s *Service) ReleaseClaim(ctx context.Context, c Claimed) error {
+	return s.releaseClaim(ctx, c.ro)
 }

@@ -323,7 +323,7 @@ func TestForwardingWithDeterministicTrackingIDs(t *testing.T) {
 		t.Fatalf("forward with Kill Bill down = %+v %v", report, err)
 	}
 	var tracking, lastErr string
-	if err := e.db.Pool.QueryRow(ctx, `SELECT tracking_id, last_error FROM usage_rollups WHERE tenant_id = $1`, tn.ID).Scan(&tracking, &lastErr); err != nil || lastErr != "usage_subscription_unconfirmed" {
+	if err := e.db.Pool.QueryRow(ctx, `SELECT tracking_id, last_error FROM usage_rollups WHERE tenant_id = $1`, tn.ID).Scan(&tracking, &lastErr); err != nil || lastErr != "usage_preflight_unavailable" {
 		t.Fatalf("rollup = %q %q %v", tracking, lastErr, err)
 	}
 	var ids []idgen.UUID

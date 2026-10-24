@@ -152,6 +152,11 @@ func (s *Service) Forward(ctx context.Context) (ForwardReport, error) {
 	if s.DB == nil || !s.Billing.Ready() {
 		return report, zserrors.New(zserrors.CodeNotReady, "Forwarding needs the database and the Kill Bill admin settings.")
 	}
+	swept, err := s.ResolveStranded(ctx)
+	report.Unconfirmed += swept
+	if err != nil {
+		return report, err
+	}
 	rows, err := s.DB.Query(ctx, `SELECT DISTINCT brand_id, tenant_id FROM usage_events WHERE rollup_id IS NULL AND reservation_id IS NULL AND acceptance_protocol = 1`)
 	if err != nil {
 		return report, unavailable(err)
@@ -361,6 +366,79 @@ func newClaimToken() []byte {
 	return b
 }
 
+func (s *Service) claimTTL() time.Duration {
+	if s.ClaimTTL > 0 {
+		return s.ClaimTTL
+	}
+	return rollupClaim
+}
+
+// ResolveStranded is the recovery sweep. It never sends anything: Kill
+// Bill cannot be read back by tracking ID, so a rollup whose send may have
+// happened is kept for staff, with a fixed reason and an audit row.
+//   - A claim that ran out before any send started becomes
+//     usage_claim_unconfirmed, because an expired claim never regains the
+//     right to send.
+//   - A started send nobody finished within strandedAfter becomes
+//     usage_send_unconfirmed.
+//
+// It returns how many rollups it resolved.
+func (s *Service) ResolveStranded(ctx context.Context) (int, error) {
+	resolved := 0
+	for _, q := range []struct{ reason, where string }{
+		{"usage_claim_unconfirmed", `send_provenance = 'possibly_attempted' AND claim_from_never AND send_started_at IS NULL AND send_payload IS NULL
+        AND claim_token IS NOT NULL AND claimed_until <= clock_timestamp() AND $2::timestamptz IS NOT NULL`},
+		{"usage_send_unconfirmed", `send_started_at IS NOT NULL AND send_payload IS NOT NULL AND claim_token IS NOT NULL
+        AND send_started_at <= $2`},
+	} {
+		type stranded struct {
+			sc                  scope.Scope
+			id                  idgen.UUID
+			tracking, unit, sub string
+			quantity            int64
+			events              int
+		}
+		var list []stranded
+		err := pgx.BeginFunc(context.WithoutCancel(ctx), s.DB, func(tx pgx.Tx) error {
+			list = nil
+			rows, err := tx.Query(ctx, `UPDATE usage_rollups r SET closure_unresolved_reason = $1, last_error = $1, claim_from_never = false
+FROM (SELECT id FROM usage_rollups WHERE status = 'pending' AND send_protocol = 1 AND closure_unresolved_reason IS NULL AND `+q.where+`
+      ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED) due
+WHERE r.id = due.id
+RETURNING r.brand_id, r.tenant_id, r.id, r.tracking_id, r.killbill_unit, coalesce(r.subscription_id::text, ''), r.quantity_micro, r.events`,
+				q.reason, s.now().Add(-strandedAfter))
+			if err != nil {
+				return unavailable(err)
+			}
+			list, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (stranded, error) {
+				var x stranded
+				err := r.Scan(&x.sc.Brand, &x.sc.Tenant, &x.id, &x.tracking, &x.unit, &x.sub, &x.quantity, &x.events)
+				return x, err
+			})
+			if err != nil {
+				return unavailable(err)
+			}
+			for _, x := range list {
+				if _, err := audit.Write(ctx, tx, x.sc, audit.Entry{Actor: ForwarderActor, Action: "metering.usage.send_unconfirmed", Outcome: audit.OutcomeFailure,
+					CorrelationID: x.tracking, Details: map[string]any{"rollup_id": idgen.Format(idgen.Rollup, x.id), "reason": q.reason,
+						"killbill_tracking_id": x.tracking, "killbill_subscription_id": x.sub, "killbill_unit": x.unit,
+						"quantity_micro": x.quantity, "events": x.events}}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return resolved, err
+		}
+		for _, x := range list {
+			s.log().ErrorContext(ctx, "usage rollup needs review", "tenant_id", x.sc.TenantID(), "tracking_id", x.tracking, "reason", q.reason)
+		}
+		resolved += len(list)
+	}
+	return resolved, nil
+}
+
 // claimDue claims one batch of due rollups, of one tenant when only is set,
 // under a fresh claim token. Only an unsent protocol 1 rollup can be
 // claimed, once: the claim is the durable record that a send may follow, so
@@ -372,7 +450,7 @@ func (s *Service) claimDue(ctx context.Context, only *scope.Scope) ([]rollup, er
 		brandID, tenantID = only.Brand, only.Tenant
 	}
 	token := newClaimToken()
-	rows, err := s.DB.Query(ctx, `UPDATE usage_rollups r SET claimed_until = $1 + make_interval(secs => $2), claim_token = $6,
+	rows, err := s.DB.Query(ctx, `UPDATE usage_rollups r SET claimed_until = clock_timestamp() + make_interval(secs => $2), claim_token = $6,
     claim_from_never = true, send_provenance = 'possibly_attempted'
 FROM (SELECT id FROM usage_rollups WHERE status = 'pending' AND next_attempt_at <= $1
         AND send_protocol = 1 AND send_provenance = 'never_attempted' AND NOT claim_from_never
@@ -383,7 +461,7 @@ FROM (SELECT id FROM usage_rollups WHERE status = 'pending' AND next_attempt_at 
 WHERE r.id = due.id
 RETURNING r.id, r.brand_id, r.tenant_id, r.killbill_unit, r.tracking_id, coalesce(r.requested_subscription_id::text, ''),
           coalesce(r.subscription_id::text, ''), r.day, r.record_at, r.period_start, r.quantity_micro, r.events, r.attempts`,
-		s.now(), rollupClaim.Seconds(), brandID, tenantID, sendBatch, token)
+		s.now(), s.claimTTL().Seconds(), brandID, tenantID, sendBatch, token)
 	if err != nil {
 		return nil, unavailable(err)
 	}
@@ -475,11 +553,11 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND cl
 // renewClaim extends the claim of a rollup before it is sent. It reports
 // false when the claim token no longer holds the rollup.
 func (s *Service) renewClaim(ctx context.Context, ro rollup) (bool, error) {
-	args, _ := ro.sc.Bind(ro.id, s.now().Add(rollupClaim), ro.token)
+	args, _ := ro.sc.Bind(ro.id, s.claimTTL().Seconds(), ro.token)
 	// Only a live claim before the send started can be renewed; the guard
 	// never lets an expired claim regain authority. The new deadline always
 	// moves forward.
-	tag, err := s.DB.Exec(ctx, `UPDATE usage_rollups SET claimed_until = greatest($4::timestamptz, claimed_until + interval '1 millisecond')
+	tag, err := s.DB.Exec(ctx, `UPDATE usage_rollups SET claimed_until = greatest(clock_timestamp() + make_interval(secs => $4), claimed_until + interval '1 millisecond')
 WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $5
   AND send_protocol = 1 AND send_started_at IS NULL AND closure_unresolved_reason IS NULL AND claimed_until > clock_timestamp()`, args...)
 	if err != nil {
@@ -492,7 +570,7 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND cl
 // Bill endpoint, tenant and account the usage would land in. The binding is
 // made once: it reports false when the claim no longer holds the rollup or
 // the rollup is already bound to another target.
-func (s *Service) bindTarget(ctx context.Context, ro rollup, subscription string, t killbill.UsageTarget) (bool, error) {
+func (s *Service) bindTarget(ctx context.Context, ro rollup, subscription string, t killbill.UsageTarget) (bound, mismatch bool, err error) {
 	args, _ := ro.sc.Bind(ro.id, subscription, t.EndpointFingerprint, t.TenantID, t.AccountID, ro.token)
 	tag, err := s.DB.Exec(ctx, `UPDATE usage_rollups SET subscription_id = $4::uuid, target_endpoint_fingerprint = $5,
     target_killbill_tenant_id = $6::uuid, target_killbill_account_id = $7::uuid
@@ -502,9 +580,37 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND cl
   AND (target_endpoint_fingerprint IS NULL OR (target_endpoint_fingerprint, target_killbill_tenant_id, target_killbill_account_id)
        = ($5, $6::uuid, $7::uuid))`, args...)
 	if err != nil {
-		return false, unavailable(err)
+		return false, false, unavailable(err)
 	}
-	return tag.RowsAffected() == 1, nil
+	if tag.RowsAffected() == 1 {
+		return true, false, nil
+	}
+	// Told apart: a claim that is still ours but bound elsewhere is a target
+	// mismatch, anything else is a lost claim.
+	var differs bool
+	if err := s.DB.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM usage_rollups
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $8
+  AND send_protocol = 1 AND send_started_at IS NULL AND claimed_until > clock_timestamp()
+  AND ((subscription_id IS NOT NULL AND subscription_id <> $4::uuid)
+       OR (target_endpoint_fingerprint IS NOT NULL AND (target_endpoint_fingerprint, target_killbill_tenant_id, target_killbill_account_id)
+           IS DISTINCT FROM ($5, $6::uuid, $7::uuid))))`, args...).Scan(&differs); err != nil {
+		return false, false, unavailable(err)
+	}
+	return false, differs, nil
+}
+
+// auditTargetMismatch records that a rollup bound to one Kill Bill target
+// was met by another, after a change of the Kill Bill address or tenant.
+// The rollup waits and is not sent, and staff must see why.
+func (s *Service) auditTargetMismatch(ctx context.Context, ro rollup, subscription string) error {
+	ctx = context.WithoutCancel(ctx)
+	return pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
+		_, err := audit.Write(ctx, tx, ro.sc, audit.Entry{Actor: ForwarderActor, Action: "metering.usage.target_mismatch", Outcome: audit.OutcomeFailure,
+			CorrelationID: ro.trackingID, Details: map[string]any{"rollup_id": idgen.Format(idgen.Rollup, ro.id),
+				"killbill_tracking_id": ro.trackingID, "killbill_subscription_id": subscription, "killbill_unit": ro.unit,
+				"quantity_micro": ro.quantity, "events": ro.events}})
+		return err
+	})
 }
 
 // startSend stores the body and the time of the send on a live claim,
@@ -598,9 +704,15 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	if err != nil {
 		return 0, preflight(reasonTarget, err)
 	}
-	bound, err := s.bindTarget(ctx, ro, subscription, kbTarget)
+	bound, mismatch, err := s.bindTarget(ctx, ro, subscription, kbTarget)
 	if err != nil {
 		return 0, err
+	}
+	if mismatch {
+		if err := s.auditTargetMismatch(ctx, ro, subscription); err != nil {
+			return 0, err
+		}
+		return 0, preflight(reasonTarget, errTargetMismatch)
 	}
 	if !bound {
 		return sendLost, nil
@@ -613,6 +725,9 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	}
 	// The send is written down first: from here on a lost answer leaves a
 	// durable record that Kill Bill may hold the usage.
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	started, err := s.startSend(ctx, ro, payload)
 	if err != nil {
 		return 0, err
@@ -620,7 +735,9 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	if !started {
 		return sendLost, nil
 	}
-	res, sendErr := acct.SendUsage(ctx, call, payload)
+	sendCtx, cancelSend := context.WithTimeout(context.WithoutCancel(ctx), sendBound)
+	res, sendErr := acct.SendUsage(sendCtx, call, payload)
+	cancelSend()
 	duplicate := res.Outcome == killbill.UsageHeld
 	if res.Outcome != killbill.UsageSent && !duplicate {
 		// Nothing is sent again on an unconfirmed answer, and the guard
@@ -632,36 +749,46 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 		return s.markUnconfirmed(ctx, ro, reason, sendErr)
 	}
 	now := s.now()
-	err = pgx.BeginFunc(context.WithoutCancel(ctx), s.DB, func(tx pgx.Tx) error {
-		ctx := context.WithoutCancel(ctx)
-		args, _ := ro.sc.Bind(ro.id, now, ro.token)
-		tag, err := tx.Exec(ctx, `UPDATE usage_rollups SET status = 'forwarded', forwarded_at = $4, claimed_until = NULL, claim_token = NULL, claim_from_never = false, last_error = NULL
+	finalize := func() error {
+		return pgx.BeginFunc(context.WithoutCancel(ctx), s.DB, func(tx pgx.Tx) error {
+			ctx := context.WithoutCancel(ctx)
+			args, _ := ro.sc.Bind(ro.id, now, ro.token)
+			tag, err := tx.Exec(ctx, `UPDATE usage_rollups SET status = 'forwarded', forwarded_at = $4, claimed_until = NULL, claim_token = NULL, claim_from_never = false, last_error = NULL
 WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $5
   AND send_protocol = 1 AND send_started_at IS NOT NULL AND send_payload IS NOT NULL AND closure_unresolved_reason IS NULL`, args...)
-		if err != nil {
-			return unavailable(err)
-		}
-		if tag.RowsAffected() == 0 {
-			// Another forwarder took the rollup after this one sent it. It
-			// sends the same tracking ID, which Kill Bill records once, and
-			// records the rollup itself.
-			return nil
-		}
-		ev, _ := ro.sc.Bind(ro.id, ro.trackingID, now)
-		if _, err := tx.Exec(ctx, `UPDATE usage_events SET forwarded_at = $5, killbill_tracking_id = $4
+			if err != nil {
+				return unavailable(err)
+			}
+			if tag.RowsAffected() == 0 {
+				// Another forwarder took the rollup after this one sent it. It
+				// sends the same tracking ID, which Kill Bill records once, and
+				// records the rollup itself.
+				return nil
+			}
+			ev, _ := ro.sc.Bind(ro.id, ro.trackingID, now)
+			if _, err := tx.Exec(ctx, `UPDATE usage_events SET forwarded_at = $5, killbill_tracking_id = $4
 WHERE brand_id = $1 AND tenant_id = $2 AND rollup_id = $3 AND forwarded_at IS NULL AND killbill_tracking_id IS NULL`, ev...); err != nil {
-			return unavailable(err)
-		}
-		// Kill Bill's unbilled amount for the tenant just grew.
-		if err := billing.BumpWalletVersion(ctx, tx, ro.sc); err != nil {
+				return unavailable(err)
+			}
+			// Kill Bill's unbilled amount for the tenant just grew.
+			if err := billing.BumpWalletVersion(ctx, tx, ro.sc); err != nil {
+				return err
+			}
+			_, err = audit.Write(ctx, tx, ro.sc, audit.Entry{Actor: ForwarderActor, Action: "metering.usage.forwarded", Outcome: audit.OutcomeSuccess,
+				CorrelationID: ro.trackingID, Details: map[string]any{"killbill_subscription_id": ro.subscription,
+					"killbill_tracking_id": ro.trackingID, "killbill_unit": ro.unit, "day": ro.day.UTC().Format(time.DateOnly),
+					"quantity_micro": ro.quantity, "duplicate": duplicate}})
 			return err
+		})
+	}
+	// Kill Bill confirmed the usage, so the finish is retried a few times
+	// before it is left to the recovery sweep. The send is never repeated.
+	for attempt := 0; ; attempt++ {
+		if err = finalize(); err == nil || attempt == finalizeAttempts-1 {
+			break
 		}
-		_, err = audit.Write(ctx, tx, ro.sc, audit.Entry{Actor: ForwarderActor, Action: "metering.usage.forwarded", Outcome: audit.OutcomeSuccess,
-			CorrelationID: ro.trackingID, Details: map[string]any{"killbill_subscription_id": ro.subscription,
-				"killbill_tracking_id": ro.trackingID, "killbill_unit": ro.unit, "day": ro.day.UTC().Format(time.DateOnly),
-				"quantity_micro": ro.quantity, "duplicate": duplicate}})
-		return err
-	})
+		time.Sleep(time.Duration(attempt+1) * finalizeBackoff)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -711,6 +838,20 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND cl
 	return sendRejected, nil
 }
 
+// finalizeAttempts is how many times the database write that marks a
+// confirmed send forwarded is tried, finalizeBackoff apart and growing.
+const (
+	finalizeAttempts = 3
+	finalizeBackoff  = 200 * time.Millisecond
+	// sendBound is the most a started send may take: the client's own
+	// timeout, kept apart from the caller's context so a shutdown after the
+	// send started still sees the answer.
+	sendBound = 25 * time.Second
+	// strandedAfter is how long a started send may stay unfinished before
+	// the sweep takes it for unconfirmed.
+	strandedAfter = 10 * time.Minute
+)
+
 // The reasons a rollup can wait before its send has started. The guard
 // accepts no other last_error on a retry, and none holds Kill Bill's text.
 const (
@@ -730,7 +871,17 @@ type preflightError struct {
 func (e *preflightError) Error() string { return e.err.Error() }
 func (e *preflightError) Unwrap() error { return e.err }
 
-func preflight(reason string, err error) error { return &preflightError{reason: reason, err: err} }
+var errTargetMismatch = errors.New("the rollup is bound to another Kill Bill target")
+
+// preflight tags a failure before the send started with the reason the
+// rollup waits. A Kill Bill that is down or unreachable is always
+// usage_preflight_unavailable, whichever step found it.
+func preflight(reason string, err error) error {
+	if zserrors.IsCode(err, zserrors.CodeBillingUnavailable) {
+		reason = reasonPreflight
+	}
+	return &preflightError{reason: reason, err: err}
+}
 
 // retryLater gives a rollup whose send has not started back to the unsent
 // state and sets when the next attempt is due. A rollup whose claim this
@@ -748,11 +899,11 @@ func (s *Service) retryLater(ctx context.Context, ro rollup, cause error) error 
 		reason = pre.reason
 	}
 	args, _ := ro.sc.Bind(ro.id, s.now().Add(wait), reason, ro.token)
-	if _, err := s.DB.Exec(context.WithoutCancel(ctx), `UPDATE usage_rollups SET attempts = attempts + 1, next_attempt_at = $4,
+	if _, err := s.DB.Exec(context.WithoutCancel(ctx), `UPDATE usage_rollups SET attempts = attempts + 1, next_attempt_at = greatest($4::timestamptz, clock_timestamp() + interval '1 second'),
     claimed_until = NULL, claim_token = NULL, claim_from_never = false, send_provenance = 'never_attempted', last_error = $5
 WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $6
   AND send_protocol = 1 AND send_started_at IS NULL AND send_payload IS NULL AND closure_unresolved_reason IS NULL
-  AND claimed_until > clock_timestamp() AND $4::timestamptz > clock_timestamp()`, args...); err != nil {
+  AND claimed_until > clock_timestamp()`, args...); err != nil {
 		return unavailable(err)
 	}
 	return nil
@@ -880,10 +1031,10 @@ func (s *Service) Run(ctx context.Context, reader outbox.Reader, interval time.D
 		report, err := s.Forward(ctx)
 		if err != nil {
 			s.log().Error("usage forward failed", "error", err.Error())
-		} else if report.RolledUp > 0 || report.Forwarded > 0 || report.Failed > 0 || report.Rejected > 0 || report.Backlogs > 0 {
+		} else if report.RolledUp > 0 || report.Forwarded > 0 || report.Failed > 0 || report.Rejected > 0 || report.Unconfirmed > 0 || report.Backlogs > 0 {
 			s.log().Info("usage forward", "rolled_up", report.RolledUp, "forwarded", report.Forwarded,
 				"duplicates", report.Duplicates, "failed", report.Failed, "rejected", report.Rejected, "skipped", report.Skipped,
-				"backlogs", report.Backlogs)
+				"unconfirmed", report.Unconfirmed, "backlogs", report.Backlogs)
 		}
 		select {
 		case <-ctx.Done():

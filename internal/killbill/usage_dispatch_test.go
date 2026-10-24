@@ -383,3 +383,31 @@ func TestSendUsageAgainstTheFake(t *testing.T) {
 		t.Fatalf("unknown subscription = %+v %v", res, err)
 	}
 }
+
+// The fake answers the admin tenant lookup like Kill Bill 0.24.22 does.
+func TestUsageTargetAgainstTheFake(t *testing.T) {
+	ctx := context.Background()
+	f, kb, creds, acct := fakeTenant(t)
+	sub, err := kb.CreateSubscription(ctx, creds, cc, acct, enginetest.PlanMetered, "zs-sub-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenant, err := kb.TenantByAPIKey(ctx, creds.APIKey)
+	if err != nil || tenant.TenantID == "" || tenant.APIKey != creds.APIKey {
+		t.Fatalf("tenant = %+v %v", tenant, err)
+	}
+	got, err := kb.UsageTarget(ctx, creds, sub)
+	if err != nil || got.TenantID != tenant.TenantID || got.AccountID != acct || got.EndpointFingerprint != kb.EndpointFingerprint() {
+		t.Fatalf("target = %+v %v", got, err)
+	}
+	if again, _ := kb.TenantByAPIKey(ctx, creds.APIKey); again.TenantID != tenant.TenantID {
+		t.Fatal("tenant ID is not stable")
+	}
+	f.AddKillBillTenant("zs-other", "secret")
+	if other, _ := kb.TenantByAPIKey(ctx, "zs-other"); other.TenantID == "" || other.TenantID == tenant.TenantID {
+		t.Fatalf("other tenant = %+v", other)
+	}
+	if _, err := kb.TenantByAPIKey(ctx, "zs-unknown"); !errors.Is(err, killbill.ErrNotFound) {
+		t.Fatalf("unknown tenant: %v", err)
+	}
+}

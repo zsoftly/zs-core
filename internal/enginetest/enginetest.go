@@ -77,8 +77,10 @@ type Fake struct {
 	accounts map[string]map[string]*Account
 	// tenantSecrets are the Kill Bill API secrets by API key.
 	tenantSecrets map[string]string
-	env           map[string]string
-	server        *httptest.Server
+	// tenantIDs are the Kill Bill tenant UUIDs by API key.
+	tenantIDs map[string]string
+	env       map[string]string
+	server    *httptest.Server
 	// rejectedAccounts counts account creations refused for a column limit.
 	rejectedAccounts int
 	// billing is the billing state of each Kill Bill tenant, by API key.
@@ -185,7 +187,7 @@ func (f *Fake) RejectedAccounts() int {
 func New(t testing.TB) *Fake {
 	t.Helper()
 	f := &Fake{orgs: map[string]*organization{}, accounts: map[string]map[string]*Account{},
-		tenantSecrets: map[string]string{}, env: map[string]string{}, billing: map[string]*kbTenant{},
+		tenantSecrets: map[string]string{}, tenantIDs: map[string]string{}, env: map[string]string{}, billing: map[string]*kbTenant{},
 		nodes: []killbill.NodeInfo{{NodeName: "fake-node-1", KBVersion: "0.24.22", PluginsInfo: []killbill.PluginInfo{
 			{PluginName: "org.kill-bill.billing.killbill-platform-osgi-bundles-kpm", State: "RUNNING"}}}}}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
@@ -450,6 +452,24 @@ func (f *Fake) serveOrganization(w http.ResponseWriter, r *http.Request, o *orga
 	}
 }
 
+// serveTenantLookup answers GET /1.0/kb/tenants?apiKey= with the admin
+// credentials. Kill Bill 0.24.22 answers an unknown API key with HTTP 500 and
+// a message that names the tenant cache, not 404.
+func (f *Fake) serveTenantLookup(w http.ResponseWriter, r *http.Request) {
+	user, pass, ok := r.BasicAuth()
+	if !ok || user != "admin" || pass != "pw" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	apiKey := r.URL.Query().Get("apiKey")
+	id, found := f.tenantIDs[apiKey]
+	if !found {
+		reply(w, http.StatusInternalServerError, map[string]string{"message": "TenantCacheLoader cannot find value for key " + apiKey})
+		return
+	}
+	reply(w, http.StatusOK, killbill.Tenant{TenantID: id, ExternalKey: apiKey, APIKey: apiKey})
+}
+
 func (f *Fake) serveKillBill(w http.ResponseWriter, r *http.Request, path string, body []byte) {
 	if r.Method != http.MethodGet {
 		f.requests = append(f.requests, KillBillWrite{Method: r.Method, Path: path, APIKey: r.Header.Get(killbill.HeaderAPIKey),
@@ -457,6 +477,10 @@ func (f *Fake) serveKillBill(w http.ResponseWriter, r *http.Request, path string
 	}
 	if path == "/1.0/kb/nodesInfo" {
 		f.serveNodes(w, r, body)
+		return
+	}
+	if path == "/1.0/kb/tenants" && r.Method == http.MethodGet {
+		f.serveTenantLookup(w, r)
 		return
 	}
 	apiKey := r.Header.Get(killbill.HeaderAPIKey)
@@ -570,6 +594,7 @@ VALUES ($1, $2, $2, $2, $1, $2, $3, $4, $5, now())`, b.ID, slug, ref, manifest, 
 	}
 	f.AddKillBillTenant(slug, "kb-secret-"+slug)
 	f.mu.Lock()
+	f.tenantIDs[slug] = b.ID.String()
 	f.env[strings.TrimPrefix(ref, "env://")] = "kb-secret-" + slug
 	f.mu.Unlock()
 	return b
@@ -581,6 +606,9 @@ func (f *Fake) AddKillBillTenant(apiKey, secret string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tenantSecrets[apiKey] = secret
+	if f.tenantIDs[apiKey] == "" {
+		f.tenantIDs[apiKey] = idgen.MustNewV7().String()
+	}
 	if f.accounts[apiKey] == nil {
 		f.accounts[apiKey] = map[string]*Account{}
 	}

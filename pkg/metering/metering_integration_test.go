@@ -319,11 +319,11 @@ func TestForwardingWithDeterministicTrackingIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	report, err := e.svc.Forward(ctx)
-	if err != nil || report.RolledUp != 1 || report.Forwarded != 0 || report.Failed != 1 {
+	if err != nil || report.RolledUp != 1 || report.Forwarded != 0 || report.Failed != 1 || report.Unconfirmed != 0 {
 		t.Fatalf("forward with Kill Bill down = %+v %v", report, err)
 	}
 	var tracking, lastErr string
-	if err := e.db.Pool.QueryRow(ctx, `SELECT tracking_id, last_error FROM usage_rollups WHERE tenant_id = $1`, tn.ID).Scan(&tracking, &lastErr); err != nil || lastErr != "billing_unavailable" {
+	if err := e.db.Pool.QueryRow(ctx, `SELECT tracking_id, last_error FROM usage_rollups WHERE tenant_id = $1`, tn.ID).Scan(&tracking, &lastErr); err != nil || lastErr != "usage_subscription_unconfirmed" {
 		t.Fatalf("rollup = %q %q %v", tracking, lastErr, err)
 	}
 	var ids []idgen.UUID
@@ -348,20 +348,33 @@ func TestForwardingWithDeterministicTrackingIDs(t *testing.T) {
 	if n := count(t, e.db, `SELECT count(*) FROM usage_events WHERE tenant_id = $1 AND forwarded_at IS NOT NULL AND killbill_tracking_id = $2`, tn.ID, tracking); n != 2 {
 		t.Fatalf("forwarded events = %d", n)
 	}
-	// A forced retry, as after an answer lost on the way back: Kill Bill
-	// already holds the tracking ID and records nothing more.
-	if _, err := e.db.Pool.Exec(ctx, `UPDATE usage_rollups SET status = 'pending', forwarded_at = NULL WHERE tenant_id = $1`, tn.ID); err != nil {
-		t.Fatal(err)
-	}
-	if report, err := e.svc.Forward(ctx); err != nil || report.Duplicates != 1 {
-		t.Fatalf("forced retry = %+v %v", report, err)
-	}
-	if recs := e.fake.UsageRecords(b.Slug); len(recs) != 1 {
-		t.Fatalf("Kill Bill usage after a retry = %+v", recs)
-	}
 	billed, err := e.svc.BilledUsage(ctx, sc, sub, e.clock.Now().AddDate(0, 0, -1), e.clock.Now().AddDate(0, 0, 1))
 	if err != nil || len(billed) != 1 || len(billed[0].Units) != 1 || billed[0].Units[0].QuantityMicro != 3_500_000 {
 		t.Fatalf("billed = %+v %v", billed, err)
+	}
+	// Kill Bill already holds a rollup's tracking ID, as after an answer lost
+	// on the way back: the send is answered as held, nothing more is
+	// recorded, and the rollup is forwarded as a duplicate.
+	if _, _, err := e.record(sc, metering.Event{Meter: "api-calls", EventID: "f-held", QuantityMicro: 1_000_000}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := e.svc.RollUp(ctx, sc); err != nil || n != 1 {
+		t.Fatalf("rollup of the held usage = %d %v", n, err)
+	}
+	var heldTracking string
+	if err := e.db.Pool.QueryRow(ctx, `SELECT tracking_id FROM usage_rollups WHERE tenant_id = $1 AND status = 'pending'`, tn.ID).Scan(&heldTracking); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.fake.KillBill(t).RecordUsage(ctx, killbill.TenantCredentials{APIKey: b.Slug, APISecret: "kb-secret-" + b.Slug}, killbill.CallContext{CreatedBy: "test"},
+		killbill.SubscriptionUsageRecord{SubscriptionID: sub, TrackingID: heldTracking, UnitUsageRecords: []killbill.UnitUsageRecords{{UnitType: enginetest.UnitAPICall,
+			UsageRecords: []killbill.UsageRecord{{RecordDate: e.clock.Now().UTC().Format("2006-01-02T15:04:05.000Z"), Amount: "1"}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := e.svc.Forward(ctx); err != nil || report.Duplicates != 1 || report.Forwarded != 1 || report.Unconfirmed != 0 {
+		t.Fatalf("forward of held usage = %+v %v", report, err)
+	}
+	if recs := e.fake.UsageRecords(b.Slug); len(recs) != 2 {
+		t.Fatalf("Kill Bill usage after a held send = %+v", recs)
 	}
 	// New events make a new rollup with another tracking ID.
 	if _, _, err := e.record(sc, metering.Event{Meter: "api-calls", EventID: "f-3", QuantityMicro: 1}); err != nil {
@@ -370,7 +383,7 @@ func TestForwardingWithDeterministicTrackingIDs(t *testing.T) {
 	if _, err := e.svc.ForwardTenant(ctx, sc); err != nil {
 		t.Fatal(err)
 	}
-	if recs := e.fake.UsageRecords(b.Slug); len(recs) != 2 || recs[1].TrackingID == tracking {
+	if recs := e.fake.UsageRecords(b.Slug); len(recs) != 3 || recs[2].TrackingID == tracking {
 		t.Fatalf("second rollup = %+v", recs)
 	}
 	if n := count(t, e.db, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'metering.usage.forwarded'`, tn.ID); n != 3 {
@@ -396,7 +409,7 @@ func TestForwardingNeverReachesAnotherAccount(t *testing.T) {
 		t.Fatalf("usage on another tenant's subscription = %+v", recs)
 	}
 	var lastErr string
-	if err := e.db.Pool.QueryRow(ctx, `SELECT last_error FROM usage_rollups WHERE tenant_id = $1`, x.ID).Scan(&lastErr); err != nil || lastErr != "not_found" {
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_error FROM usage_rollups WHERE tenant_id = $1`, x.ID).Scan(&lastErr); err != nil || lastErr != "usage_subscription_unconfirmed" {
 		t.Fatalf("last error = %q %v", lastErr, err)
 	}
 	// A tenant without a plan that prices the unit waits too.

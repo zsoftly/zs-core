@@ -30,9 +30,11 @@ const (
 	// rollupBatch is the most events one rollup pass of a tenant reads.
 	// With MaxQuantityMicro per event, their sum fits an int64.
 	rollupBatch = 5000
-	// sendBatch is the most rollups one pass claims at a time. A small
-	// batch keeps the claims of the rollups not yet sent short.
-	sendBatch = 10
+	// sendBatch is the most rollups one pass claims at a time. A claim is
+	// the durable record that a send may follow and an expired claim is
+	// never taken over, so a pass claims one rollup and sends it before it
+	// claims the next: a crash strands at most that one.
+	sendBatch = 1
 	// rollupClaim is how long a forwarder holds a rollup. It renews the
 	// claim before each send, so the claim only has to outlast one Kill
 	// Bill call.
@@ -77,8 +79,12 @@ type ForwardReport struct {
 	// them.
 	Rejected int
 	// Skipped counts rollups another forwarder claimed in the meantime.
-	Skipped  int
-	Backlogs int
+	Skipped int
+	// Unconfirmed counts rollups whose send started and whose outcome Kill
+	// Bill did not confirm. They are never sent again by the forwarder:
+	// staff resolve them against Kill Bill.
+	Unconfirmed int
+	Backlogs    int
 }
 
 // TrackingID is the Kill Bill tracking ID of a rollup: a digest of the
@@ -404,8 +410,15 @@ func (s *Service) sendDue(ctx context.Context, only *scope.Scope, report *Forwar
 			return err
 		}
 		sort.Slice(due, func(i, j int) bool { return due[i].id.String() < due[j].id.String() })
-		for _, ro := range due {
+		for i, ro := range due {
 			if ctx.Err() != nil {
+				// Claimed but not started: give them back, so a restart
+				// sends them instead of leaving them to an expired claim.
+				for _, rest := range due[i:] {
+					if err := s.releaseClaim(ctx, rest); err != nil {
+						return err
+					}
+				}
 				return ctx.Err()
 			}
 			held, err := s.renewClaim(ctx, ro)
@@ -429,6 +442,8 @@ func (s *Service) sendDue(ctx context.Context, only *scope.Scope, report *Forwar
 				report.Rejected++
 			case outcome == sendLost:
 				report.Skipped++
+			case outcome == sendUnconfirmed:
+				report.Unconfirmed++
 			case outcome == sendDuplicate:
 				report.Duplicates++
 				report.Forwarded++
@@ -440,6 +455,21 @@ func (s *Service) sendDue(ctx context.Context, only *scope.Scope, report *Forwar
 			return nil
 		}
 	}
+}
+
+// releaseClaim gives a claimed rollup whose send has not started back to the
+// unsent state, with nothing else changed. A rollup whose claim this
+// forwarder lost is left alone.
+func (s *Service) releaseClaim(ctx context.Context, ro rollup) error {
+	args, _ := ro.sc.Bind(ro.id, ro.token)
+	if _, err := s.DB.Exec(context.WithoutCancel(ctx), `UPDATE usage_rollups SET claimed_until = NULL, claim_token = NULL,
+    claim_from_never = false, send_provenance = 'never_attempted'
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $4
+  AND send_protocol = 1 AND send_started_at IS NULL AND send_payload IS NULL AND closure_unresolved_reason IS NULL
+  AND claimed_until > clock_timestamp()`, args...); err != nil {
+		return unavailable(err)
+	}
+	return nil
 }
 
 // renewClaim extends the claim of a rollup before it is sent. It reports
@@ -477,6 +507,57 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND cl
 	return tag.RowsAffected() == 1, nil
 }
 
+// startSend stores the body and the time of the send on a live claim,
+// before the POST. It reports false when the claim no longer holds the
+// rollup or the send was already started.
+func (s *Service) startSend(ctx context.Context, ro rollup, payload []byte) (bool, error) {
+	args, _ := ro.sc.Bind(ro.id, s.now(), string(payload), ro.token)
+	tag, err := s.DB.Exec(ctx, `UPDATE usage_rollups SET send_started_at = $4, send_payload = $5::jsonb
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $6
+  AND send_protocol = 1 AND send_started_at IS NULL AND send_payload IS NULL AND closure_unresolved_reason IS NULL
+  AND claimed_until > clock_timestamp()`, args...)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// markUnconfirmed keeps a started send whose outcome Kill Bill did not
+// confirm. The rollup stays pending with its stored send and a fixed
+// reason, and the forwarder never claims it again: staff resolve it
+// against Kill Bill, so the usage is neither lost nor sent twice.
+func (s *Service) markUnconfirmed(ctx context.Context, ro rollup, reason string, cause error) (sendOutcome, error) {
+	ctx = context.WithoutCancel(ctx)
+	lost := false
+	err := pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
+		args, _ := ro.sc.Bind(ro.id, reason, ro.token)
+		tag, err := tx.Exec(ctx, `UPDATE usage_rollups SET closure_unresolved_reason = $4, last_error = $4, claim_from_never = false
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $5
+  AND send_protocol = 1 AND send_started_at IS NOT NULL AND closure_unresolved_reason IS NULL`, args...)
+		if err != nil {
+			return unavailable(err)
+		}
+		if tag.RowsAffected() == 0 {
+			lost = true
+			return nil
+		}
+		_, err = audit.Write(ctx, tx, ro.sc, audit.Entry{Actor: ForwarderActor, Action: "metering.usage.send_unconfirmed", Outcome: audit.OutcomeFailure,
+			CorrelationID: ro.trackingID, Details: map[string]any{"rollup_id": idgen.Format(idgen.Rollup, ro.id), "reason": reason,
+				"killbill_tracking_id": ro.trackingID, "killbill_subscription_id": ro.subscription, "killbill_unit": ro.unit,
+				"quantity_micro": ro.quantity, "events": ro.events}})
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	if lost {
+		return sendLost, nil
+	}
+	s.log().ErrorContext(ctx, "usage rollup send unconfirmed", "tenant_id", ro.sc.TenantID(), "tracking_id", ro.trackingID,
+		"reason", reason, "error", errorName(cause))
+	return sendUnconfirmed, nil
+}
+
 type sendOutcome int
 
 const (
@@ -484,6 +565,7 @@ const (
 	sendDuplicate
 	sendRejected
 	sendLost
+	sendUnconfirmed
 )
 
 // send writes one rollup to Kill Bill and records it. The subscription
@@ -494,7 +576,7 @@ const (
 func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	acct, err := s.Billing.TenantAccount(ctx, s.DB, ro.sc)
 	if err != nil {
-		return 0, err
+		return 0, preflight(reasonPreflight, err)
 	}
 	target, err := acct.UsageSubscriptionAt(ctx, ro.subscription, ro.unit, ro.periodStart)
 	switch {
@@ -503,7 +585,7 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	case errors.Is(err, billing.ErrSubscriptionCancelled):
 		return s.reject(ctx, ro, RejectCancelled)
 	case err != nil:
-		return 0, err
+		return 0, preflight(reasonSubscription, err)
 	}
 	// The subscription is chosen once and kept, so every retry of the
 	// tracking ID goes to the same subscription and the same Kill Bill
@@ -514,7 +596,7 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	}
 	kbTarget, err := acct.UsageTarget(ctx, subscription)
 	if err != nil {
-		return 0, err
+		return 0, preflight(reasonTarget, err)
 	}
 	bound, err := s.bindTarget(ctx, ro, subscription, kbTarget)
 	if err != nil {
@@ -525,17 +607,37 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	}
 	ro.subscription = subscription
 	call := billing.Call{Actor: ForwarderActor, Reason: "usage forward", CorrelationID: ro.trackingID}
-	duplicate, err := acct.RecordUsage(ctx, call, ro.subscription, ro.unit, ro.trackingID,
-		[]billing.UsageAmount{{At: ro.recordAt, AmountMicro: ro.quantity}})
+	payload, err := acct.UsagePayload(ro.subscription, ro.unit, ro.trackingID, []billing.UsageAmount{{At: ro.recordAt, AmountMicro: ro.quantity}})
+	if err != nil {
+		return 0, preflight(reasonPayload, err)
+	}
+	// The send is written down first: from here on a lost answer leaves a
+	// durable record that Kill Bill may hold the usage.
+	started, err := s.startSend(ctx, ro, payload)
 	if err != nil {
 		return 0, err
+	}
+	if !started {
+		return sendLost, nil
+	}
+	res, sendErr := acct.SendUsage(ctx, call, payload)
+	duplicate := res.Outcome == killbill.UsageHeld
+	if res.Outcome != killbill.UsageSent && !duplicate {
+		// Nothing is sent again on an unconfirmed answer, and the guard
+		// allows no way back from a started send.
+		reason := "usage_send_unconfirmed"
+		if res.Outcome == killbill.UsageNotSent {
+			reason = "usage_transport_unconfirmed"
+		}
+		return s.markUnconfirmed(ctx, ro, reason, sendErr)
 	}
 	now := s.now()
 	err = pgx.BeginFunc(context.WithoutCancel(ctx), s.DB, func(tx pgx.Tx) error {
 		ctx := context.WithoutCancel(ctx)
 		args, _ := ro.sc.Bind(ro.id, now, ro.token)
-		tag, err := tx.Exec(ctx, `UPDATE usage_rollups SET status = 'forwarded', forwarded_at = $4, claimed_until = NULL, claim_token = NULL, last_error = NULL
-WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $5`, args...)
+		tag, err := tx.Exec(ctx, `UPDATE usage_rollups SET status = 'forwarded', forwarded_at = $4, claimed_until = NULL, claim_token = NULL, claim_from_never = false, last_error = NULL
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $5
+  AND send_protocol = 1 AND send_started_at IS NOT NULL AND send_payload IS NOT NULL AND closure_unresolved_reason IS NULL`, args...)
 		if err != nil {
 			return unavailable(err)
 		}
@@ -547,7 +649,7 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND cl
 		}
 		ev, _ := ro.sc.Bind(ro.id, ro.trackingID, now)
 		if _, err := tx.Exec(ctx, `UPDATE usage_events SET forwarded_at = $5, killbill_tracking_id = $4
-WHERE brand_id = $1 AND tenant_id = $2 AND rollup_id = $3`, ev...); err != nil {
+WHERE brand_id = $1 AND tenant_id = $2 AND rollup_id = $3 AND forwarded_at IS NULL AND killbill_tracking_id IS NULL`, ev...); err != nil {
 			return unavailable(err)
 		}
 		// Kill Bill's unbilled amount for the tenant just grew.
@@ -578,7 +680,10 @@ func (s *Service) reject(ctx context.Context, ro rollup, reason string) (sendOut
 	err := pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
 		args, _ := ro.sc.Bind(ro.id, s.now(), reason, ro.token)
 		tag, err := tx.Exec(ctx, `UPDATE usage_rollups SET status = 'rejected', reject_reason = $5, rejected_at = $4,
-    claimed_until = NULL, claim_token = NULL WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $6`, args...)
+    claimed_until = NULL, claim_token = NULL, claim_from_never = false, send_provenance = 'never_attempted'
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $6
+  AND send_protocol = 1 AND send_started_at IS NULL AND send_payload IS NULL AND closure_unresolved_reason IS NULL
+  AND claimed_until > clock_timestamp()`, args...)
 		if err != nil {
 			return unavailable(err)
 		}
@@ -606,19 +711,48 @@ func (s *Service) reject(ctx context.Context, ro rollup, reason string) (sendOut
 	return sendRejected, nil
 }
 
-// retryLater ends the claim of a rollup Kill Bill did not take and sets
-// when the next attempt is due. A rollup whose claim this forwarder lost is
-// left to the forwarder that holds it.
+// The reasons a rollup can wait before its send has started. The guard
+// accepts no other last_error on a retry, and none holds Kill Bill's text.
+const (
+	reasonPreflight    = "usage_preflight_unavailable"
+	reasonPayload      = "usage_payload_not_ready"
+	reasonSubscription = "usage_subscription_unconfirmed"
+	reasonTarget       = "usage_target_unconfirmed"
+)
+
+// preflightError is a failure before the send started, so nothing reached
+// Kill Bill and the rollup can go back to unsent and wait.
+type preflightError struct {
+	reason string
+	err    error
+}
+
+func (e *preflightError) Error() string { return e.err.Error() }
+func (e *preflightError) Unwrap() error { return e.err }
+
+func preflight(reason string, err error) error { return &preflightError{reason: reason, err: err} }
+
+// retryLater gives a rollup whose send has not started back to the unsent
+// state and sets when the next attempt is due. A rollup whose claim this
+// forwarder lost, or whose claim ran out, is left alone: an expired claim
+// never regains the right to send.
 func (s *Service) retryLater(ctx context.Context, ro rollup, cause error) error {
 	wait := rollupBackoffFirst
 	for i := 0; i < ro.attempts && wait < rollupBackoffMax; i++ {
 		wait *= 2
 	}
 	wait = min(wait, rollupBackoffMax)
-	args, _ := ro.sc.Bind(ro.id, s.now().Add(wait), errorName(cause), ro.token)
+	reason := reasonPreflight
+	var pre *preflightError
+	if errors.As(cause, &pre) {
+		reason = pre.reason
+	}
+	args, _ := ro.sc.Bind(ro.id, s.now().Add(wait), reason, ro.token)
 	if _, err := s.DB.Exec(context.WithoutCancel(ctx), `UPDATE usage_rollups SET attempts = attempts + 1, next_attempt_at = $4,
-    claimed_until = NULL, claim_token = NULL, last_error = $5
-WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $6`, args...); err != nil {
+    claimed_until = NULL, claim_token = NULL, claim_from_never = false, send_provenance = 'never_attempted', last_error = $5
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $6
+  AND send_protocol = 1 AND send_started_at IS NULL AND send_payload IS NULL AND closure_unresolved_reason IS NULL
+  AND claimed_until > clock_timestamp() AND $4::timestamptz > clock_timestamp()`, args...); err != nil {
 		return unavailable(err)
 	}
 	return nil

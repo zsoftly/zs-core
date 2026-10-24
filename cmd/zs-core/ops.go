@@ -93,6 +93,12 @@ func runDoctor(args, environ []string, stdout, stderr io.Writer) int {
 			}
 		}
 	}
+	if pool != nil {
+		now := time.Now
+		opts.Closures = func(ctx context.Context) ([]doctor.Finding, error) {
+			return doctor.ClosureFindings(ctx, pool, now())
+		}
+	}
 	if cfg.KillBillDatabaseURL != "" {
 		kbPool, err := database.Open(ctx, database.Options{URL: cfg.KillBillDatabaseURL, MaxConns: 2})
 		if err != nil {

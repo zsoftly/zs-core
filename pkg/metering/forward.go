@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/zsoftly/zs-core/internal/killbill"
 	"github.com/zsoftly/zs-core/pkg/audit"
 	"github.com/zsoftly/zs-core/pkg/billing"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
@@ -354,37 +355,53 @@ func newClaimToken() []byte {
 	return b
 }
 
+// claimDue claims one batch of due rollups, of one tenant when only is set,
+// under a fresh claim token. Only an unsent protocol 1 rollup can be
+// claimed, once: the claim is the durable record that a send may follow, so
+// an expired claim is never taken over, and a legacy protocol 0 rollup is
+// read-only under the guard and never claimed.
+func (s *Service) claimDue(ctx context.Context, only *scope.Scope) ([]rollup, error) {
+	var brandID, tenantID any
+	if only != nil {
+		brandID, tenantID = only.Brand, only.Tenant
+	}
+	token := newClaimToken()
+	rows, err := s.DB.Query(ctx, `UPDATE usage_rollups r SET claimed_until = $1 + make_interval(secs => $2), claim_token = $6,
+    claim_from_never = true, send_provenance = 'possibly_attempted'
+FROM (SELECT id FROM usage_rollups WHERE status = 'pending' AND next_attempt_at <= $1
+        AND send_protocol = 1 AND send_provenance = 'never_attempted' AND NOT claim_from_never
+        AND claim_token IS NULL AND claimed_until IS NULL AND send_started_at IS NULL AND send_payload IS NULL
+        AND closure_unresolved_reason IS NULL
+        AND ($3::uuid IS NULL OR (brand_id = $3 AND tenant_id = $4))
+      ORDER BY next_attempt_at, id LIMIT $5 FOR UPDATE SKIP LOCKED) due
+WHERE r.id = due.id
+RETURNING r.id, r.brand_id, r.tenant_id, r.killbill_unit, r.tracking_id, coalesce(r.requested_subscription_id::text, ''),
+          coalesce(r.subscription_id::text, ''), r.day, r.record_at, r.period_start, r.quantity_micro, r.events, r.attempts`,
+		s.now(), rollupClaim.Seconds(), brandID, tenantID, sendBatch, token)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	due, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (rollup, error) {
+		ro := rollup{token: token}
+		err := r.Scan(&ro.id, &ro.sc.Brand, &ro.sc.Tenant, &ro.unit, &ro.trackingID, &ro.requested, &ro.subscription, &ro.day,
+			&ro.recordAt, &ro.periodStart, &ro.quantity, &ro.events, &ro.attempts)
+		return ro, err
+	})
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	return due, nil
+}
+
 // sendDue claims due rollups, of one tenant when only is set, a batch at a
 // time under a claim token, and sends each to Kill Bill. Before each send
 // it renews its claim. A rollup whose claim it lost, because the claim ran
 // out and another forwarder took the rollup, is skipped and never sent.
 func (s *Service) sendDue(ctx context.Context, only *scope.Scope, report *ForwardReport) error {
 	for {
-		var brandID, tenantID any
-		if only != nil {
-			brandID, tenantID = only.Brand, only.Tenant
-		}
-		token := newClaimToken()
-		rows, err := s.DB.Query(ctx, `UPDATE usage_rollups r SET claimed_until = $1 + make_interval(secs => $2), claim_token = $6
-FROM (SELECT id FROM usage_rollups WHERE status = 'pending' AND next_attempt_at <= $1
-        AND (claimed_until IS NULL OR claimed_until <= $1)
-        AND ($3::uuid IS NULL OR (brand_id = $3 AND tenant_id = $4))
-      ORDER BY next_attempt_at, id LIMIT $5 FOR UPDATE SKIP LOCKED) due
-WHERE r.id = due.id
-RETURNING r.id, r.brand_id, r.tenant_id, r.killbill_unit, r.tracking_id, coalesce(r.requested_subscription_id::text, ''),
-          coalesce(r.subscription_id::text, ''), r.day, r.record_at, r.period_start, r.quantity_micro, r.events, r.attempts`,
-			s.now(), rollupClaim.Seconds(), brandID, tenantID, sendBatch, token)
+		due, err := s.claimDue(ctx, only)
 		if err != nil {
-			return unavailable(err)
-		}
-		due, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (rollup, error) {
-			ro := rollup{token: token}
-			err := r.Scan(&ro.id, &ro.sc.Brand, &ro.sc.Tenant, &ro.unit, &ro.trackingID, &ro.requested, &ro.subscription, &ro.day,
-				&ro.recordAt, &ro.periodStart, &ro.quantity, &ro.events, &ro.attempts)
-			return ro, err
-		})
-		if err != nil {
-			return unavailable(err)
+			return err
 		}
 		sort.Slice(due, func(i, j int) bool { return due[i].id.String() < due[j].id.String() })
 		for _, ro := range due {
@@ -429,8 +446,31 @@ RETURNING r.id, r.brand_id, r.tenant_id, r.killbill_unit, r.tracking_id, coalesc
 // false when the claim token no longer holds the rollup.
 func (s *Service) renewClaim(ctx context.Context, ro rollup) (bool, error) {
 	args, _ := ro.sc.Bind(ro.id, s.now().Add(rollupClaim), ro.token)
-	tag, err := s.DB.Exec(ctx, `UPDATE usage_rollups SET claimed_until = $4
-WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $5`, args...)
+	// Only a live claim before the send started can be renewed; the guard
+	// never lets an expired claim regain authority. The new deadline always
+	// moves forward.
+	tag, err := s.DB.Exec(ctx, `UPDATE usage_rollups SET claimed_until = greatest($4::timestamptz, claimed_until + interval '1 millisecond')
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $5
+  AND send_protocol = 1 AND send_started_at IS NULL AND closure_unresolved_reason IS NULL AND claimed_until > clock_timestamp()`, args...)
+	if err != nil {
+		return false, unavailable(err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// bindTarget records, before anything is sent, the subscription and the Kill
+// Bill endpoint, tenant and account the usage would land in. The binding is
+// made once: it reports false when the claim no longer holds the rollup or
+// the rollup is already bound to another target.
+func (s *Service) bindTarget(ctx context.Context, ro rollup, subscription string, t killbill.UsageTarget) (bool, error) {
+	args, _ := ro.sc.Bind(ro.id, subscription, t.EndpointFingerprint, t.TenantID, t.AccountID, ro.token)
+	tag, err := s.DB.Exec(ctx, `UPDATE usage_rollups SET subscription_id = $4::uuid, target_endpoint_fingerprint = $5,
+    target_killbill_tenant_id = $6::uuid, target_killbill_account_id = $7::uuid
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' AND claim_token = $8
+  AND send_protocol = 1 AND send_started_at IS NULL AND closure_unresolved_reason IS NULL AND claimed_until > clock_timestamp()
+  AND (subscription_id IS NULL OR subscription_id = $4::uuid)
+  AND (target_endpoint_fingerprint IS NULL OR (target_endpoint_fingerprint, target_killbill_tenant_id, target_killbill_account_id)
+       = ($5, $6::uuid, $7::uuid))`, args...)
 	if err != nil {
 		return false, unavailable(err)
 	}
@@ -465,20 +505,25 @@ func (s *Service) send(ctx context.Context, ro rollup) (sendOutcome, error) {
 	case err != nil:
 		return 0, err
 	}
-	if ro.subscription == "" {
-		// The subscription is chosen once and kept, so every retry of the
-		// tracking ID goes to the same subscription.
-		args, _ := ro.sc.Bind(ro.id, target.Subscription.SubscriptionID, ro.token)
-		tag, err := s.DB.Exec(ctx, `UPDATE usage_rollups SET subscription_id = $4::uuid
-WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND subscription_id IS NULL AND claim_token = $5`, args...)
-		if err != nil {
-			return 0, unavailable(err)
-		}
-		if tag.RowsAffected() == 0 {
-			return sendLost, nil
-		}
-		ro.subscription = target.Subscription.SubscriptionID
+	// The subscription is chosen once and kept, so every retry of the
+	// tracking ID goes to the same subscription and the same Kill Bill
+	// target, bound before anything is sent.
+	subscription := ro.subscription
+	if subscription == "" {
+		subscription = target.Subscription.SubscriptionID
 	}
+	kbTarget, err := acct.UsageTarget(ctx, subscription)
+	if err != nil {
+		return 0, err
+	}
+	bound, err := s.bindTarget(ctx, ro, subscription, kbTarget)
+	if err != nil {
+		return 0, err
+	}
+	if !bound {
+		return sendLost, nil
+	}
+	ro.subscription = subscription
 	call := billing.Call{Actor: ForwarderActor, Reason: "usage forward", CorrelationID: ro.trackingID}
 	duplicate, err := acct.RecordUsage(ctx, call, ro.subscription, ro.unit, ro.trackingID,
 		[]billing.UsageAmount{{At: ro.recordAt, AmountMicro: ro.quantity}})

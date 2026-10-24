@@ -61,6 +61,16 @@ func (s *Service) TenantAccount(ctx context.Context, q Querier, sc scope.Scope) 
 	return &TenantAccount{s: s, a: account{tenant: t, brand: rec, creds: killbill.TenantCredentials{APIKey: rec.KillBillAPIKey, APISecret: secret}}}, nil
 }
 
+// UsageTarget returns the Kill Bill endpoint, tenant and account that usage
+// for the subscription lands in, as the tenant's own credentials see it.
+func (k *TenantAccount) UsageTarget(ctx context.Context, subscriptionID string) (killbill.UsageTarget, error) {
+	t, err := k.s.KillBill.UsageTarget(ctx, k.a.creds, subscriptionID)
+	if err != nil {
+		return killbill.UsageTarget{}, kbError(err)
+	}
+	return t, nil
+}
+
 // ID returns the Kill Bill account ID.
 func (k *TenantAccount) ID() string { return k.a.id() }
 

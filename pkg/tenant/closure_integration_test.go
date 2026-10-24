@@ -731,6 +731,10 @@ type kbMode struct {
 	dryHeld      chan struct{}
 	dryRelease   chan struct{}
 	dryOnce      sync.Once
+	// noClaim leaves the tenant ready to be claimed, instead of claimed.
+	noClaim bool
+	// inFlight, when set, runs while a dry run or a POST is in flight.
+	inFlight func()
 }
 
 // claimedClosure is a closing tenant with a claimed, not yet executed,
@@ -750,8 +754,10 @@ func claimedClosure(t *testing.T, m *kbMode, posts, lookups *atomic.Int64) (*env
 VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.BrandID, tn.ID); err != nil {
 		t.Fatal(err)
 	}
-	if claim, err := tenant.ProcessClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err != nil || !claim.Claimed {
-		t.Fatalf("claim = %+v %v", claim, err)
+	if !m.noClaim {
+		if claim, err := tenant.ProcessClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err != nil || !claim.Claimed {
+			t.Fatalf("claim = %+v %v", claim, err)
+		}
 	}
 	var mu sync.Mutex
 	var invoiceID, targetDate string
@@ -767,6 +773,9 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 				answerTenantLookup(w, r, tn.BrandID)
 			}
 			return
+		}
+		if m.inFlight != nil && r.Method == http.MethodPost && (r.URL.Path == "/1.0/kb/invoices/dryRun" || r.URL.Path == "/1.0/kb/invoices") {
+			m.inFlight()
 		}
 		if m.holdFirstDry && r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices/dryRun" {
 			first := false

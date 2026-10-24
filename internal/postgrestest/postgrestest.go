@@ -56,6 +56,10 @@ const (
 	// EnvURL names an existing Postgres server to use instead of a
 	// container. It must point at a loopback host.
 	EnvURL = "ZS_TEST_POSTGRES_URL"
+	// EnvRequireTemplate, set to 1, makes a missing or broken template
+	// database fail the test instead of quietly falling back to the slower
+	// schema per test.
+	EnvRequireTemplate = "ZS_TEST_REQUIRE_TEMPLATE"
 	// Image is the container image used when EnvURL is unset.
 	Image = "postgres:18-alpine"
 
@@ -63,9 +67,11 @@ const (
 	startupTimeout = 2 * time.Minute
 )
 
-// DB is one isolated, migrated schema.
+// DB is one isolated, migrated schema, or one cloned database.
 type DB struct {
-	Pool   *pgxpool.Pool
+	Pool *pgxpool.Pool
+	// Schema names the isolation unit: a schema, or the database name when
+	// the test runs in a clone of the template, where the schema is public.
 	Schema string
 	// URL connects to the same server with search_path set to Schema.
 	URL string
@@ -331,11 +337,17 @@ func newFromTemplate(t testing.TB) *DB {
 	ctx := context.Background()
 	templateOnce.Do(func() { templateName, templateErr = buildTemplate(ctx, srv) })
 	if templateErr != nil {
+		if templateRequired() {
+			t.Fatalf("%s is set and the template database is unavailable: %v", EnvRequireTemplate, templateErr)
+		}
 		t.Logf("template database unavailable, using a schema per test: %v", templateErr)
 		return nil
 	}
 	name := schemaPrefix + randomHex(t, 8)
 	if err := cloneDatabase(ctx, srv, name); err != nil {
+		if templateRequired() {
+			t.Fatalf("%s is set and cloning the template failed: %v", EnvRequireTemplate, err)
+		}
 		t.Logf("cloning the template failed, using a schema per test: %v", err)
 		return nil
 	}
@@ -417,3 +429,6 @@ func randomBytes(n int) []byte {
 	}
 	return b
 }
+
+// templateRequired reports whether a missing template database must fail.
+func templateRequired() bool { return os.Getenv(EnvRequireTemplate) == "1" }

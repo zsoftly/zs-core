@@ -30,6 +30,25 @@ type ClosureExecutionResult struct {
 	NoInvoice bool
 }
 
+// The closure invoice answers these when it needs a person: an unknown
+// outcome of the POST, a start another executor made, or a readback that did
+// not match. RunClosureInvoice reports them as manual review, not as errors to
+// retry.
+//
+// Every statement of the closure code names the brand and the tenant as its
+// first two arguments, because the lifecycle guard checks them against the
+// scope it holds before any SQL runs.
+var (
+	errClosureManualReview   = zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is pending manual review.")
+	errClosureReadbackReview = zserrors.New(zserrors.CodeNotReady, "Closure invoice readback is pending manual review.")
+)
+
+// IsClosureManualReview reports whether err says the closure invoice waits
+// for manual review.
+func IsClosureManualReview(err error) bool {
+	return errors.Is(err, errClosureManualReview) || errors.Is(err, errClosureReadbackReview)
+}
+
 const (
 	// closurePostBound is the most a started invoice POST may take. It runs
 	// apart from the caller's context, so a stop after the start still sees
@@ -88,8 +107,8 @@ WHERE t.brand_id = $1 AND t.id = $2 FOR UPDATE`, sc.Brand, sc.Tenant).Scan(&stat
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_attempts
     (id, brand_id, tenant_id, killbill_tenant_id, killbill_account_id, target_date)
-VALUES ($1, $2, $3, $4, $5, $6)
-ON CONFLICT (brand_id, tenant_id) DO NOTHING`, attemptID, sc.Brand, sc.Tenant, kbTenant, kbAccount, targetDate)
+VALUES ($3, $1, $2, $4, $5, $6)
+ON CONFLICT (brand_id, tenant_id) DO NOTHING`, sc.Brand, sc.Tenant, attemptID, kbTenant, kbAccount, targetDate)
 		if err != nil {
 			return unavailable(err)
 		}
@@ -123,7 +142,7 @@ func ExecuteClosureInvoiceOnce(ctx context.Context, db DB, eng Engines, sc scope
 		invoiceID        string
 		expectedCurrency string
 	)
-	manualReview := zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is pending manual review.")
+	manualReview := errClosureManualReview
 	// lock reads the attempt under its row lock and, inside that lock, the
 	// brand, once. It refuses the attempt unless the tenant is closing, the
 	// settlement waits for finance, and the brand still stores the Kill Bill
@@ -242,8 +261,10 @@ WHERE attempt_id = $1 AND kind IN ('started', 'invoice_id', 'post_unknown'))`, a
 					if begun {
 						return manualReview
 					}
-					if _, err := tx.Exec(writeCtx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind) VALUES ($1, $2, 'no_invoice')
-ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID); err != nil {
+					if _, err := tx.Exec(writeCtx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind)
+SELECT $3, $4, 'no_invoice'
+WHERE EXISTS (SELECT 1 FROM tenant_closure_invoice_attempts WHERE id = $4 AND brand_id = $1 AND tenant_id = $2)
+ON CONFLICT (attempt_id, kind) DO NOTHING`, sc.Brand, sc.Tenant, idgen.MustNewV7(), attemptID); err != nil {
 						return unavailable(err)
 					}
 					return nil
@@ -270,8 +291,9 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID); err !
 				return errClosureNothingToInvoice
 			}
 			tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, expected_currency)
-VALUES ($1, $2, 'started', $3)
-ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expectedCurrency)
+SELECT $3, $4, 'started', $5
+WHERE EXISTS (SELECT 1 FROM tenant_closure_invoice_attempts WHERE id = $4 AND brand_id = $1 AND tenant_id = $2)
+ON CONFLICT (attempt_id, kind) DO NOTHING`, sc.Brand, sc.Tenant, idgen.MustNewV7(), attemptID, expectedCurrency)
 			if err != nil {
 				return unavailable(err)
 			}
@@ -313,7 +335,7 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expect
 		if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "read_mismatch", invoiceID); err != nil {
 			return ClosureExecutionResult{Posted: started}, err
 		}
-		return ClosureExecutionResult{Posted: started}, zserrors.New(zserrors.CodeNotReady, "Closure invoice readback is pending manual review.")
+		return ClosureExecutionResult{Posted: started}, errClosureReadbackReview
 	}
 	if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "evidenced", invoiceID); err != nil {
 		return ClosureExecutionResult{Posted: started}, err
@@ -362,14 +384,14 @@ func recordClosureInvoiceOutcomeOnce(ctx context.Context, db DB, sc scope.Scope,
 		if invoiceID != "" {
 			parsed, err := idgen.ParseUUID(invoiceID)
 			if err != nil {
-				return zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is pending manual review.")
+				return errClosureManualReview
 			}
 			invoice = &parsed
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, invoice_id)
-SELECT $1, $2, $3, $4
-WHERE EXISTS (SELECT 1 FROM tenant_closure_invoice_attempts WHERE id = $2 AND brand_id = $5 AND tenant_id = $6)
-ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, kind, invoice, sc.Brand, sc.Tenant)
+SELECT $3, $4, $5, $6
+WHERE EXISTS (SELECT 1 FROM tenant_closure_invoice_attempts WHERE id = $4 AND brand_id = $1 AND tenant_id = $2)
+ON CONFLICT (attempt_id, kind) DO NOTHING`, sc.Brand, sc.Tenant, idgen.MustNewV7(), attemptID, kind, invoice)
 		if err != nil {
 			return unavailable(err)
 		}
@@ -386,7 +408,7 @@ WHERE o.attempt_id = $1 AND o.kind = $2 AND o.invoice_id IS NOT DISTINCT FROM $3
 			return unavailable(err)
 		}
 		if !same {
-			return zserrors.New(zserrors.CodeNotReady, "Closure invoice execution is pending manual review.")
+			return errClosureManualReview
 		}
 		return nil
 	})

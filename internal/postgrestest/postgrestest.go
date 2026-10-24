@@ -453,6 +453,7 @@ func disableSettlementStartRule(ctx context.Context, pool *pgxpool.Pool) error {
 	for _, stmt := range []string{
 		`ALTER TABLE tenant_closure_settlements DISABLE TRIGGER tenant_closure_completed_needs_closed`,
 		`ALTER TABLE tenants DISABLE TRIGGER tenant_closed_needs_completed_closure`,
+		`ALTER TABLE tenants DISABLE TRIGGER tenant_closing_needs_settlement`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("disable a closure invariant: %w", err)
@@ -482,6 +483,7 @@ func EnableClosureInvariants(t testing.TB, db *DB) {
 	for _, stmt := range []string{
 		`ALTER TABLE tenant_closure_settlements ENABLE ALWAYS TRIGGER tenant_closure_completed_needs_closed`,
 		`ALTER TABLE tenants ENABLE ALWAYS TRIGGER tenant_closed_needs_completed_closure`,
+		`ALTER TABLE tenants ENABLE ALWAYS TRIGGER tenant_closing_needs_settlement`,
 	} {
 		if _, err := db.Pool.Exec(context.Background(), stmt); err != nil {
 			t.Fatalf("enable a closure invariant: %v", err)

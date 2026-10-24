@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/zsoftly/zs-core/internal/postgrestest"
@@ -22,6 +23,7 @@ func closureStartEnv(t *testing.T) (*env, tenant.Tenant) {
 	t.Helper()
 	e := newEnv(t)
 	postgrestest.EnableSettlementStartRule(t, e.db)
+	postgrestest.EnableClosureInvariants(t, e.db)
 	return e, e.mustOrg(e.person("closer@example.test"), "Closing tenant")
 }
 
@@ -422,7 +424,17 @@ func TestCommandsRefuseATenantChangedDuringTheirEngineCall(t *testing.T) {
 				var written1 atomic.Bool
 				e.fake.AfterWrite(func(string, string) {
 					if written1.CompareAndSwap(false, true) {
-						if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = $2 WHERE id = $1`, tn.ID, written); err != nil {
+						// A closing tenant has its settlement, as the database requires,
+						// so both are written in one transaction.
+						if err := pgx.BeginFunc(ctx, e.db.Pool, func(tx pgx.Tx) error {
+							if written == "closing" {
+								if _, err := tx.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ($1, $2, now())`, tn.BrandID, tn.ID); err != nil {
+									return err
+								}
+							}
+							_, err := tx.Exec(ctx, `UPDATE tenants SET status = $2 WHERE id = $1`, tn.ID, written)
+							return err
+						}); err != nil {
 							t.Error(err)
 						}
 					}

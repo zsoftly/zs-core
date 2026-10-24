@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/zsoftly/zs-core/internal/postgrestest"
@@ -22,13 +23,18 @@ func settlementAt(t *testing.T, e *env, status string, drained, blocked bool) te
 	t.Helper()
 	ctx := context.Background()
 	tn := e.mustOrg(e.person("owner@example.test"), "Tenant A")
-	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = 'closing' WHERE brand_id = $1 AND id = $2`, tn.BrandID, tn.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements
+	// The status and the settlement go in together, as the database requires
+	// when its closure rules are on.
+	if err := pgx.BeginFunc(ctx, e.db.Pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE tenants SET status = 'closing' WHERE brand_id = $1 AND id = $2`, tn.BrandID, tn.ID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO tenant_closure_settlements
     (brand_id, tenant_id, cutoff_at, status, cancellation_completed_at, drain_completed_at, finance_target_date, blocked_at)
 VALUES ($1, $2, now(), $3, CASE WHEN $3 <> 'cancelling' THEN now() END, CASE WHEN $4 THEN now() END, CASE WHEN $3 <> 'cancelling' OR $4 THEN current_date END,
-        CASE WHEN $5 THEN now() END)`, tn.BrandID, tn.ID, status, drained, blocked); err != nil {
+        CASE WHEN $5 THEN now() END)`, tn.BrandID, tn.ID, status, drained, blocked)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return tn

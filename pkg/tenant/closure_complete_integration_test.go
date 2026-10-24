@@ -159,6 +159,7 @@ func TestClosureInvariantsAreEnforcedByTheDatabase(t *testing.T) {
 // refused, before it calls Kill Bill, and without one it works.
 func TestHardCloseIsRefusedForATenantWithASettlement(t *testing.T) {
 	e := newEnv(t)
+	postgrestest.EnableClosureInvariants(t, e.db)
 	ctx := context.Background()
 	tn := e.mustOrg(e.person("hard-owner@example.test"), "Hard close")
 	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ($1, $2, now())`, tn.BrandID, tn.ID); err != nil {
@@ -173,5 +174,54 @@ func TestHardCloseIsRefusedForATenantWithASettlement(t *testing.T) {
 	plain := e.mustOrg(e.person("plain2-owner@example.test"), "No closure")
 	if got, err := tenant.Close(ctx, e.db.Pool, e.eng, plain.Scope(), tenant.SystemActor, "hard close", "c"); err != nil || got.Status != tenant.StatusClosed {
 		t.Fatalf("close of a tenant without a settlement = %+v %v", got, err)
+	}
+}
+
+// A tenant is closing only with a settlement, checked at commit, so no code
+// path can mark a tenant closing and leave it with no closure to settle it.
+func TestClosingNeedsASettlementInTheDatabase(t *testing.T) {
+	e := newEnv(t)
+	postgrestest.EnableClosureInvariants(t, e.db)
+	ctx := context.Background()
+	run := func(statements ...string) error {
+		return pgx.BeginFunc(ctx, e.db.Pool, func(tx pgx.Tx) error {
+			for _, s := range statements {
+				if _, err := tx.Exec(ctx, s); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	tn := e.mustOrg(e.person("closing-needs@example.test"), "Closing needs a settlement")
+	id := tn.ID.String()
+	if err := run(`UPDATE tenants SET status = 'closing' WHERE id = '` + id + `'`); !checkViolation(err) {
+		t.Fatalf("closing with no settlement = %v, want a check violation", err)
+	}
+	if err := run(
+		`INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ('`+tn.BrandID.String()+`', '`+id+`', now())`,
+		`UPDATE tenants SET status = 'closing' WHERE id = '`+id+`'`,
+	); err != nil {
+		t.Fatalf("closing with its settlement in one transaction = %v", err)
+	}
+}
+
+// Closed is terminal in the database: a closed tenant never leaves that status.
+func TestClosedIsTerminalInTheDatabase(t *testing.T) {
+	e := newEnv(t)
+	postgrestest.EnableClosureInvariants(t, e.db)
+	ctx := context.Background()
+	tn := e.mustOrg(e.person("closed-terminal@example.test"), "Closed terminal")
+	if got, err := tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), tenant.SystemActor, "hard close", "c"); err != nil || got.Status != tenant.StatusClosed {
+		t.Fatalf("hard close with the rules on = %+v %v", got, err)
+	}
+	for _, to := range []string{"active", "suspended", "closing"} {
+		_, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = $2 WHERE id = $1`, tn.ID, to)
+		if !checkViolation(err) {
+			t.Errorf("closed -> %s = %v, want a check violation", to, err)
+		}
+	}
+	if got := tenantStatus(t, e, tn); got != "closed" {
+		t.Fatalf("status = %q, want closed", got)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -626,13 +627,15 @@ func TestIssue14MigrationsUpgradeReleasedTwentyOneWithoutBackfill(t *testing.T) 
 	db := postgrestest.NewEmpty(t)
 	ctx := context.Background()
 	throughTwentyOne := fstest.MapFS{}
+	var wantApplied []int64
 	loaded, err := database.Load(migrations.FS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, migration := range loaded {
 		if migration.Version > 21 {
-			break
+			wantApplied = append(wantApplied, migration.Version)
+			continue
 		}
 		name := fmt.Sprintf("%06d_%s.up.sql", migration.Version, migration.Name)
 		body, err := migrations.FS.ReadFile(name)
@@ -653,8 +656,8 @@ func TestIssue14MigrationsUpgradeReleasedTwentyOneWithoutBackfill(t *testing.T) 
 		t.Fatal(err)
 	}
 	applied, err := database.Migrate(ctx, db.Pool, migrations.FS)
-	if err != nil || len(applied) != 2 {
-		t.Fatalf("upgrade = %v %v", applied, err)
+	if err != nil || !slices.Equal(applied, wantApplied) {
+		t.Fatalf("upgrade = %v %v, want %v", applied, err, wantApplied)
 	}
 	if applied, err := database.Migrate(ctx, db.Pool, migrations.FS); err != nil || len(applied) != 0 {
 		t.Fatalf("upgrade noop = %v %v", applied, err)

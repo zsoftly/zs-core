@@ -99,6 +99,42 @@ func TrackingID(sc scope.Scope, unit, subscription string, day time.Time, eventI
 	return "zs-usg-" + hex.EncodeToString(h.Sum(nil))[:40]
 }
 
+// EventSetFingerprint is the durable evidence of which events a protocol 1
+// rollup holds: the sha256 of a fixed domain, the scope, the rollup key and
+// the sorted event ids, each followed by a zero byte. Unlike TrackingID it
+// keeps all 64 hex digits, as migration 22 requires.
+func EventSetFingerprint(sc scope.Scope, unit, subscription string, day time.Time, eventIDs []idgen.UUID) string {
+	ids := make([]string, len(eventIDs))
+	for i, id := range eventIDs {
+		ids[i] = id.String()
+	}
+	sort.Strings(ids)
+	h := sha256.New()
+	for _, part := range append([]string{"zs-core.usage-event-set.v1", sc.Brand.String(), sc.Tenant.String(), unit, subscription,
+		day.UTC().Format(time.DateOnly)}, ids...) {
+		h.Write([]byte(part))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// LegacyUnrolled counts the tenant's raw events accepted before dispatch
+// protocol 1 that are in no rollup. The guard keeps them read-only and the
+// forwarder never rolls them up, so they stay unbilled until staff decide
+// what to do with them; this count keeps that visible.
+func (s *Service) LegacyUnrolled(ctx context.Context, sc scope.Scope) (int, error) {
+	args, err := sc.Bind()
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	if err := s.DB.QueryRow(ctx, `SELECT count(*) FROM usage_events
+WHERE brand_id = $1 AND tenant_id = $2 AND rollup_id IS NULL AND reservation_id IS NULL AND acceptance_protocol = 0`, args...).Scan(&n); err != nil {
+		return 0, unavailable(err)
+	}
+	return n, nil
+}
+
 // Forward runs one pass over every tenant: it rolls up the events not yet
 // in a rollup, sends every due rollup to Kill Bill and emits
 // metering.forward_backlog for tenants whose events waited too long. The
@@ -109,7 +145,7 @@ func (s *Service) Forward(ctx context.Context) (ForwardReport, error) {
 	if s.DB == nil || !s.Billing.Ready() {
 		return report, zserrors.New(zserrors.CodeNotReady, "Forwarding needs the database and the Kill Bill admin settings.")
 	}
-	rows, err := s.DB.Query(ctx, `SELECT DISTINCT brand_id, tenant_id FROM usage_events WHERE rollup_id IS NULL AND reservation_id IS NULL`)
+	rows, err := s.DB.Query(ctx, `SELECT DISTINCT brand_id, tenant_id FROM usage_events WHERE rollup_id IS NULL AND reservation_id IS NULL AND acceptance_protocol = 1`)
 	if err != nil {
 		return report, unavailable(err)
 	}
@@ -228,7 +264,7 @@ func (s *Service) rollUp(ctx context.Context, sc scope.Scope) (int, error) {
 	created := 0
 	err = pgx.BeginFunc(ctx, s.DB, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT id, occurred_at, killbill_unit, coalesce(subscription_id::text, ''), quantity_micro
-FROM usage_events WHERE brand_id = $1 AND tenant_id = $2 AND rollup_id IS NULL AND reservation_id IS NULL
+FROM usage_events WHERE brand_id = $1 AND tenant_id = $2 AND rollup_id IS NULL AND reservation_id IS NULL AND acceptance_protocol = 1
 ORDER BY occurred_at, id LIMIT $3 FOR UPDATE SKIP LOCKED`, args...)
 		if err != nil {
 			return unavailable(err)
@@ -275,10 +311,12 @@ ORDER BY occurred_at, id LIMIT $3 FOR UPDATE SKIP LOCKED`, args...)
 			if k.subscription != "" {
 				sub = k.subscription
 			}
-			insert, _ := sc.Bind(rollupID, k.unit, sub, k.day, total, len(group), TrackingID(sc, k.unit, k.subscription, day, ids), s.now(), latest, earliest)
+			insert, _ := sc.Bind(rollupID, k.unit, sub, k.day, total, len(group), TrackingID(sc, k.unit, k.subscription, day, ids), s.now(), latest, earliest,
+				EventSetFingerprint(sc, k.unit, k.subscription, day, ids))
 			if _, err := tx.Exec(ctx, `INSERT INTO usage_rollups (brand_id, tenant_id, id, killbill_unit, requested_subscription_id,
-    subscription_id, day, quantity_micro, events, tracking_id, next_attempt_at, record_at, period_start)
-VALUES ($1, $2, $3, $4, $5::uuid, $5::uuid, $6::date, $7, $8, $9, $10, $11, $12)`, insert...); err != nil {
+    subscription_id, day, quantity_micro, events, tracking_id, next_attempt_at, record_at, period_start,
+    send_protocol, send_provenance, event_set_fingerprint)
+VALUES ($1, $2, $3, $4, $5::uuid, $5::uuid, $6::date, $7, $8, $9, $10, $11, $12, 1, 'never_attempted', $13)`, insert...); err != nil {
 				return unavailable(err)
 			}
 			strIDs := make([]string, len(ids))

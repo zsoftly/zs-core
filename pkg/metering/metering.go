@@ -361,8 +361,9 @@ WHERE brand_id = $1 AND tenant_id = $2 AND meter_id = $3 AND event_id = $4`, arg
 	insertArgs, _ := sc.Bind(id, m.ID, ev.EventID, m.KillBillUnit, ev.QuantityMicro, dims, dimsKey, nullable(ev.ResourceRef), sub, rsv, ev.OccurredAt, r.now,
 		forwardedAt, tracking)
 	if _, err := tx.Exec(ctx, `INSERT INTO usage_events (brand_id, tenant_id, id, meter_id, event_id, killbill_unit, quantity_micro,
-    dimensions, dimensions_key, resource_ref, subscription_id, reservation_id, occurred_at, received_at, forwarded_at, killbill_tracking_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::uuid, $12, $13, $14, $15, $16)`, insertArgs...); err != nil {
+    dimensions, dimensions_key, resource_ref, subscription_id, reservation_id, occurred_at, received_at, forwarded_at, killbill_tracking_id,
+    acceptance_protocol)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::uuid, $12::uuid, $13, $14, $15, $16, CASE WHEN $12::uuid IS NULL THEN 1 ELSE 0 END)`, insertArgs...); err != nil {
 		return Usage{}, false, unavailable(err)
 	}
 	if err := addToSummary(ctx, tx, sc, m.ID, ev.OccurredAt, dims, dimsKey, ev.QuantityMicro); err != nil {

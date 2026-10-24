@@ -562,9 +562,10 @@ func (f *Fake) InsertBrand(t testing.TB, pool *pgxpool.Pool, slug string, permis
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(context.Background(), `INSERT INTO brands (id, slug, name, keycloak_realm, killbill_api_key,
+	// The fake uses the brand UUID as its stable Kill Bill tenant identity.
+	if _, err := pool.Exec(context.Background(), `INSERT INTO brands (id, slug, name, keycloak_realm, killbill_tenant_id, killbill_api_key,
     killbill_api_secret_ref, manifest, manifest_digest, applied_at)
-VALUES ($1, $2, $2, $2, $2, $3, $4, $5, now())`, b.ID, slug, ref, manifest, m.Digest()); err != nil {
+VALUES ($1, $2, $2, $2, $1, $2, $3, $4, $5, now())`, b.ID, slug, ref, manifest, m.Digest()); err != nil {
 		t.Fatal(err)
 	}
 	f.AddKillBillTenant(slug, "kb-secret-"+slug)

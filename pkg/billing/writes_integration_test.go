@@ -259,11 +259,52 @@ func TestResumedRedemptionKeepsItsExpiry(t *testing.T) {
 	if _, _, err := e.svc.Redeem(ctx, a.Scope(), e.call(), "LATER-ON"); codeOf(err) != "billing_unavailable" {
 		t.Fatalf("Kill Bill down: %v", err)
 	}
+	var (
+		id          idgen.UUID
+		firstExpiry *time.Time
+	)
+	if err := e.db.Pool.QueryRow(ctx, `SELECT id, expires_at FROM credit_code_redemptions WHERE tenant_id = $1`, a.ID).Scan(&id, &firstExpiry); err != nil || firstExpiry == nil || !firstExpiry.Equal(first.AddDate(0, 0, 30)) {
+		t.Fatalf("first pending redemption = id %v expiry %v err %v", id, firstExpiry, err)
+	}
+	creditPosts := func() int {
+		n := 0
+		for _, write := range e.fake.Writes() {
+			if write.Method == http.MethodPost && strings.HasPrefix(write.Path, "/1.0/kb/credits") {
+				n++
+			}
+		}
+		return n
+	}
 	e.fake.SetDown(false, false)
 	e.clock.advance(3 * 24 * time.Hour)
+	beforeRetry := creditPosts()
+	if _, created, err := e.svc.Redeem(ctx, a.Scope(), e.call(), "LATER-ON"); created || err == nil || strings.HasPrefix(codeOf(err), "untyped:") {
+		t.Fatalf("missing receipt retry = created %v, err %v", created, err)
+	}
+	if afterRetry := creditPosts(); afterRetry != beforeRetry {
+		t.Fatalf("missing receipt credit POSTs = %d, want %d", afterRetry, beforeRetry)
+	}
+	var status string
+	if err := e.db.Pool.QueryRow(ctx, `SELECT status, expires_at FROM credit_code_redemptions WHERE id = $1`, id).Scan(&status, &firstExpiry); err != nil || status != "pending" || firstExpiry == nil || !firstExpiry.Equal(first.AddDate(0, 0, 30)) {
+		t.Fatalf("missing receipt row = status %q expiry %v err %v", status, firstExpiry, err)
+	}
+	seedBefore := creditPosts()
+	creds := killbill.TenantCredentials{APIKey: "zs-acme", APISecret: "kb-secret-zs-acme"}
+	if _, err := e.fake.KillBill(t).CreateCredit(ctx, creds, killbill.CallContext{CreatedBy: "test"}, killbill.InvoiceItem{
+		AccountID: a.KillBillAccountID, Amount: "1.00", Currency: "CAD", Description: "zs-core credit " + idgen.Format(idgen.Credit, id),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if seedAfter := creditPosts(); seedAfter != seedBefore+1 {
+		t.Fatalf("seed credit POSTs = %d, want %d", seedAfter, seedBefore+1)
+	}
+	beforeRecovery := creditPosts()
 	c, created, err := e.svc.Redeem(ctx, a.Scope(), e.call(), "LATER-ON")
 	if err != nil || !created || c.ExpiresAt == nil || !c.ExpiresAt.Equal(first.AddDate(0, 0, 30)) {
 		t.Fatalf("resumed = %+v %v %v, want expiry %s", c, created, err, first.AddDate(0, 0, 30))
+	}
+	if afterRecovery := creditPosts(); afterRecovery != beforeRecovery {
+		t.Fatalf("recovery credit POSTs = %d, want %d", afterRecovery, beforeRecovery)
 	}
 }
 

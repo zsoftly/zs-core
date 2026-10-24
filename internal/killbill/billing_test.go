@@ -108,9 +108,15 @@ func TestTriggerInvoiceRequiresCreatedLocation(t *testing.T) {
 		status   int
 		location string
 		wantErr  bool
+		nothing  bool
+
+		contentType, body string
 	}{
 		"created location":   {status: http.StatusCreated, location: "/1.0/kb/invoices/018f7d96-5ce7-7b9e-8f21-5a67a10d0001"},
-		"nothing to do":      {status: http.StatusNotFound, wantErr: true},
+		"unknown account":    {status: http.StatusNotFound, contentType: "application/json", body: `{"className":"x.ObjectDoesNotExist","message":"Object id=1 type=ACCOUNT doesn't exist!"}`, wantErr: true},
+		"bare 404":           {status: http.StatusNotFound, wantErr: true},
+		"tomcat 404":         {status: http.StatusNotFound, contentType: "text/html;charset=utf-8", body: "<!doctype html><html><h3>Apache Tomcat/9.0.122</h3></html>", nothing: true},
+		"proxy 404":          {status: http.StatusNotFound, contentType: "text/html", body: "<html>nginx 404</html>", wantErr: true},
 		"no content":         {status: http.StatusNoContent, wantErr: true},
 		"missing location":   {status: http.StatusCreated, wantErr: true},
 		"malformed location": {status: http.StatusCreated, location: "/1.0/kb/invoices/not-a-uuid", wantErr: true},
@@ -125,21 +131,32 @@ func TestTriggerInvoiceRequiresCreatedLocation(t *testing.T) {
 				if response.location != "" {
 					w.Header().Set("Location", response.location)
 				}
+				if response.contentType != "" {
+					w.Header().Set("Content-Type", response.contentType)
+				}
 				w.WriteHeader(response.status)
+				_, _ = w.Write([]byte(response.body))
 			}))
 			t.Cleanup(server.Close)
 			client, err := killbill.New(killbill.Config{URL: server.URL, AdminUser: "admin", AdminPassword: "pw", HTTPClient: server.Client()})
 			if err != nil {
 				t.Fatal(err)
 			}
-			id, err := client.TriggerInvoice(ctx, killbill.TenantCredentials{APIKey: "key", APISecret: "secret"}, cc,
+			trigger, err := client.TriggerInvoice(ctx, killbill.TenantCredentials{APIKey: "key", APISecret: "secret"}, cc,
 				"018f7d96-5ce7-7b9e-8f21-5a67a10d0002", "2026-10-24")
-			if response.wantErr {
-				if err == nil || id != "" {
-					t.Fatalf("trigger = %q %v", id, err)
+			switch {
+			case response.wantErr:
+				if err == nil || trigger.Created || trigger.InvoiceID != "" {
+					t.Fatalf("trigger = %+v %v", trigger, err)
 				}
-			} else if err != nil || id != "018f7d96-5ce7-7b9e-8f21-5a67a10d0001" {
-				t.Fatalf("trigger = %q %v", id, err)
+			case response.nothing:
+				if err != nil || trigger.Created || trigger.InvoiceID != "" {
+					t.Fatalf("nothing to invoice = %+v %v", trigger, err)
+				}
+			default:
+				if err != nil || !trigger.Created || trigger.InvoiceID != "018f7d96-5ce7-7b9e-8f21-5a67a10d0001" {
+					t.Fatalf("trigger = %+v %v", trigger, err)
+				}
 			}
 		})
 	}

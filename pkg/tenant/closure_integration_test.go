@@ -205,15 +205,18 @@ VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, id, tn.BrandID, tn.ID, tn.Kill
 		})
 	}
 	// The outcomes table references the attempts table, so Postgres only
-	// lets a truncate through to the guard when both are named.
-	_, err := e.db.Pool.Exec(ctx, `TRUNCATE tenant_closure_invoice_attempts, tenant_closure_invoice_outcomes`)
-	var pgErr *pgconn.PgError
-	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || (pgErr.Message != "closure invoice attempt is immutable" && pgErr.Message != "closure invoice outcome is immutable") {
-		t.Fatalf("truncate error = %v", err)
-	}
-	_, err = e.db.Pool.Exec(ctx, `TRUNCATE tenant_closure_invoice_outcomes`)
-	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != "closure invoice outcome is immutable" {
-		t.Fatalf("outcomes truncate error = %v", err)
+	// lets a truncate through to a guard when both are named. The first table
+	// named is the one whose guard answers.
+	for _, tc := range []struct{ statement, message string }{
+		{`TRUNCATE tenant_closure_invoice_attempts, tenant_closure_invoice_outcomes`, "closure invoice attempt is immutable"},
+		{`TRUNCATE tenant_closure_invoice_outcomes, tenant_closure_invoice_attempts`, "closure invoice outcome is immutable"},
+		{`TRUNCATE tenant_closure_invoice_outcomes`, "closure invoice outcome is immutable"},
+	} {
+		_, err := e.db.Pool.Exec(ctx, tc.statement)
+		var pgErr *pgconn.PgError
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != tc.message {
+			t.Fatalf("%s = %v, want %q", tc.statement, err, tc.message)
+		}
 	}
 	var n int
 	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_invoice_attempts WHERE brand_id = $1 AND tenant_id = $2`, tn.BrandID, tn.ID).Scan(&n); err != nil || n != 1 {
@@ -681,7 +684,7 @@ func answerTenantLookup(w http.ResponseWriter, r *http.Request, tenantID idgen.U
 // claimedClosure is a closing tenant with a claimed, not yet executed,
 // closure invoice, and a Kill Bill whose tenant lookup answers as lookup
 // says: 0 the stored tenant, 1 another tenant, 2 unavailable.
-func claimedClosure(t *testing.T, lookup *atomic.Int32, posts, lookups *atomic.Int64) (*env, tenant.Tenant) {
+func claimedClosure(t *testing.T, lookup, post *atomic.Int32, posts, lookups *atomic.Int64) (*env, tenant.Tenant) {
 	t.Helper()
 	e := newEnv(t)
 	ctx := context.Background()
@@ -715,6 +718,16 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/1.0/kb/invoices" {
 			posts.Add(1)
+			switch post.Load() {
+			case 1:
+				// Kill Bill 0.24.22 answers nothing-to-invoice with Tomcat's own 404 page.
+				w.Header().Set("Content-Type", "text/html;charset=utf-8")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte("<!doctype html><html><body><h3>Apache Tomcat/9.0.122</h3></body></html>"))
+				return
+			case 2:
+				time.Sleep(800 * time.Millisecond)
+			}
 			mu.Lock()
 			invoiceID = idgen.MustNewV7().String()
 			targetDate = r.URL.Query().Get("targetDate")
@@ -748,7 +761,8 @@ func TestClosureInvoiceExecutionRefusesARebuiltKillBillTenant(t *testing.T) {
 	var lookup atomic.Int32
 	var posts, lookups atomic.Int64
 	lookup.Store(1)
-	e, tn := claimedClosure(t, &lookup, &posts, &lookups)
+	var post atomic.Int32
+	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
 	ctx := context.Background()
 	if _, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || posts.Load() != 0 {
 		t.Fatalf("rebuilt tenant = %v posts=%d", err, posts.Load())
@@ -765,7 +779,8 @@ func TestClosureInvoiceExecutionLeavesNothingStartedWhenTheLookupFails(t *testin
 	var lookup atomic.Int32
 	var posts, lookups atomic.Int64
 	lookup.Store(2)
-	e, tn := claimedClosure(t, &lookup, &posts, &lookups)
+	var post atomic.Int32
+	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
 	ctx := context.Background()
 	if _, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err == nil || posts.Load() != 0 {
 		t.Fatalf("failed lookup = %v posts=%d", err, posts.Load())
@@ -778,5 +793,83 @@ func TestClosureInvoiceExecutionLeavesNothingStartedWhenTheLookupFails(t *testin
 	result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
 	if err != nil || !result.Posted || !result.Evidenced || posts.Load() != 1 {
 		t.Fatalf("after the lookup recovered = %+v %v posts=%d", result, err, posts.Load())
+	}
+}
+
+// Kill Bill answers with a bare 404 when the account has nothing to invoice. That is a
+// definite answer: it is recorded once, never posted again, and a repeat
+// returns it without calling Kill Bill.
+func TestClosureInvoiceExecutionRecordsNothingToInvoice(t *testing.T) {
+	var lookup, post atomic.Int32
+	var posts, lookups atomic.Int64
+	post.Store(1)
+	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
+	ctx := context.Background()
+	result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
+	if err != nil || !result.Posted || !result.NoInvoice || result.Evidenced || posts.Load() != 1 {
+		t.Fatalf("nothing to invoice = %+v %v posts=%d", result, err, posts.Load())
+	}
+	var outcomes int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_invoice_outcomes WHERE kind = 'no_invoice' AND invoice_id IS NULL`).Scan(&outcomes); err != nil || outcomes != 1 {
+		t.Fatalf("no_invoice outcomes = %d, %v", outcomes, err)
+	}
+	lookupsBefore := lookups.Load()
+	again, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
+	if err != nil || !again.NoInvoice || again.Posted || posts.Load() != 1 || lookups.Load() != lookupsBefore {
+		t.Fatalf("repeat = %+v %v posts=%d lookups %d -> %d", again, err, posts.Load(), lookupsBefore, lookups.Load())
+	}
+}
+
+// A stop while the POST is in flight still records the invoice ID the answer
+// carries, so the attempt is recovered by its read and never posted again.
+func TestClosureInvoiceExecutionRecordsTheInvoiceIDWhenStoppedDuringThePost(t *testing.T) {
+	var lookup, post atomic.Int32
+	var posts, lookups atomic.Int64
+	post.Store(2)
+	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
+	ctx := context.Background()
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		for cctx.Err() == nil {
+			var started int
+			if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_invoice_outcomes WHERE kind = 'started'`).Scan(&started); err == nil && started == 1 {
+				time.Sleep(150 * time.Millisecond)
+				cancel()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	_, _ = tenant.ExecuteClosureInvoiceOnce(cctx, e.db.Pool, e.eng, tn.Scope())
+	var invoiceOutcomes, unknown int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'invoice_id'), count(*) FILTER (WHERE kind = 'post_unknown')
+FROM tenant_closure_invoice_outcomes`).Scan(&invoiceOutcomes, &unknown); err != nil || invoiceOutcomes != 1 || unknown != 0 || posts.Load() != 1 {
+		t.Fatalf("invoice_id outcomes = %d post_unknown = %d posts = %d, %v", invoiceOutcomes, unknown, posts.Load(), err)
+	}
+}
+
+// A database failure while the invoice ID is recorded, after Kill Bill has
+// created the invoice, is retried instead of leaving the attempt unrecorded.
+func TestClosureInvoiceExecutionRetriesRecordingTheInvoiceID(t *testing.T) {
+	var lookup, post atomic.Int32
+	var posts, lookups atomic.Int64
+	e, tn := claimedClosure(t, &lookup, &post, &posts, &lookups)
+	ctx := context.Background()
+	for _, sql := range []string{
+		`CREATE SEQUENCE closure_outcome_fail_seq`,
+		`CREATE FUNCTION closure_outcome_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+  IF nextval('closure_outcome_fail_seq') <= 2 THEN RAISE EXCEPTION 'injected failure'; END IF;
+  RETURN NEW; END; $$`,
+		`CREATE TRIGGER a_closure_outcome_fail BEFORE INSERT ON tenant_closure_invoice_outcomes
+FOR EACH ROW WHEN (NEW.kind = 'invoice_id') EXECUTE FUNCTION closure_outcome_fail()`,
+	} {
+		if _, err := e.db.Pool.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := tenant.ExecuteClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope())
+	if err != nil || !result.Posted || !result.Evidenced || posts.Load() != 1 {
+		t.Fatalf("execution = %+v %v posts=%d", result, err, posts.Load())
 	}
 }

@@ -23,7 +23,21 @@ type ClosureProcessResult struct {
 type ClosureExecutionResult struct {
 	Posted    bool
 	Evidenced bool
+	// NoInvoice is true when Kill Bill answered that there was nothing to
+	// invoice for the target date.
+	NoInvoice bool
 }
+
+const (
+	// closurePostBound is the most a started invoice POST may take. It runs
+	// apart from the caller's context, so a stop after the start still sees
+	// the answer and records it.
+	closurePostBound = 25 * time.Second
+	// closureWriteAttempts is how many times an outcome is written, and
+	// closureWriteBackoff the growing wait between tries.
+	closureWriteAttempts = 3
+	closureWriteBackoff  = 200 * time.Millisecond
+)
 
 // ProcessClosureInvoiceOnce commits at most one immutable D1a closure intent.
 // It does not resolve secrets, call engines, or change closure completion.
@@ -109,6 +123,7 @@ func ExecuteClosureInvoiceOnce(ctx context.Context, db DB, eng Engines, sc scope
 		attemptTenant    string
 		started          bool
 		recorded         bool
+		noInvoice        bool
 		invoiceID        string
 		expectedCurrency string
 	)
@@ -142,6 +157,9 @@ WHERE a.brand_id = $1 AND a.tenant_id = $2 FOR UPDATE`, sc.Brand, sc.Tenant).Sca
 		if err := lock(tx); err != nil {
 			return err
 		}
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes WHERE attempt_id = $1 AND kind = 'no_invoice')`, attemptID).Scan(&noInvoice); err != nil {
+			return unavailable(err)
+		}
 		err := tx.QueryRow(ctx, `SELECT started.expected_currency, coalesce(invoice.invoice_id::text, '')
 FROM tenant_closure_invoice_outcomes started
 LEFT JOIN tenant_closure_invoice_outcomes invoice ON invoice.attempt_id = started.attempt_id AND invoice.kind = 'invoice_id'
@@ -157,6 +175,9 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 	})
 	if err != nil {
 		return ClosureExecutionResult{}, err
+	}
+	if noInvoice {
+		return ClosureExecutionResult{NoInvoice: true}, nil
 	}
 	if recorded && invoiceID == "" {
 		return ClosureExecutionResult{}, manualReview
@@ -200,13 +221,24 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expect
 		}
 	}
 	if started {
-		invoiceID, err = eng.KillBill.TriggerInvoice(ctx, be.creds, callContext("", "closure invoice"), accountID, targetDate.Format(time.DateOnly))
+		postCtx, cancelPost := context.WithTimeout(context.WithoutCancel(ctx), closurePostBound)
+		trigger, err := eng.KillBill.TriggerInvoice(postCtx, be.creds, callContext("", "closure invoice"), accountID, targetDate.Format(time.DateOnly))
+		cancelPost()
 		if err != nil {
 			if persistErr := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "post_unknown", ""); persistErr != nil {
 				return ClosureExecutionResult{}, errors.Join(engineError(err), persistErr)
 			}
 			return ClosureExecutionResult{}, engineError(err)
 		}
+		if !trigger.Created {
+			// Kill Bill answered that there is nothing to invoice. That is
+			// definite: it is recorded and the attempt is never posted again.
+			if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "no_invoice", ""); err != nil {
+				return ClosureExecutionResult{Posted: true}, err
+			}
+			return ClosureExecutionResult{Posted: true, NoInvoice: true}, nil
+		}
+		invoiceID = trigger.InvoiceID
 		if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "invoice_id", invoiceID); err != nil {
 			return ClosureExecutionResult{}, err
 		}
@@ -227,7 +259,22 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, idgen.MustNewV7(), attemptID, expect
 	return ClosureExecutionResult{Posted: started, Evidenced: true}, nil
 }
 
+// recordClosureInvoiceOutcome writes one outcome apart from the caller's
+// context, because it often records what Kill Bill just answered. A database
+// failure is retried a few times; a refusal is not.
 func recordClosureInvoiceOutcome(ctx context.Context, db DB, sc scope.Scope, attemptID idgen.UUID, kind, invoiceID string) error {
+	ctx = context.WithoutCancel(ctx)
+	var err error
+	for attempt := 0; attempt < closureWriteAttempts; attempt++ {
+		if err = recordClosureInvoiceOutcomeOnce(ctx, db, sc, attemptID, kind, invoiceID); err == nil || !zserrors.IsCode(err, zserrors.CodeDatabaseUnavailable) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * closureWriteBackoff)
+	}
+	return err
+}
+
+func recordClosureInvoiceOutcomeOnce(ctx context.Context, db DB, sc scope.Scope, attemptID idgen.UUID, kind, invoiceID string) error {
 	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
 		var invoice *idgen.UUID
 		if invoiceID != "" {

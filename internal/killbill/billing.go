@@ -1,6 +1,7 @@
 package killbill
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/zsoftly/zs-core/internal/upstream"
 	"github.com/zsoftly/zs-core/pkg/idgen"
 )
 
@@ -245,22 +247,48 @@ func (c *Client) AccountInvoices(ctx context.Context, creds TenantCredentials, a
 	return out, nil
 }
 
+// InvoiceTrigger is what an invoice run answered. Created is true for a 201
+// with the new invoice's ID. Created false with no ID means Kill Bill
+// answered that the account has nothing to invoice for the target date.
+type InvoiceTrigger struct {
+	Created   bool
+	InvoiceID string
+}
+
 // TriggerInvoice asks Kill Bill to create a future invoice for one account
 // and target date. A created invoice is identified only by a 201 Location.
-func (c *Client) TriggerInvoice(ctx context.Context, creds TenantCredentials, cc CallContext, accountID, targetDate string) (string, error) {
+//
+// Kill Bill 0.24.22 answers "nothing to invoice" with a 404 that has no
+// Kill Bill body: Tomcat's own HTML error page, checked on the reference
+// stack. An unknown account is also a 404, but a JSON error that names the
+// missing object, and bad credentials are a 401. Only the bare HTML 404 is
+// the nothing-to-invoice answer. Any other answer is an error.
+func (c *Client) TriggerInvoice(ctx context.Context, creds TenantCredentials, cc CallContext, accountID, targetDate string) (InvoiceTrigger, error) {
 	q := url.Values{"accountId": {accountID}, "targetDate": {targetDate}}
 	resp, err := c.do(ctx, request{op: "trigger invoice", method: http.MethodPost, path: "/1.0/kb/invoices?" + q.Encode(), tenant: &creds, call: &cc})
 	if err != nil {
-		return "", err
+		if errors.Is(err, ErrNotFound) && bareTomcatNotFound(resp) {
+			return InvoiceTrigger{}, nil
+		}
+		return InvoiceTrigger{}, err
 	}
 	if resp.Status != http.StatusCreated {
-		return "", fmt.Errorf("killbill trigger invoice: unexpected HTTP %d", resp.Status)
+		return InvoiceTrigger{}, fmt.Errorf("killbill trigger invoice: unexpected HTTP %d", resp.Status)
 	}
 	id := locationID(resp)
 	if _, err := idgen.ParseUUID(id); err != nil {
-		return "", fmt.Errorf("killbill trigger invoice: invalid Location")
+		return InvoiceTrigger{}, fmt.Errorf("killbill trigger invoice: invalid Location")
 	}
-	return id, nil
+	return InvoiceTrigger{Created: true, InvoiceID: id}, nil
+}
+
+// bareTomcatNotFound reports Tomcat's own 404 page, which carries no Kill
+// Bill error.
+func bareTomcatNotFound(resp upstream.Response) bool {
+	return resp.Status == http.StatusNotFound &&
+		strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
+		bytes.Contains(resp.Body, []byte("Apache Tomcat")) &&
+		!json.Valid(resp.Body)
 }
 
 // Invoice returns an invoice with its items, or ErrNotFound.

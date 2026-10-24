@@ -1,14 +1,14 @@
 CREATE TABLE tenant_closure_invoice_outcomes (
     id uuid PRIMARY KEY,
     attempt_id uuid NOT NULL REFERENCES tenant_closure_invoice_attempts (id),
-    kind text NOT NULL CHECK (kind IN ('started', 'post_unknown', 'invoice_id', 'evidenced', 'read_mismatch')),
+    kind text NOT NULL CHECK (kind IN ('started', 'post_unknown', 'no_invoice', 'invoice_id', 'evidenced', 'read_mismatch')),
     invoice_id uuid,
     expected_currency text,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (attempt_id, kind),
     CHECK (
         (kind = 'started' AND invoice_id IS NULL AND expected_currency IS NOT NULL AND expected_currency ~ '^[A-Z]{3}$')
-        OR (kind = 'post_unknown' AND invoice_id IS NULL AND expected_currency IS NULL)
+        OR (kind IN ('post_unknown', 'no_invoice') AND invoice_id IS NULL AND expected_currency IS NULL)
         OR (kind IN ('invoice_id', 'evidenced', 'read_mismatch') AND invoice_id IS NOT NULL AND expected_currency IS NULL)
     )
 );

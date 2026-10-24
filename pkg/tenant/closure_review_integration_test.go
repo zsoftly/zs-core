@@ -28,10 +28,14 @@ func closingWithLegacyUsage(t *testing.T, e *env, events, rollups bool) (tenant.
 	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = 'closing' WHERE brand_id = $1 AND id = $2`, tn.BrandID, tn.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status)
-VALUES ($1, $2, now(), 'finance_pending')`, tn.BrandID, tn.ID); err != nil {
+	// The settlement sits at the state closure can complete from, with its
+	// invoice settled, so that only the review guard can refuse completion.
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements
+    (brand_id, tenant_id, cutoff_at, status, cancellation_completed_at, drain_completed_at, finance_target_date, finance_completed_at, blocked_at)
+VALUES ($1, $2, now(), 'blocking', now(), now(), current_date, now(), now())`, tn.BrandID, tn.ID); err != nil {
 		t.Fatal(err)
 	}
+	settleInvoice(t, e, tn, "no_invoice")
 	var eventID, rollupID idgen.UUID
 	if events {
 		meterID := idgen.MustNewV7()

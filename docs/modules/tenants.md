@@ -182,6 +182,16 @@ A closing tenant's closure invoice is recorded as an outcome and never assumed. 
 
 `RunClosureInvoice` runs the closure invoice of one closing tenant under the tenant's lifecycle capability. In order, it records the review items, commits the invoice intent and executes the invoice. It never completes the closure. Every database step is a short transaction, so no transaction and no row lock is open while Kill Bill is called: only the capability's advisory lock is held. The capability treats any statement error as its end, so a database failure ends the pass. The pass returns the error and the next pass resumes, because every outcome is durable and the invoice is never posted twice. The result says `Busy` when another owner holds the tenant, in which case nothing was called, and `ManualReview` when a review item is unresolved or the invoice outcome is unknown or did not match. The pass that records an unknown invoice outcome reports `ManualReview` at once and returns no error, so a worker does not retry for nothing. A caller that loops on the error must back off, because an error is a database or Kill Bill failure and a loop that does not wait only adds load to it.
 
+A closure settlement moves through four states in order: `cancelling`, `finance_pending`, `blocking`, `completed`. `AdvanceClosureSettlement` moves it one state at a time and audits each move as `tenant.closure_state_changed`. A move that is already done is a no-op, and a move that would skip a state is refused. A database trigger refuses to skip or go back as well, and checks what each state needs:
+
+| Move to | Needs |
+| --- | --- |
+| `finance_pending` | The cancellation and the usage drain done, and a finance target date. |
+| `blocking` | A settled invoice: evidenced, or nothing to invoice. An unknown outcome, an unfinished attempt and no attempt all wait for a person. |
+| `completed` | The finance step recorded, the account marked blocked with `MarkClosureBlocked`, a settled invoice, and the review guard: no unresolved legacy usage. |
+
+`MarkClosureBlocked` records that the account is blocked, audited as `tenant.closure_blocked`, and leaves the settlement in `blocking`.
+
 ## Scope resolution
 
 Every `/v1/tenants/{id}/...` route passes through the same step before its handler. The tenant must belong to the caller's brand, and must not be closed. A write needs it active. A customer token needs an active membership of its identity. A staff or service token has none. An API key must belong to the tenant. Anything else is `404 tenant_not_found`, so a tenant's existence is never confirmed to an outsider. A database failure in this step is `503 authentication_unavailable`. The handler then calls `scope.Require(ctx, "resource:action")`, and a missing permission is `403 permission_denied`.

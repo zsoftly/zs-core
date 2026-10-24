@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -65,7 +66,10 @@ const (
 	// is named in Kill Bill's message but is not read here: read the
 	// subscription to see whether it is already cancelled.
 	CancelRefused
-	// CancelNotFound: Kill Bill has no such subscription (HTTP 404).
+	// CancelNotFound: HTTP 404. CancelSubscriptionOnce has just read the
+	// subscription among the account's, so this is a race with its removal or
+	// a bare 404 page from something in front of Kill Bill, not "already
+	// gone". A caller treats it as a case for a person.
 	CancelNotFound
 	// NotCancelled: nothing was changed. The request was not sent (a bad
 	// argument, a subscription that is not in the account, a cancelled
@@ -158,7 +162,7 @@ func (c *Client) CancelSubscriptionOnce(ctx context.Context, creds TenantCredent
 func inBundles(bundles []Bundle, accountID, subscriptionID string) bool {
 	for _, b := range bundles {
 		for _, s := range b.Subscriptions {
-			if s.SubscriptionID == subscriptionID && (s.AccountID == "" || s.AccountID == accountID) {
+			if s.SubscriptionID == subscriptionID && (s.AccountID == "" || strings.EqualFold(s.AccountID, accountID)) {
 				return true
 			}
 		}

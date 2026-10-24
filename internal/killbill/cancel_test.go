@@ -34,7 +34,7 @@ func newCancelServer(t *testing.T, answer http.HandlerFunc) (*killbill.Client, *
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cs.mu.Lock()
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/1.0/kb/accounts/"+cancelAccount+"/bundles":
+		case r.Method == http.MethodGet && strings.EqualFold(r.URL.Path, "/1.0/kb/accounts/"+cancelAccount+"/bundles"):
 			cs.gets++
 			cs.mu.Unlock()
 			_ = json.NewEncoder(w).Encode([]killbill.Bundle{{AccountID: cancelAccount, BundleID: "b1",
@@ -117,6 +117,11 @@ func TestCancelSubscriptionOnceChecksTheAccountFirst(t *testing.T) {
 	res, err = kb.CancelSubscriptionOnce(ctx, creds, cc, cancelAccount, cancelSub, immediate)
 	if err != nil || res.Outcome != killbill.Cancelled || cs.deleteCount() != 1 {
 		t.Fatalf("own subscription = %+v %v deletes=%d", res, err, cs.deleteCount())
+	}
+	// The account ID is compared without regard to case.
+	res, err = kb.CancelSubscriptionOnce(ctx, creds, cc, strings.ToUpper(cancelAccount), cancelSub, immediate)
+	if err != nil || res.Outcome != killbill.Cancelled || cs.deleteCount() != 2 {
+		t.Fatalf("repeat = %+v %v deletes=%d", res, err, cs.deleteCount())
 	}
 }
 
@@ -228,6 +233,38 @@ func TestCancelSubscriptionOnceTransportFailures(t *testing.T) {
 		res, err := kb.CancelSubscriptionOnce(ctx, creds, cc, cancelAccount, cancelSub, immediate)
 		if err == nil || res.Outcome != killbill.CancelUnknown {
 			t.Fatalf("timeout = %+v %v", res, err)
+		}
+	})
+	t.Run("connection refused for the cancel after the bundles were read", func(t *testing.T) {
+		// The bundles read succeeds and then the listener closes, so only the
+		// DELETE finds the connection refused. Keep-alives are off so the
+		// cancel opens a new connection instead of reusing the read's.
+		var srv *httptest.Server
+		var mu sync.Mutex
+		deletes := 0
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodDelete {
+				mu.Lock()
+				deletes++
+				mu.Unlock()
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			_ = srv.Listener.Close()
+			_ = json.NewEncoder(w).Encode([]killbill.Bundle{{AccountID: cancelAccount, BundleID: "b1",
+				Subscriptions: []killbill.Subscription{{AccountID: cancelAccount, SubscriptionID: cancelSub, State: "ACTIVE"}}}})
+		}))
+		t.Cleanup(srv.Close)
+		client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+		kb, err := killbill.New(killbill.Config{URL: srv.URL, AdminUser: "admin", AdminPassword: "pw", HTTPClient: client})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := kb.CancelSubscriptionOnce(context.Background(), creds, cc, cancelAccount, cancelSub, immediate)
+		mu.Lock()
+		defer mu.Unlock()
+		if err == nil || res.Outcome != killbill.NotCancelled || res.Status != 0 || deletes != 0 {
+			t.Fatalf("refused cancel = %+v %v deletes=%d, want NotCancelled, status 0 and no DELETE seen", res, err, deletes)
 		}
 	})
 	t.Run("connection refused", func(t *testing.T) {

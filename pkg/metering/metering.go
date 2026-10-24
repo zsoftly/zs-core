@@ -190,7 +190,7 @@ type recording struct {
 	meters          map[string]brand.MeterRecord
 }
 
-func (s *Service) begin(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Call) (*recording, error) {
+func (s *Service) begin(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Call, settlement bool) (*recording, error) {
 	if err := call.validate(); err != nil {
 		return nil, err
 	}
@@ -204,6 +204,13 @@ func (s *Service) begin(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Cal
 	// A suspended tenant's work that already ran is still billed. A
 	// closed tenant has no billing surface.
 	if t.Status == tenant.StatusClosed {
+		return nil, errTenantNotActive
+	}
+	// Once a closure has started, raw usage is refused: the closure invoices
+	// what was accepted before it. The settlement of a reservation held before
+	// it is still taken, because the drain waits for each one to be settled or
+	// released.
+	if t.Status == tenant.StatusClosing && !settlement {
 		return nil, errTenantNotActive
 	}
 	rec, err := brand.Get(ctx, tx, sc.Brand)
@@ -456,7 +463,7 @@ func (s *Service) RecordUsageBatch(ctx context.Context, tx pgx.Tx, sc scope.Scop
 }
 
 func (s *Service) recordBatch(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Call, batch []Event) ([]Usage, []bool, error) {
-	r, err := s.begin(ctx, tx, sc, call)
+	r, err := s.begin(ctx, tx, sc, call, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -526,7 +533,7 @@ func (s *Service) recorded(ctx context.Context, tx pgx.Tx, sc scope.Scope, call 
 // unit, and the event a settlement records on it, normalized. ok is false
 // when no meter maps to the unit.
 func (s *Service) settledMeter(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Call, unit string, ev Event) (*recording, brand.MeterRecord, Event, bool, error) {
-	r, err := s.begin(ctx, tx, sc, call)
+	r, err := s.begin(ctx, tx, sc, call, true)
 	if err != nil {
 		return nil, brand.MeterRecord{}, Event{}, false, err
 	}

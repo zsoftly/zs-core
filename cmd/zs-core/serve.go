@@ -169,12 +169,19 @@ func newKillBill(cfg config.Config) (*killbill.Client, error) {
 // and the relays that mirror membership changes to Keycloak Organizations,
 // when the engines are configured. Without them tenants cannot be created
 // and there is nothing to sweep or mirror.
-func startTenantSweeper(ctx context.Context, pool *pgxpool.Pool, engines tenant.Engines, interval time.Duration, log *slog.Logger) {
+func startTenantSweeper(ctx context.Context, pool *pgxpool.Pool, engines tenant.Engines, meter *metering.Service, interval time.Duration, log *slog.Logger) {
 	if !engines.Ready() {
 		log.Warn("tenant sweeper not started: tenant creation needs the Keycloak and Kill Bill admin settings")
 		return
 	}
 	sweeper := &tenant.Sweeper{DB: pool, Engines: engines, Log: log}
+	if meter != nil && meter.Billing.Ready() {
+		// The closure steps need the usage drain: without it the usage is never
+		// reported drained and a closure would wait for ever.
+		sweeper.Closure = tenant.EngineClosureSteps{Engines: engines, Drain: meter}
+	} else {
+		log.Warn("tenant closures are not settled: they need the usage forwarder, which needs the Kill Bill admin settings")
+	}
 	go sweeper.Run(ctx, interval)
 	log.Info("tenant sweeper started", "interval", interval.String())
 	go tenant.RunMirror(ctx, pool, engines, log)

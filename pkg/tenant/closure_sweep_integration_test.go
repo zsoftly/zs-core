@@ -351,9 +351,12 @@ func makeDue(t *testing.T, e *env, tn tenant.Tenant) {
 func TestClosureSweepBacksOffAFailingTenantAndKeepsOnlyTheErrorName(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	tn := threeClosing(t, e)[0]
-	for _, other := range threeClosing(t, e)[1:] {
-		_ = other
+	closing := threeClosing(t, e)
+	tn := closing[0]
+	// Only this tenant is due: the others wait a day, so the one pass that
+	// drives one tenant always drives this one.
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_closure_settlements SET next_attempt_at = now() + interval '1 day' WHERE tenant_id <> $1`, tn.ID); err != nil {
+		t.Fatal(err)
 	}
 	steps := &fakeClosureSteps{prepareErr: errors.New("secret-marker: Kill Bill said the token is hunter2")}
 	sweeper := &tenant.Sweeper{DB: e.db.Pool, Engines: e.eng, Closure: steps, ClosureWork: 1}

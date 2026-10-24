@@ -37,6 +37,22 @@ func (c EngineClosureSteps) today() string {
 	return time.Now().UTC().Format(time.DateOnly)
 }
 
+// cancelVerdict says what Prepare does when the account is still not cancelled
+// after its cancels and the read that followed: nil to wait for the next call,
+// or an error. Kill Bill refusing a cancel because of the subscription's state
+// and the subscription still not being CANCELLED is not a thing to wait on, nor
+// is a subscription that is gone or cancelled for a day that does not count:
+// they are for a person.
+func cancelVerdict(receipt killbill.CancelReceipt, refused, notFound bool, firstErr error) error {
+	switch {
+	case refused || notFound || cancelNeedsAPerson(receipt):
+		return errClosureCancelReview()
+	case firstErr != nil:
+		return engineError(firstErr)
+	}
+	return nil
+}
+
 // errClosureCancelReview says a subscription cannot be cancelled by the
 // closure and needs a person.
 func errClosureCancelReview() error {
@@ -58,8 +74,9 @@ func cancelNeedsAPerson(r killbill.CancelReceipt) bool {
 	return false
 }
 
-// Prepare cancels, immediately, every subscription of the tenant that is not
-// already cancelled: the base subscriptions first, which take their add-ons
+// Prepare first asks the drain whether the usage of the tenant is all with Kill
+// Bill, and does nothing else until it is. It then cancels, immediately, every
+// subscription of the tenant that is not already cancelled: the base subscriptions first, which take their add-ons
 // with them, then any add-on that is left. It reads the account again and
 // answers Cancelled only when every subscription is CANCELLED with a day that
 // is not after today. A cancel whose outcome is unknown is not repeated: the
@@ -79,6 +96,27 @@ func (c EngineClosureSteps) Prepare(ctx context.Context, db DB, sc scope.Scope) 
 	}
 	kb, account, today := c.Engines.KillBill, t.KillBillAccountID, c.today()
 	cc := callContext("closure:"+sc.TenantID(), "tenant closure")
+	// A tenant that was suspended has its billing blocked. The closed state,
+	// which leaves billing open, is written first, so that the final invoice is
+	// not computed under a billing block.
+	if err := c.openBilling(ctx, kb, be.creds, account, cc); err != nil {
+		return ClosurePrepared{}, err
+	}
+	// The usage goes to Kill Bill first, while the subscriptions are active: a
+	// subscription that is cancelled is not one Kill Bill is sure to take usage
+	// for. Nothing is cancelled until the drain says the usage is all there, and
+	// a closing tenant takes no new usage, so none arrives after it. Without a
+	// drain nothing is cancelled and the closure waits.
+	if c.Drain == nil {
+		return ClosurePrepared{}, nil
+	}
+	drained, err := c.Drain.Drained(ctx, sc)
+	if err != nil {
+		return ClosurePrepared{}, engineError(err)
+	}
+	if !drained {
+		return ClosurePrepared{}, nil
+	}
 	read := func() (killbill.CancelReceipt, error) {
 		bundles, err := kb.AccountBundles(ctx, be.creds, account)
 		if err != nil {
@@ -91,7 +129,7 @@ func (c EngineClosureSteps) Prepare(ctx context.Context, db DB, sc scope.Scope) 
 		return ClosurePrepared{}, err
 	}
 	var firstErr error
-	notFound := false
+	notFound, refused := false, false
 	cancel := func(addOns bool) {
 		for _, f := range receipt.Failing {
 			if !cancellableState(f.State) || (f.Category == "ADD_ON") != addOns {
@@ -99,7 +137,9 @@ func (c EngineClosureSteps) Prepare(ctx context.Context, db DB, sc scope.Scope) 
 			}
 			res, err := kb.CancelSubscriptionOnce(ctx, be.creds, cc, account, f.SubscriptionID, killbill.CancelHow{Policy: killbill.PolicyImmediate})
 			switch res.Outcome {
-			case killbill.Cancelled, killbill.CancelRefused:
+			case killbill.Cancelled:
+			case killbill.CancelRefused:
+				refused = true
 			case killbill.CancelNotFound:
 				notFound = true
 			default:
@@ -123,15 +163,9 @@ func (c EngineClosureSteps) Prepare(ctx context.Context, db DB, sc scope.Scope) 
 			}
 		}
 	}
-	prepared := ClosurePrepared{}
+	prepared := ClosurePrepared{Drained: true}
 	if !receipt.OK() {
-		switch {
-		case notFound || cancelNeedsAPerson(receipt):
-			return prepared, errClosureCancelReview()
-		case firstErr != nil:
-			return prepared, engineError(firstErr)
-		}
-		return prepared, nil
+		return prepared, cancelVerdict(receipt, refused, notFound, firstErr)
 	}
 	prepared.Cancelled = true
 	day, err := time.Parse(time.DateOnly, today)
@@ -139,11 +173,6 @@ func (c EngineClosureSteps) Prepare(ctx context.Context, db DB, sc scope.Scope) 
 		return ClosurePrepared{}, zserrors.Wrap(zserrors.CodeInternal, "", err)
 	}
 	prepared.TargetDate = day
-	if c.Drain != nil {
-		if prepared.Drained, err = c.Drain.Drained(ctx, sc); err != nil {
-			return ClosurePrepared{}, engineError(err)
-		}
-	}
 	return prepared, nil
 }
 
@@ -154,6 +183,41 @@ func (c EngineClosureSteps) Prepare(ctx context.Context, db DB, sc scope.Scope) 
 var closedBlock = killbill.BlockingState{
 	StateName: BlockingClosed, Service: BlockingService,
 	IsBlockChange: true, IsBlockEntitlement: true, IsBlockBilling: false,
+}
+
+// billingBlockedByCore reports whether the latest blocking state of Core's
+// service blocks billing, as the suspended state does.
+func billingBlockedByCore(states []killbill.BlockingState) bool {
+	for i := len(states) - 1; i >= 0; i-- {
+		if states[i].Service == BlockingService {
+			return states[i].IsBlockBilling
+		}
+	}
+	return false
+}
+
+// openBilling writes the closed blocking state when the account's billing is
+// blocked by Core, and reads it back. It writes nothing when billing is open,
+// and a second call finds it open.
+func (c EngineClosureSteps) openBilling(ctx context.Context, kb *killbill.Client, creds killbill.TenantCredentials, account string, cc killbill.CallContext) error {
+	states, err := kb.AccountBlockingStates(ctx, creds, account)
+	if err != nil {
+		return engineError(err)
+	}
+	if !billingBlockedByCore(states) {
+		return nil
+	}
+	writeErr := kb.SetAccountBlockingState(ctx, creds, cc, account, closedBlock)
+	if states, err = kb.AccountBlockingStates(ctx, creds, account); err != nil {
+		return engineError(err)
+	}
+	if billingBlockedByCore(states) {
+		if writeErr != nil {
+			return engineError(writeErr)
+		}
+		return zserrors.New(zserrors.CodeNotReady, "The billing of the closing tenant is still blocked.")
+	}
+	return nil
 }
 
 func closedBlockInForce(states []killbill.BlockingState) bool {

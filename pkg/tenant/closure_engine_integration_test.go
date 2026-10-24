@@ -6,6 +6,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/zsoftly/zs-core/internal/enginetest"
 	"github.com/zsoftly/zs-core/internal/killbill"
 	"github.com/zsoftly/zs-core/internal/postgrestest"
@@ -17,10 +19,15 @@ import (
 type fakeDrain struct {
 	done  bool
 	calls int
+	// onCall, when set, runs when the drain is asked.
+	onCall func()
 }
 
 func (f *fakeDrain) Drained(context.Context, scope.Scope) (bool, error) {
 	f.calls++
+	if f.onCall != nil {
+		f.onCall()
+	}
 	return f.done, nil
 }
 
@@ -90,20 +97,29 @@ func TestEnginePrepareCancelsEverySubscriptionAndIsIdempotent(t *testing.T) {
 	}
 }
 
-// A tenant with nothing to cancel is cancelled, and the usage drain is asked
-// only once the cancellation is done.
-func TestEnginePrepareWithNothingToCancelAndTheDrain(t *testing.T) {
+// Nothing is cancelled until the usage drain says the usage is all with Kill
+// Bill, and once it does the subscriptions are cancelled.
+func TestEnginePrepareCancelsOnlyOnceTheUsageIsDrained(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
-	tn := settlementAt(t, e, "cancelling", false, false)
+	tn, _, _ := closingWithSubscriptions(t, e)
 	drain := &fakeDrain{done: false}
 	got, err := engineSteps(e, drain).Prepare(ctx, e.db.Pool, tn.Scope())
-	if err != nil || !got.Cancelled || got.Drained || drain.calls != 1 || len(e.fake.CancelRequests(e.brand.Slug)) != 0 {
-		t.Fatalf("prepare = %+v %v, drain calls %d, cancels %d", got, err, drain.calls, len(e.fake.CancelRequests(e.brand.Slug)))
+	if err != nil || got.Cancelled || got.Drained || drain.calls != 1 || len(e.fake.CancelRequests(e.brand.Slug)) != 0 {
+		t.Fatalf("prepare before the drain = %+v %v, drain calls %d, cancels %d, want nothing cancelled", got, err, drain.calls, len(e.fake.CancelRequests(e.brand.Slug)))
 	}
 	noDrain := tenant.EngineClosureSteps{Engines: e.eng, Today: func() string { return enginetest.CancelDay }}
-	if got, err := noDrain.Prepare(ctx, e.db.Pool, tn.Scope()); err != nil || !got.Cancelled || got.Drained {
-		t.Fatalf("prepare without a drain = %+v %v, want not drained", got, err)
+	if got, err := noDrain.Prepare(ctx, e.db.Pool, tn.Scope()); err != nil || got.Cancelled || len(e.fake.CancelRequests(e.brand.Slug)) != 0 {
+		t.Fatalf("prepare without a drain = %+v %v, want nothing cancelled", got, err)
+	}
+	drain.done = true
+	if got, err := engineSteps(e, drain).Prepare(ctx, e.db.Pool, tn.Scope()); err != nil || !got.Cancelled || !got.Drained {
+		t.Fatalf("prepare after the drain = %+v %v, want cancelled and drained", got, err)
+	}
+	// An account with nothing to cancel is cancelled once drained.
+	empty := settlementAt(t, e, "cancelling", false, false)
+	if got, err := engineSteps(e, drain).Prepare(ctx, e.db.Pool, empty.Scope()); err != nil || !got.Cancelled || !got.Drained {
+		t.Fatalf("prepare with nothing to cancel = %+v %v", got, err)
 	}
 }
 
@@ -246,5 +262,55 @@ func TestSweeperCompletesAClosureWithTheEngineSteps(t *testing.T) {
 	account := accountOf(e, tn)
 	if account.Closed || account.Blocking[len(account.Blocking)-1].StateName != tenant.BlockingClosed {
 		t.Fatalf("account closed = %v, blocking = %+v, want blocked and not closed", account.Closed, account.Blocking)
+	}
+}
+
+// A tenant that was suspended has Kill Bill billing blocked. Prepare opens it
+// before it does anything else, with the closed state, so the final invoice is
+// not computed under a billing block. A tenant that was not suspended gets no
+// write.
+func TestEnginePrepareOpensBillingOfASuspendedTenantFirst(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn := e.mustOrg(e.person("suspended-closing@example.test"), "Suspended closing")
+	kb := e.fake.KillBill(t)
+	if _, err := kb.CreateSubscription(ctx, engineCreds(e), killbill.CallContext{CreatedBy: "test"}, tn.KillBillAccountID, enginetest.PlanUsage, "susp-"+idgen.MustNewV7().String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tenant.Suspend(ctx, e.db.Pool, e.eng, tn.Scope(), tenant.SystemActor, "overdue", "c"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pgx.BeginFunc(ctx, e.db.Pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE tenants SET status = 'closing' WHERE id = $1`, tn.ID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ($1, $2, now())`, tn.BrandID, tn.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if last := accountOf(e, tn).Blocking[len(accountOf(e, tn).Blocking)-1]; !last.IsBlockBilling {
+		t.Fatalf("the suspended tenant's billing is not blocked: %+v", last)
+	}
+	var atDrain killbill.BlockingState
+	drain := &fakeDrain{done: true, onCall: func() {
+		b := accountOf(e, tn).Blocking
+		atDrain = b[len(b)-1]
+	}}
+	if got, err := engineSteps(e, drain).Prepare(ctx, e.db.Pool, tn.Scope()); err != nil || !got.Cancelled {
+		t.Fatalf("prepare = %+v %v", got, err)
+	}
+	if atDrain.StateName != tenant.BlockingClosed || atDrain.IsBlockBilling {
+		t.Fatalf("blocking state when the drain was asked = %+v, want %s with billing open", atDrain, tenant.BlockingClosed)
+	}
+	n := len(accountOf(e, tn).Blocking)
+	if _, err := engineSteps(e, drain).Prepare(ctx, e.db.Pool, tn.Scope()); err != nil || len(accountOf(e, tn).Blocking) != n {
+		t.Fatalf("a second prepare wrote a blocking state: %d -> %d, %v", n, len(accountOf(e, tn).Blocking), err)
+	}
+
+	// A tenant that was not suspended has no state to open.
+	other, _, _ := closingWithSubscriptions(t, e)
+	if _, err := engineSteps(e, &fakeDrain{done: true}).Prepare(ctx, e.db.Pool, other.Scope()); err != nil || len(accountOf(e, other).Blocking) != 0 {
+		t.Fatalf("prepare of an active tenant wrote %d blocking states, %v", len(accountOf(e, other).Blocking), err)
 	}
 }

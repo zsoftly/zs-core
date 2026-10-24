@@ -345,3 +345,19 @@ WHERE tgrelid = 'tenant_closure_settlements'::regclass AND tgname = ANY($1) ORDE
 		t.Fatalf("found %d of the 4 settlement rules", seen)
 	}
 }
+
+// A closure settlement is never deleted, in any state.
+func TestClosureSettlementCannotBeDeleted(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	for _, status := range []string{"cancelling", "blocking"} {
+		tn := settlementAt(t, e, status, true, status == "blocking")
+		if _, err := e.db.Pool.Exec(ctx, `DELETE FROM tenant_closure_settlements WHERE tenant_id = $1`, tn.ID); !checkViolation(err) {
+			t.Errorf("delete of a settlement at %s = %v, want a check violation", status, err)
+		}
+		var n int
+		if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_closure_settlements WHERE tenant_id = $1`, tn.ID).Scan(&n); err != nil || n != 1 {
+			t.Errorf("settlements after the refused delete = %d, %v", n, err)
+		}
+	}
+}

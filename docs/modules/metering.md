@@ -143,3 +143,7 @@ All three need `usage:read`. `RebuildSummaries` recomputes a tenant's summaries 
 - A meter's change of Kill Bill unit applies to events recorded after it. Events already recorded keep the unit of their time.
 - A rollup whose period starts before its subscription started is rejected as a whole, also when some of its events came after the start. Staff reassign it, or discard it.
 - A rollup that keeps failing is retried once a day without end. Its last error and the backlog event say why.
+
+## Closing tenants
+
+Once a tenant's closure has started, `RecordUsage` and `RecordUsageBatch` refuse its usage with `tenant_not_found`, as they do for a closed tenant: the closure invoices what was accepted before it. The settlement of a reservation held before the closure is still taken. `Service.Drained` is what a closure asks before it cancels the subscriptions: it forwards the tenant's usage and answers true only when no protocol 1 event is unrolled, no protocol 1 rollup is pending or rejected, and no reservation is held. See [tenants.md](tenants.md).

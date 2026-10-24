@@ -202,7 +202,7 @@ func serve(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	if err := startNotifications(ctx, pool, api.BrandDeps.Secrets, log); err != nil {
 		return err
 	}
-	startTenantSweeper(ctx, pool, api.Tenants, cfg.TenantSweepInterval, log)
+	startTenantSweeper(ctx, pool, api.Tenants, api.Metering, cfg.TenantSweepInterval, log)
 	startCreditSweeper(ctx, api.Billing, cfg.CreditSweepInterval, log)
 	startExtensions(ctx, pool, api, cfg, log)
 

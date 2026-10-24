@@ -1,6 +1,7 @@
 package tenant
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/zsoftly/zs-core/internal/killbill"
@@ -24,6 +25,36 @@ func TestClosureCancelNeedsAPerson(t *testing.T) {
 	} {
 		if got := cancelNeedsAPerson(killbill.CancelReceipt{Failing: tc.failing}); got != tc.want {
 			t.Errorf("%s = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// What Prepare does when the account is still not cancelled after its cancels.
+func TestCancelVerdict(t *testing.T) {
+	active := killbill.CancelReceipt{Failing: []killbill.CancelFailure{{State: "ACTIVE"}}}
+	cancelled := killbill.CancelReceipt{Failing: []killbill.CancelFailure{{State: "CANCELLED", Day: "2026-12-31"}}}
+	boom := errors.New("boom")
+	for name, tc := range map[string]struct {
+		receipt  killbill.CancelReceipt
+		refused  bool
+		notFound bool
+		err      error
+		want     string
+	}{
+		"still active, nothing said":   {active, false, false, nil, ""},
+		"still active after a refusal": {active, true, false, nil, "conflict"},
+		"not found":                    {active, false, true, nil, "conflict"},
+		"cancelled for a later day":    {cancelled, false, false, nil, "conflict"},
+		"a failed cancel":              {active, false, false, boom, "internal_error"},
+		"a refusal wins over an error": {active, true, false, boom, "conflict"},
+	} {
+		err := cancelVerdict(tc.receipt, tc.refused, tc.notFound, tc.err)
+		got := ""
+		if err != nil {
+			got = codeName(err)
+		}
+		if got != tc.want {
+			t.Errorf("%s = %q, want %q", name, got, tc.want)
 		}
 	}
 }

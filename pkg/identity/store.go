@@ -180,12 +180,13 @@ const (
 	StaffActivation StaffScope = "activation"
 	StaffBilling    StaffScope = "billing"
 	StaffSupport    StaffScope = "support"
+	StaffClosure    StaffScope = "closure"
 )
 
 // Valid reports whether s is a known scope.
 func (s StaffScope) Valid() bool {
 	switch s {
-	case StaffOperator, StaffActivation, StaffBilling, StaffSupport:
+	case StaffOperator, StaffActivation, StaffBilling, StaffSupport, StaffClosure:
 		return true
 	}
 	return false

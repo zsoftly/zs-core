@@ -10,6 +10,7 @@
 //	zs-core grant revoke   take a scope away from a staff principal
 //	zs-core grant list     list the staff grants of a brand
 //	zs-core tenant suspend|reactivate|close  change a tenant's status in Core and the engines
+//	zs-core tenant start-closure  start the closure of a tenant and settle its final billing
 //	zs-core tenant sweep   run one pass of the tenant sweeper
 //	zs-core credit-code add|list|disable  manage the promo and voucher codes of a brand
 //	zs-core credit sweep   run one pass of the credit expiry sweeper
@@ -65,6 +66,7 @@ Commands:
   grant list     list the staff grants of a brand
                    --brand <slug>
   tenant suspend|reactivate|close  change a tenant's status in Core, Kill Bill and Keycloak
+  tenant start-closure  start a tenant's closure; the sweeper then settles its final billing
                    --brand <slug> --tenant <tnt_...> --reason <text> --operator <name>
   tenant sweep   complete interrupted tenant creations and correct Keycloak Organizations once
   credit-code add      add a promo or voucher code to a brand; only its digest is stored

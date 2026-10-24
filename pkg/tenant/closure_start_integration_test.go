@@ -4,6 +4,7 @@ package tenant_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,8 +22,10 @@ func closureStartEnv(t *testing.T) (*env, tenant.Tenant) {
 	return e, e.mustOrg(e.person("closer@example.test"), "Closing tenant")
 }
 
+var closureRequest = tenant.ClosureRequest{Reason: "customer asked to leave", RequestID: "closure-request-0001"}
+
 func startClosure(e *env, tn tenant.Tenant) (tenant.ClosureStart, error) {
-	return tenant.StartClosure(context.Background(), e.db.Pool, tn.Scope(), tenant.SystemActor, "customer asked to leave", "corr-start")
+	return tenant.StartClosure(context.Background(), e.db.Pool, tn.Scope(), tenant.SystemActor, closureRequest, "corr-start")
 }
 
 func tenantStatus(t *testing.T, e *env, tn tenant.Tenant) string {
@@ -93,40 +96,11 @@ func TestStartClosureIsIdempotent(t *testing.T) {
 	}
 }
 
-// Callers at once make exactly one settlement, one start and one audit. They
-// serialise on the lifecycle capability, so the others are told the tenant is
-// busy or find the closure that exists.
-func TestStartClosureConcurrentCallsStartItOnce(t *testing.T) {
-	e, tn := closureStartEnv(t)
-	var started, answered atomic.Int64
-	var wg sync.WaitGroup
-	for i := 0; i < 6; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			got, err := startClosure(e, tn)
-			switch {
-			case err == nil && got.Started:
-				started.Add(1)
-			case err == nil, code(err) == "not_ready":
-				answered.Add(1)
-			default:
-				t.Error(err)
-			}
-		}()
-	}
-	wg.Wait()
-	var audits int
-	if err := e.db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.closure_started'`, tn.ID).Scan(&audits); err != nil || started.Load() != 1 || started.Load()+answered.Load() != 6 || audits != 1 || settlementRows(t, e, tn) != 1 {
-		t.Fatalf("started = %d answered = %d audits = %d settlements = %d, %v, want one start, one audit, one settlement", started.Load(), answered.Load(), audits, settlementRows(t, e, tn), err)
-	}
-}
-
 func TestStartClosureRefusesWhatItMust(t *testing.T) {
 	e, tn := closureStartEnv(t)
 	ctx := context.Background()
 	for _, reason := range []string{"", "   "} {
-		if _, err := tenant.StartClosure(ctx, e.db.Pool, tn.Scope(), tenant.SystemActor, reason, "c"); code(err) != "reason_required" {
+		if _, err := tenant.StartClosure(ctx, e.db.Pool, tn.Scope(), tenant.SystemActor, tenant.ClosureRequest{Reason: reason, RequestID: closureRequest.RequestID}, "c"); code(err) != "reason_required" {
 			t.Fatalf("reason %q = %v, want reason_required", reason, err)
 		}
 	}
@@ -134,7 +108,7 @@ func TestStartClosureRefusesWhatItMust(t *testing.T) {
 		t.Fatal("a refused start changed the tenant")
 	}
 	unknown := scope.Scope{Brand: tn.BrandID, Tenant: idgen.MustNewV7()}
-	if _, err := tenant.StartClosure(ctx, e.db.Pool, unknown, tenant.SystemActor, "reason", "c"); code(err) != "tenant_not_found" {
+	if _, err := tenant.StartClosure(ctx, e.db.Pool, unknown, tenant.SystemActor, closureRequest, "c"); code(err) != "tenant_not_found" {
 		t.Fatalf("unknown tenant = %v, want not found", err)
 	}
 	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = 'closed' WHERE id = $1`, tn.ID); err != nil {
@@ -204,6 +178,94 @@ func TestStartedClosureIsPickedUpBySweeper(t *testing.T) {
 	}
 	if org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID()); org.Enabled {
 		t.Fatal("the Organization of a closing tenant stayed enabled after the sweep")
+	}
+}
+
+// The settlement keeps who asked for the closure, why, and under which request
+// ID, and none of it can be changed afterwards.
+func TestStartClosureRecordsTheRequestAndKeepsItFixed(t *testing.T) {
+	e, tn := closureStartEnv(t)
+	ctx := context.Background()
+	got, err := startClosure(e, tn)
+	if err != nil || got.Reason != closureRequest.Reason || got.RequestID != closureRequest.RequestID {
+		t.Fatalf("start = %+v %v", got, err)
+	}
+	var by, reason, request string
+	if err := e.db.Pool.QueryRow(ctx, `SELECT started_by, start_reason, start_request_id FROM tenant_closure_settlements WHERE tenant_id = $1`, tn.ID).Scan(&by, &reason, &request); err != nil {
+		t.Fatal(err)
+	}
+	if by != string(tenant.SystemActor.Type)+":"+tenant.SystemActor.ID || reason != closureRequest.Reason || request != closureRequest.RequestID {
+		t.Fatalf("stored = %q %q %q", by, reason, request)
+	}
+	for _, column := range []string{"started_by = 'someone else'", "start_reason = 'another reason'", "start_request_id = 'another-request-id'"} {
+		if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_closure_settlements SET `+column+` WHERE tenant_id = $1`, tn.ID); err == nil {
+			t.Errorf("%s was changed after the start", column)
+		}
+	}
+}
+
+// The request ID makes the start idempotent: the same ID and reason is a
+// replay, the same ID with another reason conflicts, and another ID on a
+// closure that has started gets the closure that exists.
+func TestStartClosureReplaysByRequestID(t *testing.T) {
+	e, tn := closureStartEnv(t)
+	ctx := context.Background()
+	first, err := startClosure(e, tn)
+	if err != nil || !first.Started {
+		t.Fatalf("first = %+v %v", first, err)
+	}
+	same, err := tenant.StartClosure(ctx, e.db.Pool, tn.Scope(), tenant.SystemActor, closureRequest, "c")
+	if err != nil || same.Started || same.Reason != closureRequest.Reason {
+		t.Fatalf("same request = %+v %v, want a replay", same, err)
+	}
+	other := tenant.ClosureRequest{Reason: "a different reason", RequestID: closureRequest.RequestID}
+	if _, err := tenant.StartClosure(ctx, e.db.Pool, tn.Scope(), tenant.SystemActor, other, "c"); code(err) != "idempotency_key_conflict" {
+		t.Fatalf("same ID, other reason = %v, want idempotency_key_conflict", err)
+	}
+	second, err := tenant.StartClosure(ctx, e.db.Pool, tn.Scope(), tenant.SystemActor, tenant.ClosureRequest{Reason: "second caller", RequestID: "closure-request-0002"}, "c")
+	if err != nil || second.Started || second.Reason != closureRequest.Reason || second.RequestID != closureRequest.RequestID || !second.CutoffAt.Equal(first.CutoffAt) {
+		t.Fatalf("another ID = %+v %v, want the closure that exists", second, err)
+	}
+}
+
+func TestStartClosureNeedsAValidRequestID(t *testing.T) {
+	e, tn := closureStartEnv(t)
+	for _, id := range []string{"", "short", strings.Repeat("x", 256)} {
+		if _, err := tenant.StartClosure(context.Background(), e.db.Pool, tn.Scope(), tenant.SystemActor, tenant.ClosureRequest{Reason: "r", RequestID: id}, "c"); code(err) != "validation_failed" {
+			t.Errorf("request ID %q = %v, want validation_failed", id, err)
+		}
+	}
+	if tenantStatus(t, e, tn) != "active" || settlementRows(t, e, tn) != 0 {
+		t.Fatal("a refused start changed the tenant")
+	}
+}
+
+// Callers at once make exactly one settlement, one start and one audit. They
+// serialise on the lifecycle capability, so the others are told the tenant is
+// busy or find the closure that exists.
+func TestStartClosureConcurrentCallsStartItOnce(t *testing.T) {
+	e, tn := closureStartEnv(t)
+	var started, answered atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := startClosure(e, tn)
+			switch {
+			case err == nil && got.Started:
+				started.Add(1)
+			case err == nil, code(err) == "not_ready":
+				answered.Add(1)
+			default:
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	var audits int
+	if err := e.db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.closure_started'`, tn.ID).Scan(&audits); err != nil || started.Load() != 1 || started.Load()+answered.Load() != 6 || audits != 1 || settlementRows(t, e, tn) != 1 {
+		t.Fatalf("started = %d answered = %d audits = %d settlements = %d, %v, want one start, one audit, one settlement", started.Load(), answered.Load(), audits, settlementRows(t, e, tn), err)
 	}
 }
 

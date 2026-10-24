@@ -271,3 +271,26 @@ func TestPluginUsageAndConfigurationErrors(t *testing.T) {
 		}
 	}
 }
+
+// start-closure needs its flags, and does not ask for engine settings: it only
+// writes Core, so with no Keycloak or Kill Bill setting it gets as far as the
+// database, where this configuration has none.
+func TestTenantStartClosureFlagsAndNoEngineSettings(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := run([]string{"tenant", "start-closure", "--brand", "zs-reference"}, nil, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "--reason") {
+		t.Fatalf("missing flags = %d %q", code, errOut.String())
+	}
+	errOut.Reset()
+	environ := []string{"ZS_DATABASE_URL=postgres://u:pw-123@127.0.0.1:1/x?connect_timeout=1"}
+	args := []string{"tenant", "start-closure", "--brand", "zs-reference", "--tenant", "tnt_01m5qxsm2vefytm7qehn7fnrx5", "--reason", "left", "--operator", "me"}
+	if code := run(args, environ, &out, &errOut); code == 0 || strings.Contains(errOut.String(), "ZS_KEYCLOAK_URL") || strings.Contains(errOut.String(), "ZS_KILLBILL_URL") {
+		t.Fatalf("start-closure = %d %q, want a database error and no engine settings asked for", code, errOut.String())
+	}
+	errOut.Reset()
+	if code := run(append([]string{}, args[:1]...), nil, &out, &errOut); code != 2 {
+		t.Fatalf("tenant alone = %d", code)
+	}
+	if code := run([]string{"tenant", "suspend", "--brand", "zs-reference", "--tenant", "tnt_01m5qxsm2vefytm7qehn7fnrx5", "--reason", "left", "--operator", "me"}, environ, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "ZS_KEYCLOAK_URL") {
+		t.Fatalf("suspend without engine settings = %d %q, want the Keycloak setting asked for", code, errOut.String())
+	}
+}

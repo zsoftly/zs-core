@@ -526,7 +526,7 @@ func TestClosingTenantRefusesMembersAndAPIKeys(t *testing.T) {
 		t.Fatalf("key before the closure = %d %v", r.status, r.body)
 	}
 	if _, err := tenant.StartClosure(context.Background(), a.db.Pool, scope.Scope{Brand: b.ID, Tenant: tid},
-		events.Actor{Type: events.ActorService, ID: "test"}, "customer left", "test"); err != nil {
+		events.Actor{Type: events.ActorService, ID: "test"}, tenant.ClosureRequest{Reason: "customer left", RequestID: "closing-request-0001"}, "test"); err != nil {
 		t.Fatal(err)
 	}
 	tok := a.token(owner, mfa())

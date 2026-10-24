@@ -89,7 +89,7 @@ Rules:
 
 ## Staff grants
 
-Table `staff_grants`: `id` (`grt_`), `brand_id`, `issuer`, `subject`, `scope` (`operator`, `activation`, `billing`, `support`), `status`, `granted_by`, `reason`.
+Table `staff_grants`: `id` (`grt_`), `brand_id`, `issuer`, `subject`, `scope` (`operator`, `activation`, `billing`, `support`, `closure`), `status`, `granted_by`, `reason`.
 
 Staff tokens are verified against the brand's staff client. Authority comes only from an active grant with the needed scope in the same brand. A missing grant returns `404`. With a grant, a brand on `mfa: required` or `required_for_staff` also needs a second factor in the token, or the route answers `403 mfa_required`. No HTTP route creates or revokes grants in v1. `zs-core grant add` creates one and `zs-core grant revoke --brand --issuer --subject --scope --reason --operator` sets it to `revoked`. Both are audited, as `staff.grant.added` and `staff.grant.revoked`. A revoked grant stops working at once, because verification requires an `active` grant. Migrations create no grants. Keycloak realm roles never grant staff authority.
 

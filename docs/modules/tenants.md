@@ -169,6 +169,15 @@ Each command changes Kill Bill first, then the Keycloak Organization, then Core,
 
 Closing is terminal. It revokes every API key of the tenant with `tenant_closed`, in the same transaction. Each command on a closed tenant answers `409 tenant_closed`. Core checks again under the tenant lock before it writes. A reactivation that called the engines while a close committed is refused there with `tenant_closed`, the tenant stays closed, and Core disables the Organization again. If that last call fails, the sweeper disables it.
 
+A closing tenant that holds usage accepted before dispatch protocol 1 needs a manual review before closure can complete. That usage is read-only: the forwarder never rolls it up, sends it or marks it billed, and closure never discards, resends or bills it either. `RecordClosureReviews` records a required review item for each kind the tenant holds, once, and audits it as `tenant.closure_review_required`:
+
+| Kind | Reason shown to staff | Held when |
+| --- | --- | --- |
+| `legacy_usage_events` | `legacy_usage_unbilled` | The tenant has raw events of protocol 0 that are in no rollup. |
+| `legacy_usage_rollups` | `legacy_rollup_unsent` | The tenant has rollups of protocol 0 that are still pending. |
+
+Staff resolve an item with `ResolveClosureReview`, a note of 1 to 500 characters and their identity, audited as `tenant.closure_review_resolved`. `ListClosureReviews` returns the items with who resolved each and the note. The database refuses to move the closure settlement to `completed` while the tenant holds either kind of usage and no resolved item of that kind exists, so the rule holds even when no item was ever recorded. Resolving an item records the review. It does not change the usage.
+
 A closing tenant's closure invoice is recorded as an outcome and never assumed. `no_invoice` means Kill Bill's dry run for the account and target date found nothing left to invoice at that moment. Invoices that Kill Bill already generated are evidenced at settlement, not by this outcome.
 
 ## Scope resolution

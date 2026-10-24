@@ -80,7 +80,7 @@ After the send starts, only two answers are final. A `2xx`, or Kill Bill's refus
 
 Every pass starts with a sweep that never sends. A claim that ran out before any send started becomes `usage_claim_unconfirmed`, and a started send that nobody finished within ten minutes becomes `usage_send_unconfirmed`. Each is audited as `metering.usage.send_unconfirmed` and counted.
 
-Usage accepted before dispatch protocol 1 is read-only under the database guard. The forwarder never rolls it up, claims a legacy rollup or changes it. `LegacyUnrolled` counts a tenant's legacy events that are in no rollup, so unbilled legacy usage is never silent. Closing a tenant with such events is not covered yet.
+Usage accepted before dispatch protocol 1 is read-only under the database guard. The forwarder never rolls it up, claims a legacy rollup or changes it. `LegacyUnrolled` counts a tenant's legacy events that are in no rollup, so unbilled legacy usage is never silent. A closing tenant that holds such usage cannot complete closure until staff resolve a review item for it. See [tenants.md](tenants.md#suspension-and-closure).
 
 Each forwarded rollup is audited as `metering.usage.forwarded` with the subscription, the tracking ID, the unit and the quantity, and moves the tenant's wallet version on, since Kill Bill's unbilled amount grew.
 

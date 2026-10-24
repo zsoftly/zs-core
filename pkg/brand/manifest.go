@@ -640,6 +640,21 @@ func (m *Manifest) Validate() error {
 		}
 		aliases[p.Alias] = true
 	}
+	if m.Notifications != nil {
+		seen := map[string]string{}
+		for i, webhook := range m.Notifications.Webhooks {
+			path := fmt.Sprintf("/notifications/webhooks/%d/url", i)
+			canonical, err := CanonicalWebhookURL(webhook.URL)
+			if err != nil {
+				fail("%s: %v", path, err)
+				continue
+			}
+			if previous, ok := seen[canonical]; ok {
+				fail("%s: canonical URL %q is also used by %s", path, canonical, previous)
+			}
+			seen[canonical] = path
+		}
+	}
 	for path, file := range m.Billing.filePaths() {
 		if file != "" && !filepath.IsLocal(filepath.FromSlash(file)) {
 			fail("%s: must be a relative path inside the manifest directory", path)

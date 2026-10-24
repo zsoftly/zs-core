@@ -166,6 +166,18 @@ func transition(ctx context.Context, db DB, eng Engines, s scope.Scope, actor ev
 	if t.Status == to {
 		return t, nil
 	}
+	if to == StatusClosed {
+		// The hard close is for a tenant without a closure: with a settlement
+		// the closure ends it, and a close that called Kill Bill first would
+		// leave nothing for the closure to cancel or invoice.
+		var hasClosure bool
+		if err := db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_settlements WHERE brand_id = $1 AND tenant_id = $2)`, s.Brand, s.Tenant).Scan(&hasClosure); err != nil {
+			return Tenant{}, unavailable(err)
+		}
+		if hasClosure {
+			return Tenant{}, errTenantClosing()
+		}
+	}
 	be, err := eng.forBrand(ctx, db, s.Brand)
 	if err != nil {
 		return Tenant{}, err

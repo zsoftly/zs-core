@@ -10,6 +10,7 @@ import (
 	"github.com/zsoftly/zs-core/pkg/audit"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/events"
+	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/scope"
 )
 
@@ -98,6 +99,11 @@ WHERE brand_id = $1 AND tenant_id = $2 AND status = 'blocking'`
 			CorrelationID: correlationID, Details: map[string]any{"from": string(from), "to": string(to)}}); err != nil {
 			return err
 		}
+		if to == ClosureCompleted {
+			if err := closeTenantOfCompletedClosure(ctx, tx, sc, actor, correlationID); err != nil {
+				return err
+			}
+		}
 		result.Changed = true
 		return nil
 	})
@@ -105,6 +111,30 @@ WHERE brand_id = $1 AND tenant_id = $2 AND status = 'blocking'`
 		return ClosureAdvance{}, err
 	}
 	return result, nil
+}
+
+// closeTenantOfCompletedClosure closes the tenant in the transaction that
+// completes its settlement: the status, the time, the audit entry and the API
+// keys, which a hard close does the same way. A database rule of migration 32
+// refuses to commit a completed settlement whose tenant is not closed, and a
+// tenant that goes from closing to closed without one.
+func closeTenantOfCompletedClosure(ctx context.Context, tx pgx.Tx, sc scope.Scope, actor events.Actor, correlationID string) error {
+	args, err := sc.Bind()
+	if err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE tenants SET status = 'closed', closed_at = now(), updated_at = now() WHERE brand_id = $1 AND id = $2 AND status = 'closing'`, args...)
+	if err != nil {
+		return unavailable(err)
+	}
+	if tag.RowsAffected() != 1 {
+		return zserrors.New(zserrors.CodeNotReady, "The tenant is not closing.")
+	}
+	if _, err := audit.Write(ctx, tx, sc, audit.Entry{Actor: actor, Action: "tenant.closed", Reason: "closure settled", Outcome: audit.OutcomeSuccess, CorrelationID: correlationID,
+		Details: map[string]any{"status": map[string]any{"before": string(StatusClosing), "after": string(StatusClosed)}, "via": "closure"}}); err != nil {
+		return err
+	}
+	return revokeKeys(ctx, tx, sc, Caller{Actor: actor, CorrelationID: correlationID}, idgen.Nil, KeyRevokedTenantClosed)
 }
 
 // MarkClosureBlocked records that the closing tenant's account is blocked,
@@ -153,7 +183,9 @@ func lockClosureSettlement(ctx context.Context, tx pgx.Tx, sc scope.Scope) (Clos
 	err := tx.QueryRow(ctx, `SELECT s.status, t.status FROM tenant_closure_settlements s
 JOIN tenants t ON t.brand_id = s.brand_id AND t.id = s.tenant_id
 WHERE s.brand_id = $1 AND s.tenant_id = $2 FOR UPDATE OF s`, sc.Brand, sc.Tenant).Scan(&state, &tenantStatus)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && tenantStatus != "closing") {
+	// A tenant that is closing, or a closed one whose settlement is completed:
+	// completing the settlement closed it, and a repeat is a harmless no-op.
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && tenantStatus != "closing" && !(tenantStatus == "closed" && state == ClosureCompleted)) {
 		return "", zserrors.New(zserrors.CodeNotReady, "Closure settlement is not ready.")
 	}
 	if err != nil {

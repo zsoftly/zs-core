@@ -447,6 +447,17 @@ func disableSettlementStartRule(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `ALTER TABLE tenant_closure_settlements DISABLE TRIGGER tenant_closure_settlement_start`); err != nil {
 		return fmt.Errorf("disable the settlement start rule: %w", err)
 	}
+	// The same goes for the rules that tie a completed settlement to a closed
+	// tenant, which fixtures that insert a settlement at a later state would
+	// break.
+	for _, stmt := range []string{
+		`ALTER TABLE tenant_closure_settlements DISABLE TRIGGER tenant_closure_completed_needs_closed`,
+		`ALTER TABLE tenants DISABLE TRIGGER tenant_closed_needs_completed_closure`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("disable a closure invariant: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -459,5 +470,21 @@ func EnableSettlementStartRule(t testing.TB, db *DB) {
 	t.Helper()
 	if _, err := db.Pool.Exec(context.Background(), `ALTER TABLE tenant_closure_settlements ENABLE ALWAYS TRIGGER tenant_closure_settlement_start`); err != nil {
 		t.Fatalf("enable the settlement start rule: %v", err)
+	}
+}
+
+// EnableClosureInvariants turns back on, for db, the rules that tie a completed
+// closure settlement to a closed tenant, which the harness turns off on its
+// databases. A test of code that completes a closure, or of the rules
+// themselves, calls it.
+func EnableClosureInvariants(t testing.TB, db *DB) {
+	t.Helper()
+	for _, stmt := range []string{
+		`ALTER TABLE tenant_closure_settlements ENABLE ALWAYS TRIGGER tenant_closure_completed_needs_closed`,
+		`ALTER TABLE tenants ENABLE ALWAYS TRIGGER tenant_closed_needs_completed_closure`,
+	} {
+		if _, err := db.Pool.Exec(context.Background(), stmt); err != nil {
+			t.Fatalf("enable a closure invariant: %v", err)
+		}
 	}
 }

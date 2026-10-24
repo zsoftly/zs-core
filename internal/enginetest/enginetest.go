@@ -92,6 +92,12 @@ type Fake struct {
 	// lose counts the next writes, by path prefix, that take effect and
 	// then answer 503, as a lost answer looks to Core.
 	lose map[string]int
+	// drop counts the next writes, by path prefix, that take effect and
+	// then lose the connection without an answer.
+	drop map[string]int
+	// usageBodies are the exact bytes of every usage POST the fake received,
+	// by API key, oldest first.
+	usageBodies map[string][][]byte
 	// afterWrite is called after every Kill Bill write the fake took.
 	afterWrite func(method, path string)
 	// dryRunDown makes dry-run invoices answer 500.
@@ -157,6 +163,33 @@ func (f *Fake) LoseAnswers(prefix string, n int) {
 		f.lose = map[string]int{}
 	}
 	f.lose[prefix] = n
+}
+
+// DropAnswers makes the next n Kill Bill writes whose path starts with
+// prefix, such as /1.0/kb/usages, take effect and then close the connection
+// without an answer, as when Kill Bill resets the connection after it wrote.
+// The client sees a transport error, not a status.
+func (f *Fake) DropAnswers(prefix string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.drop == nil {
+		f.drop = map[string]int{}
+	}
+	f.drop[prefix] = n
+}
+
+// UsageBodies returns the exact request bodies of every POST /1.0/kb/usages
+// the fake received with the API key of a Kill Bill tenant, oldest first. A
+// POST the fake refused, lost or dropped is included, since it reached the
+// fake. The slices are copies.
+func (f *Fake) UsageBodies(apiKey string) [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]byte, 0, len(f.usageBodies[apiKey]))
+	for _, b := range f.usageBodies[apiKey] {
+		out = append(out, append([]byte(nil), b...))
+	}
+	return out
 }
 
 // AfterWrite calls fn after every Kill Bill write the fake took, with the
@@ -314,6 +347,13 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		path := strings.TrimPrefix(r.URL.Path, "/kb")
+		if r.Method == http.MethodPost && path == "/1.0/kb/usages" {
+			if f.usageBodies == nil {
+				f.usageBodies = map[string][][]byte{}
+			}
+			key := r.Header.Get(killbill.HeaderAPIKey)
+			f.usageBodies[key] = append(f.usageBodies[key], append([]byte(nil), body...))
+		}
 		for prefix, fl := range f.fail {
 			if fl.n > 0 && r.Method != http.MethodGet && strings.HasPrefix(path, prefix) {
 				f.fail[prefix] = failure{n: fl.n - 1, status: fl.status}
@@ -332,7 +372,19 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 				lost = true
 			}
 		}
-		if lost {
+		dropped := false
+		for prefix, n := range f.drop {
+			if n > 0 && r.Method != http.MethodGet && strings.HasPrefix(path, prefix) {
+				f.drop[prefix] = n - 1
+				dropped = true
+			}
+		}
+		if dropped {
+			f.serveKillBill(httptest.NewRecorder(), r, path, body)
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		} else if lost {
 			f.serveKillBill(httptest.NewRecorder(), r, path, body)
 			http.Error(w, "answer lost", http.StatusServiceUnavailable)
 		} else {

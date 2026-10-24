@@ -306,3 +306,163 @@ func TestLifecycleGuardRejectsTxOperationsWithOpenRows(t *testing.T) {
 		})
 	}
 }
+
+func TestLifecycleGuardCancelsBlockedQueryAndInvalidatesCapability(t *testing.T) {
+	db := postgrestest.New(t)
+	lockKey := int64(81234567)
+	locker, err := db.Pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { locker.Release() })
+	if _, err := locker.Exec(context.Background(), `SELECT pg_advisory_lock($1::bigint)`, lockKey); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = locker.Exec(context.Background(), `SELECT pg_advisory_unlock($1::bigint)`, lockKey) })
+	guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	var pid uint32
+	if err := guard.QueryRow(context.Background(), `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	queryCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	queryDone := make(chan error, 1)
+	go func() {
+		rows, err := guard.Query(queryCtx, `SELECT pg_advisory_lock($1::bigint)`, lockKey)
+		if rows != nil {
+			rows.Close()
+			if err == nil {
+				err = rows.Err()
+			}
+		}
+		queryDone <- err
+	}()
+	observer, err := db.Pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { observer.Release() })
+	waited := false
+	for range 1000 {
+		if err := observer.QueryRow(context.Background(), `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)`, pid).Scan(&waited); err != nil {
+			t.Fatal(err)
+		}
+		if waited {
+			break
+		}
+	}
+	if !waited {
+		t.Fatal("guard query did not enter an advisory-lock wait")
+	}
+	cancel()
+	if err := <-queryDone; err == nil {
+		t.Fatal("cancelled blocked query succeeded")
+	}
+	if _, err := guard.Query(context.Background(), `SELECT 1`); !errors.Is(err, tenant.ErrLifecycleReleased) {
+		t.Fatalf("query after cancelled result = %v", err)
+	}
+}
+
+func TestLifecycleGuardSameTenantContentionReleasesForReacquire(t *testing.T) {
+	db := postgrestest.New(t)
+	sc := lifecycleScope()
+	type result struct {
+		guard *tenant.LifecycleGuard
+		got   bool
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, sc)
+			results <- result{guard: guard, got: got, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	for _, result := range []result{first, second} {
+		if result.guard != nil {
+			guard := result.guard
+			t.Cleanup(func() {
+				if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+					t.Error(err)
+				}
+			})
+		}
+	}
+	if first.err != nil || second.err != nil || first.got == second.got {
+		t.Fatalf("contention = %+v %+v", first, second)
+	}
+	winner := first
+	if !winner.got {
+		winner = second
+	}
+	if err := winner.guard.Release(); err != nil {
+		t.Fatal(err)
+	}
+	again, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, sc)
+	if again != nil {
+		t.Cleanup(func() {
+			if err := again.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+				t.Error(err)
+			}
+		})
+	}
+	if err != nil || !got {
+		t.Fatalf("reacquire = %v %v", got, err)
+	}
+	if err := again.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLifecycleGuardInvalidatesAfterDeferredCommitFailure(t *testing.T) {
+	db := postgrestest.New(t)
+	guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), db.Pool, lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	tx, err := guard.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := tx.Rollback(context.Background()); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) && !errors.Is(err, pgx.ErrTxClosed) {
+			t.Error(err)
+		}
+	})
+	if _, err := tx.Exec(context.Background(), `CREATE TEMP TABLE lifecycle_guard_deferred_unique (id integer UNIQUE DEFERRABLE INITIALLY DEFERRED)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = guard.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(context.Background(), `INSERT INTO lifecycle_guard_deferred_unique (id) VALUES (1), (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(context.Background()); err == nil {
+		t.Fatal("deferred unique violation committed")
+	}
+	if _, err := guard.Query(context.Background(), `SELECT 1`); !errors.Is(err, tenant.ErrLifecycleReleased) {
+		t.Fatalf("query after failed commit = %v", err)
+	}
+}

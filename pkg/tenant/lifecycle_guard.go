@@ -174,19 +174,24 @@ func (g *LifecycleGuard) Begin(ctx context.Context) (pgx.Tx, error) {
 // pgx Rows Conn escape hatch and invalidates when its owner generation ends.
 func (g *LifecycleGuard) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	if err := g.readyLocked(false); err != nil {
+		g.mu.Unlock()
 		return nil, err
 	}
 	if g.activeTx != nil || g.rows != nil {
+		g.mu.Unlock()
 		return nil, errors.New("tenant lifecycle operation already active")
 	}
 	rows, err := g.conn.Query(ctx, sql, args...)
 	if err != nil {
+		g.invalidateLocked()
+		g.mu.Unlock()
+		g.discard()
 		return nil, unavailable(err)
 	}
 	bound := &lifecycleRows{owner: g, generation: g.generation, rows: rows}
 	g.rows = bound
+	g.mu.Unlock()
 	return bound, nil
 }
 
@@ -223,6 +228,17 @@ func (g *LifecycleGuard) readyLocked(child bool) error {
 	return nil
 }
 
+func (g *LifecycleGuard) invalidateLocked() {
+	g.released = true
+	*g.discarded = true
+	g.generation++
+	if g.parent != nil {
+		g.parent.released = true
+		*g.parent.discarded = true
+		g.parent.generation++
+	}
+}
+
 type lifecycleRow struct {
 	rows *lifecycleRows
 	err  error
@@ -257,17 +273,26 @@ func (r *lifecycleRows) Next() bool {
 		return false
 	}
 	r.owner.mu.Lock()
-	defer r.owner.mu.Unlock()
 	if r.closed || r.owner.readyLocked(false) != nil || r.owner.generation != r.generation {
+		r.owner.mu.Unlock()
 		return false
 	}
 	ok := r.rows.Next()
+	failed := false
 	if !ok {
+		failed = r.rows.Err() != nil
 		r.closed = true
 		r.rows.Close()
 		if r.owner.rows == r {
 			r.owner.rows = nil
 		}
+		if failed {
+			r.owner.invalidateLocked()
+		}
+	}
+	r.owner.mu.Unlock()
+	if failed {
+		r.owner.discard()
 	}
 	return ok
 }
@@ -277,18 +302,33 @@ func (r *lifecycleRows) Scan(dest ...any) error {
 		return ErrLifecycleReleased
 	}
 	r.owner.mu.Lock()
-	defer r.owner.mu.Unlock()
 	if r.closed || r.owner.readyLocked(false) != nil || r.owner.generation != r.generation {
+		r.owner.mu.Unlock()
 		return ErrLifecycleReleased
 	}
-	return r.rows.Scan(dest...)
+	err := r.rows.Scan(dest...)
+	if err != nil {
+		r.owner.invalidateLocked()
+	}
+	r.owner.mu.Unlock()
+	if err != nil {
+		r.owner.discard()
+	}
+	return err
 }
 
 func (r *lifecycleRows) Err() error {
 	if r == nil || r.owner.ready(false) != nil || r.owner.generation != r.generation {
 		return ErrLifecycleReleased
 	}
-	return r.rows.Err()
+	err := r.rows.Err()
+	if err != nil {
+		r.owner.mu.Lock()
+		r.owner.invalidateLocked()
+		r.owner.mu.Unlock()
+		r.owner.discard()
+	}
+	return err
 }
 
 func (r *lifecycleRows) CommandTag() pgconn.CommandTag {
@@ -333,13 +373,20 @@ func (r *lifecycleRows) Close() {
 	if r == nil || r.closed {
 		return
 	}
+	r.owner.mu.Lock()
 	r.closed = true
 	r.rows.Close()
-	r.owner.mu.Lock()
+	failed := r.rows.Err() != nil
 	if r.owner.rows == r {
 		r.owner.rows = nil
 	}
+	if failed {
+		r.owner.invalidateLocked()
+	}
 	r.owner.mu.Unlock()
+	if failed {
+		r.owner.discard()
+	}
 }
 
 type lifecycleTx struct {

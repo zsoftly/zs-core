@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,26 @@ type env struct {
 	eng   tenant.Engines
 	brand enginetest.Brand
 }
+
+type sweepUnlockCancelTracer struct {
+	enabled atomic.Bool
+	hits    atomic.Int64
+	child   bool
+}
+
+func (t *sweepUnlockCancelTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if t.enabled.Load() && strings.Contains(data.SQL, "pg_advisory_unlock") && len(data.Args) == 1 {
+		if key, ok := data.Args[0].(int64); ok && (key < 0) == t.child {
+			t.hits.Add(1)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx
+		}
+	}
+	return ctx
+}
+
+func (*sweepUnlockCancelTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func newEnv(t *testing.T, permissions ...string) *env {
 	t.Helper()
@@ -314,6 +335,143 @@ func TestSweeperCompletesCreationWithOneConnection(t *testing.T) {
 	}
 }
 
+func TestSweeperCancellationDoesNotRetainOneConnection(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.fake.SetDown(false, true)
+	owner := e.person("cancelled-sweep@example.test")
+	if _, err := e.createOrg(owner, "Cancelled Sweep", "cancelled-sweep-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("creation = %v", err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_provisioning SET next_attempt_at = now() WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgxpool.ParseConfig(e.db.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := (&tenant.Sweeper{DB: pool, Engines: e.eng}).SweepOnce(cancelled); err == nil {
+		t.Fatal("cancelled sweep succeeded")
+	}
+	e.fake.SetDown(false, false)
+	report, err := (&tenant.Sweeper{DB: pool, Engines: e.eng}).SweepOnce(ctx)
+	if err != nil || report.Completed != 1 {
+		t.Fatalf("sweep after cancellation = %+v %v", report, err)
+	}
+}
+
+func TestSweeperReturnsVerifiedGlobalReleaseFailure(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tracer := &sweepUnlockCancelTracer{}
+	cfg, err := pgxpool.ParseConfig(e.db.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	cfg.ConnConfig.Tracer = tracer
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	tracer.enabled.Store(true)
+	if _, err := (&tenant.Sweeper{DB: pool, Engines: e.eng}).SweepOnce(ctx); !errors.Is(err, context.Canceled) || tracer.hits.Load() == 0 {
+		t.Fatalf("global release failure = %v hits=%d", err, tracer.hits.Load())
+	}
+	tracer.enabled.Store(false)
+	if report, err := (&tenant.Sweeper{DB: pool, Engines: e.eng}).SweepOnce(ctx); err != nil || report.Skipped {
+		t.Fatalf("sweep after global release failure = %+v %v", report, err)
+	}
+}
+
+func TestSweeperReturnsVerifiedChildReleaseFailure(t *testing.T) {
+	e := newEnv(t)
+	owner := e.person("child-release@example.test")
+	e.mustOrg(owner, "Child Release")
+	ctx := context.Background()
+	tracer := &sweepUnlockCancelTracer{child: true}
+	cfg, err := pgxpool.ParseConfig(e.db.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	cfg.ConnConfig.Tracer = tracer
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	e.fake.SetDown(true, false)
+	tracer.enabled.Store(true)
+	report, err := (&tenant.Sweeper{DB: pool, Engines: e.eng}).SweepOnce(ctx)
+	if !errors.Is(err, context.Canceled) || tracer.hits.Load() == 0 || report.Errors == 0 {
+		t.Fatalf("child release failure = %+v %v hits=%d", report, err, tracer.hits.Load())
+	}
+}
+
+func TestSweeperMidFlightCancellationLeavesCreationRetryable(t *testing.T) {
+	e := newEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.fake.SetDown(false, true)
+	owner := e.person("midflight-cancel@example.test")
+	if _, err := e.createOrg(owner, "Midflight Cancel", "midflight-cancel-key"); code(err) != "billing_unavailable" {
+		t.Fatalf("creation = %v", err)
+	}
+	if _, err := e.db.Pool.Exec(context.Background(), `UPDATE tenant_provisioning SET next_attempt_at = now() WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pgxpool.ParseConfig(e.db.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	var fired atomic.Bool
+	e.fake.AfterWrite(func(_, _ string) {
+		if fired.CompareAndSwap(false, true) {
+			cancel()
+		}
+	})
+	t.Cleanup(func() { e.fake.AfterWrite(nil) })
+	e.fake.SetDown(false, false)
+	if _, err := (&tenant.Sweeper{DB: pool, Engines: e.eng}).SweepOnce(ctx); err == nil || !fired.Load() {
+		t.Fatalf("midflight cancellation = %v fired=%v", err, fired.Load())
+	}
+	e.fake.AfterWrite(nil)
+	var one int
+	if err := pool.QueryRow(context.Background(), `SELECT 1`).Scan(&one); err != nil || one != 1 {
+		t.Fatalf("pool after midflight cancellation = %d %v", one, err)
+	}
+	report, err := (&tenant.Sweeper{DB: pool, Engines: e.eng}).SweepOnce(context.Background())
+	if err != nil {
+		t.Fatalf("sweep after midflight cancellation = %+v %v", report, err)
+	}
+	var status string
+	if err := pool.QueryRow(context.Background(), `SELECT status FROM tenant_provisioning`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" && status != "completed" {
+		t.Fatalf("midflight creation status = %q", status)
+	}
+	if status == "pending" && report.Completed != 0 {
+		t.Fatalf("pending midflight creation completed count = %d", report.Completed)
+	}
+}
+
 func TestSweeperCreationCursorAdvancesPastLockedPrefix(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -406,6 +564,81 @@ func TestSweeperCreationCursorCapsWorkAndResumes(t *testing.T) {
 	}
 	if !wrapped {
 		t.Fatal("creation cursor did not wrap after resumed final work")
+	}
+}
+
+func TestSweeperCreationCursorScansBusyPrefixBeforeResuming(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.fake.SetDown(false, true)
+	for i := range 501 {
+		owner := e.person(fmt.Sprintf("cursor-scan-%03d@example.test", i))
+		if _, err := e.createOrg(owner, fmt.Sprintf("Cursor Scan %03d", i), fmt.Sprintf("cursor-scan-key-%03d", i)); code(err) != "billing_unavailable" {
+			t.Fatalf("creation %d = %v", i, err)
+		}
+	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_provisioning SET next_attempt_at = date_trunc('minute', now()) WHERE status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	var fiveHundredth idgen.UUID
+	if err := e.db.Pool.QueryRow(ctx, `SELECT tenant_id FROM tenant_provisioning WHERE status = 'pending'
+        ORDER BY next_attempt_at, tenant_id OFFSET 499 LIMIT 1`).Scan(&fiveHundredth); err != nil {
+		t.Fatal(err)
+	}
+	locker, err := e.db.Pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = locker.Exec(context.Background(), `SELECT pg_advisory_unlock_all()`)
+		locker.Release()
+	})
+	rows, err := locker.Query(ctx, `SELECT pg_advisory_lock(
+    hashtextextended('zs-core.tenant.closure:' || current_schema() || ':' || brand_id::text || ':' || tenant_id::text, 0)
+    | '-9223372036854775808'::bigint
+) FROM (
+    SELECT brand_id, tenant_id FROM tenant_provisioning WHERE status = 'pending'
+    ORDER BY next_attempt_at, tenant_id LIMIT 500
+) locked`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	e.fake.SetDown(false, false)
+	first, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng}).SweepOnce(ctx)
+	if err != nil || first.Completed != 0 {
+		t.Fatalf("busy-prefix sweep = %+v %v", first, err)
+	}
+	var cursor idgen.UUID
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id FROM sweep_cursor WHERE kind = 'creation'`).Scan(&cursor); err != nil {
+		t.Fatalf("busy-prefix cursor = %v", err)
+	}
+	if cursor != fiveHundredth {
+		t.Fatalf("busy-prefix cursor = %s, want %s", cursor, fiveHundredth)
+	}
+	second, err := (&tenant.Sweeper{DB: e.db.Pool, Engines: e.eng}).SweepOnce(ctx)
+	if err != nil || second.Completed != 1 {
+		t.Fatalf("busy-prefix resume = %+v %v", second, err)
+	}
+	var pending int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM tenant_provisioning WHERE status = 'pending'`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 500 {
+		t.Fatalf("busy pending = %d, want 500", pending)
+	}
+	var wrapped bool
+	if err := e.db.Pool.QueryRow(ctx, `SELECT last_tenant_id IS NULL FROM sweep_cursor WHERE kind = 'creation'`).Scan(&wrapped); err != nil {
+		t.Fatal(err)
+	}
+	if !wrapped {
+		t.Fatal("busy-prefix cursor did not wrap")
 	}
 }
 

@@ -82,8 +82,7 @@ func (s *Sweeper) Run(ctx context.Context, interval time.Duration) {
 
 // SweepOnce runs one pass. It returns Skipped when another pass holds the
 // lock.
-func (s *Sweeper) SweepOnce(ctx context.Context) (SweepReport, error) {
-	var report SweepReport
+func (s *Sweeper) SweepOnce(ctx context.Context) (report SweepReport, err error) {
 	if !s.Engines.Ready() {
 		return report, fmt.Errorf("tenant sweep: the engines are not configured")
 	}
@@ -99,7 +98,11 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (SweepReport, error) {
 		report.Skipped = true
 		return report, nil
 	}
-	defer func() { _ = guard.Release() }()
+	defer func() {
+		if releaseErr := guard.Release(); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+	}()
 	correlationID := idgen.MustNewV7().String()
 	if err := s.completeCreations(ctx, guard, correlationID, &report); err != nil {
 		return report, err
@@ -315,9 +318,6 @@ func (s *Sweeper) syncBrand(ctx context.Context, guard *LifecycleSweep, brandID 
 			recipientCtx, cancel := context.WithTimeout(ctx, mirrorTimeout)
 			recipient, recipientErr := ReconcileBillingRecipient(recipientCtx, child, s.Engines, t.Scope(), correlationID)
 			cancel()
-			if releaseErr := child.Release(); releaseErr != nil && err == nil && recipientErr == nil {
-				return releaseErr
-			}
 			if recipient.Deferred {
 				report.RecipientsDeferred++
 			} else {
@@ -329,6 +329,9 @@ func (s *Sweeper) syncBrand(ctx context.Context, guard *LifecycleSweep, brandID 
 			if recipientErr != nil {
 				report.Errors++
 				s.log().Warn("billing recipient not in step with Core", "tenant_id", t.PublicID(), "error_code", codeName(recipientErr))
+			}
+			if releaseErr := child.Release(); releaseErr != nil {
+				return errors.Join(err, recipientErr, releaseErr)
 			}
 		}
 		if len(list) < s.batch() {

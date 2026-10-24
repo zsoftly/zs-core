@@ -35,7 +35,7 @@ type ClosureStart struct {
 // refused as tenant_closed. The start takes no step against Kill Bill or
 // Keycloak: the cancellation, the invoice and the account block are the steps
 // of the settlement.
-func StartClosure(ctx context.Context, db DB, sc scope.Scope, actor events.Actor, reason, correlationID string) (ClosureStart, error) {
+func StartClosure(ctx context.Context, db DB, sc scope.Scope, actor events.Actor, reason, correlationID string) (_ ClosureStart, err error) {
 	if _, ok := db.(pgx.Tx); ok {
 		return ClosureStart{}, zserrors.New(zserrors.CodeNotReady, "Closure start is not ready.")
 	}
@@ -46,8 +46,16 @@ func StartClosure(ctx context.Context, db DB, sc scope.Scope, actor events.Actor
 	if reason == "" || utf8.RuneCountInString(reason) > 1000 {
 		return ClosureStart{}, zserrors.New(zserrors.CodeReasonRequired, "")
 	}
+	// The start holds the lifecycle capability of the tenant, as Suspend,
+	// Reactivate and Close do from their read to their last write, so it is
+	// refused as busy while one of them runs and one is refused while it runs.
+	db, done, err := underTenantCapability(ctx, db, sc)
+	if err != nil {
+		return ClosureStart{}, err
+	}
+	defer done(&err)
 	var result ClosureStart
-	err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
 		locked, err := lockTenant(ctx, tx, sc)
 		if err != nil {
 			return err
@@ -66,6 +74,16 @@ func StartClosure(ctx context.Context, db DB, sc scope.Scope, actor events.Actor
 			}
 			result = ClosureStart{Tenant: locked, CutoffAt: cutoff}
 			return nil
+		}
+		// A settlement that exists for a tenant that is not closing is
+		// answered before the insert: a failed statement would end the
+		// capability, and this is an answer, not a fault.
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_settlements WHERE brand_id = $1 AND tenant_id = $2)`, sc.Brand, sc.Tenant).Scan(&exists); err != nil {
+			return unavailable(err)
+		}
+		if exists {
+			return zserrors.New(zserrors.CodeConflict, "A closure settlement already exists for this tenant.")
 		}
 		var cutoff time.Time
 		if err := tx.QueryRow(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at) VALUES ($1, $2, now()) RETURNING cutoff_at`,

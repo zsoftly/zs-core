@@ -93,29 +93,32 @@ func TestStartClosureIsIdempotent(t *testing.T) {
 	}
 }
 
-// Two starts at once make exactly one settlement, one start and one audit.
+// Callers at once make exactly one settlement, one start and one audit. They
+// serialise on the lifecycle capability, so the others are told the tenant is
+// busy or find the closure that exists.
 func TestStartClosureConcurrentCallsStartItOnce(t *testing.T) {
 	e, tn := closureStartEnv(t)
-	var started atomic.Int64
+	var started, answered atomic.Int64
 	var wg sync.WaitGroup
 	for i := 0; i < 6; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			got, err := startClosure(e, tn)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			if got.Started {
+			switch {
+			case err == nil && got.Started:
 				started.Add(1)
+			case err == nil, code(err) == "not_ready":
+				answered.Add(1)
+			default:
+				t.Error(err)
 			}
 		}()
 	}
 	wg.Wait()
 	var audits int
-	if err := e.db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.closure_started'`, tn.ID).Scan(&audits); err != nil || started.Load() != 1 || audits != 1 || settlementRows(t, e, tn) != 1 {
-		t.Fatalf("started = %d audits = %d settlements = %d, %v, want one each", started.Load(), audits, settlementRows(t, e, tn), err)
+	if err := e.db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.closure_started'`, tn.ID).Scan(&audits); err != nil || started.Load() != 1 || started.Load()+answered.Load() != 6 || audits != 1 || settlementRows(t, e, tn) != 1 {
+		t.Fatalf("started = %d answered = %d audits = %d settlements = %d, %v, want one start, one audit, one settlement", started.Load(), answered.Load(), audits, settlementRows(t, e, tn), err)
 	}
 }
 
@@ -204,11 +207,11 @@ func TestStartedClosureIsPickedUpBySweeper(t *testing.T) {
 	}
 }
 
-// A closure that starts while Suspend, Reactivate or Close is calling the
-// engines wins. The command is refused, the tenant stays closing with its
-// settlement, nothing is audited as the command's own change, and the
-// Organization the command may have enabled is disabled again.
-func TestStartClosureDuringALifecycleCommandWins(t *testing.T) {
+// A closure cannot start while Suspend, Reactivate or Close is in the middle
+// of its engine call: both hold the lifecycle capability of the tenant, so the
+// start is refused as busy and the command finishes, with Kill Bill, Keycloak
+// and Core in step. The tenant can start its closure once the command is done.
+func TestStartClosureDuringALifecycleCommandIsRefusedAndTheCommandCompletes(t *testing.T) {
 	for _, command := range []string{"suspend", "reactivate", "close"} {
 		t.Run(command, func(t *testing.T) {
 			e, tn := closureStartEnv(t)
@@ -220,44 +223,118 @@ func TestStartClosureDuringALifecycleCommandWins(t *testing.T) {
 				}
 			}
 			var started atomic.Bool
+			var duringErr error
 			e.fake.AfterWrite(func(string, string) {
 				if started.CompareAndSwap(false, true) {
-					if _, err := startClosure(e, tn); err != nil {
-						t.Error(err)
-					}
+					_, duringErr = startClosure(e, tn)
 				}
 			})
 			t.Cleanup(func() { e.fake.AfterWrite(nil) })
+			var got tenant.Tenant
 			var err error
 			switch command {
 			case "suspend":
-				_, err = tenant.Suspend(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+				got, err = tenant.Suspend(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
 			case "reactivate":
-				_, err = tenant.Reactivate(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+				got, err = tenant.Reactivate(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
 			case "close":
-				_, err = tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+				got, err = tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
 			}
 			e.fake.AfterWrite(nil)
 			if !started.Load() {
-				t.Fatal("the closure was never started in the middle of the command")
+				t.Fatal("the closure start was never tried in the middle of the command")
 			}
-			if code(err) != "not_ready" {
-				t.Fatalf("%s during a closure start = %v, want not_ready", command, err)
+			if code(err) != "ok" {
+				t.Fatalf("%s = %v, want it to complete", command, err)
 			}
-			if got := tenantStatus(t, e, tn); got != "closing" || settlementRows(t, e, tn) != 1 {
-				t.Fatalf("status = %q settlements = %d, want closing and one", got, settlementRows(t, e, tn))
+			if code(duringErr) != "not_ready" {
+				t.Fatalf("the closure start during %s = %v, want not_ready", command, duringErr)
 			}
-			var own int
-			if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = $2`, tn.ID,
-				map[string]string{"suspend": "tenant.suspended", "reactivate": "tenant.reactivated", "close": "tenant.closed"}[command]).Scan(&own); err != nil {
-				t.Fatal(err)
+			want := map[string]tenant.Status{"suspend": tenant.StatusSuspended, "reactivate": tenant.StatusActive, "close": tenant.StatusClosed}[command]
+			account, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
+			org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID())
+			if got.Status != want || tenantStatus(t, e, tn) != string(want) || settlementRows(t, e, tn) != 0 {
+				t.Fatalf("status = %q (stored %q), settlements %d, want %q and none", got.Status, tenantStatus(t, e, tn), settlementRows(t, e, tn), want)
 			}
-			if own != 0 {
-				t.Fatalf("%d audit entries of the refused %s command, want none", own, command)
+			blocked := len(account.Blocking) > 0 && account.Blocking[len(account.Blocking)-1].IsBlockBilling
+			switch command {
+			case "suspend":
+				if !blocked || org.Enabled || account.Closed {
+					t.Fatalf("suspend left Kill Bill blocked = %v, Organization enabled = %v, closed = %v", blocked, org.Enabled, account.Closed)
+				}
+			case "reactivate":
+				if blocked || !org.Enabled || account.Closed {
+					t.Fatalf("reactivate left Kill Bill blocked = %v, Organization enabled = %v, closed = %v", blocked, org.Enabled, account.Closed)
+				}
+			case "close":
+				if !account.Closed || org.Enabled {
+					t.Fatalf("close left the Kill Bill account closed = %v, Organization enabled = %v", account.Closed, org.Enabled)
+				}
 			}
-			if org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID()); org.Enabled {
-				t.Fatalf("the Organization is enabled after a refused %s", command)
+			// The capability was released: once the command is done a tenant that
+			// can still be closed starts its closure.
+			if command != "close" {
+				if res, err := startClosure(e, tn); err != nil || !res.Started {
+					t.Fatalf("closure start after %s = %+v %v", command, res, err)
+				}
 			}
 		})
+	}
+}
+
+// While another owner holds the lifecycle capability of the tenant, Suspend,
+// Reactivate, Close and StartClosure are refused as busy and touch nothing:
+// not Core, not Kill Bill, not Keycloak.
+func TestLifecycleCommandsAndStartClosureAreBusyWhileTheCapabilityIsHeld(t *testing.T) {
+	e, tn := closureStartEnv(t)
+	ctx := context.Background()
+	guard, got, err := tenant.AcquireLifecycleGuard(ctx, e.db.Pool, tn.Scope())
+	if err != nil || !got {
+		t.Fatalf("acquire = %v %v", got, err)
+	}
+	before, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
+	actor := tenant.SystemActor
+	for name, run := range map[string]func() error{
+		"suspend": func() error { _, err := tenant.Suspend(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c"); return err },
+		"reactivate": func() error {
+			_, err := tenant.Reactivate(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c")
+			return err
+		},
+		"close":         func() error { _, err := tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), actor, "r", "c"); return err },
+		"start closure": func() error { _, err := startClosure(e, tn); return err },
+	} {
+		if err := run(); code(err) != "not_ready" {
+			t.Errorf("%s while the capability is held = %v, want not_ready", name, err)
+		}
+	}
+	after, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
+	org, _, _ := e.fake.Organization(e.brand.Realm, tn.PublicID())
+	if len(after.Blocking) != len(before.Blocking) || after.Closed || !org.Enabled || tenantStatus(t, e, tn) != "active" || settlementRows(t, e, tn) != 0 {
+		t.Fatalf("a busy command changed something: blocking %d -> %d, closed %v, org enabled %v, status %q", len(before.Blocking), len(after.Blocking), after.Closed, org.Enabled, tenantStatus(t, e, tn))
+	}
+	if err := guard.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := startClosure(e, tn); err != nil || !res.Started {
+		t.Fatalf("closure start after the release = %+v %v", res, err)
+	}
+}
+
+// Once a closure has started, Close is refused before it calls Kill Bill: the
+// account is not closed, so the closure still has its subscriptions to cancel
+// and its usage to invoice.
+func TestCloseOfAClosingTenantDoesNotCloseTheKillBillAccount(t *testing.T) {
+	e, tn := closureStartEnv(t)
+	ctx := context.Background()
+	if _, err := startClosure(e, tn); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
+	if _, err := tenant.Close(ctx, e.db.Pool, e.eng, tn.Scope(), tenant.SystemActor, "hard close", "c"); code(err) != "not_ready" {
+		t.Fatalf("close of a closing tenant = %v, want not_ready", err)
+	}
+	after, _ := e.fake.Account(e.brand.Slug, tn.PublicID())
+	if after.Closed || len(after.Blocking) != len(before.Blocking) {
+		t.Fatalf("the Kill Bill account was touched: closed %v, blocking %d -> %d", after.Closed, len(before.Blocking), len(after.Blocking))
 	}
 }

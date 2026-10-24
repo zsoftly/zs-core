@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/zsoftly/zs-core/internal/enginetest"
-	"github.com/zsoftly/zs-core/internal/killbill"
 	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/metering"
 	"github.com/zsoftly/zs-core/pkg/scope"
@@ -58,46 +57,43 @@ func setupOneRollup(t *testing.T, slug string) (*env, string, idgen.UUID) {
 	return e, b.Slug, tn.ID
 }
 
-// Kill Bill holds the usage but the answer is a 503: the rollup is kept as
-// unconfirmed and no second POST is made, now or later.
+// Kill Bill records the usage and the answer never arrives, as a 503 or as a
+// connection closed after the write: the rollup is kept as unconfirmed and
+// no second POST is made, now or later.
 func TestLostAnswerIsUnconfirmedAndNeverResent(t *testing.T) {
-	e := newEnv(t)
-	ctx := context.Background()
-	b := e.brand("zs-lost")
-	tn := e.tenant(b, "Lost Co")
-	sub := e.subscribe(b, tn, enginetest.PlanMetered)
-	if _, _, err := e.record(tn.Scope(), metering.Event{Meter: "api-calls", EventID: "l-a", QuantityMicro: 2_000_000}); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := e.svc.RollUp(ctx, tn.Scope()); err != nil || n != 1 {
-		t.Fatalf("rollup = %d %v", n, err)
-	}
-	var tracking string
-	if err := e.db.Pool.QueryRow(ctx, `SELECT tracking_id FROM usage_rollups WHERE tenant_id = $1`, tn.ID).Scan(&tracking); err != nil {
-		t.Fatal(err)
-	}
-	// Kill Bill recorded it, and the answer to the forwarder is lost.
-	if err := e.fake.KillBill(t).RecordUsage(ctx, killbill.TenantCredentials{APIKey: b.Slug, APISecret: "kb-secret-" + b.Slug}, killbill.CallContext{CreatedBy: "test"},
-		killbill.SubscriptionUsageRecord{SubscriptionID: sub, TrackingID: tracking, UnitUsageRecords: []killbill.UnitUsageRecords{{UnitType: enginetest.UnitAPICall,
-			UsageRecords: []killbill.UsageRecord{{RecordDate: e.clock.Now().UTC().Format("2006-01-02T15:04:05.000Z"), Amount: "2"}}}}}); err != nil {
-		t.Fatal(err)
-	}
-	e.fake.FailWrites("/1.0/kb/usages", 1, 503)
-	report, err := e.svc.Forward(ctx)
-	if err != nil || report.Unconfirmed != 1 || report.Forwarded != 0 {
-		t.Fatalf("forward = %+v %v", report, err)
-	}
-	var reason string
-	if err := e.db.Pool.QueryRow(ctx, `SELECT closure_unresolved_reason FROM usage_rollups WHERE tenant_id = $1`, tn.ID).Scan(&reason); err != nil || reason != "usage_send_unconfirmed" {
-		t.Fatalf("reason = %q %v", reason, err)
-	}
-	posts := usagePosts(e)
-	e.clock.advance(24 * time.Hour)
-	if _, err := e.svc.Forward(ctx); err != nil || usagePosts(e) != posts {
-		t.Fatalf("a second POST was made: %d -> %d %v", posts, usagePosts(e), err)
-	}
-	if recs := e.fake.UsageRecords(b.Slug); len(recs) != 1 {
-		t.Fatalf("Kill Bill holds %d records, want exactly 1", len(recs))
+	for _, mode := range []struct {
+		name string
+		lose func(*env)
+	}{
+		{"503 after the write", func(e *env) { e.fake.LoseAnswers("/1.0/kb/usages", 1) }},
+		{"connection closed after the write", func(e *env) { e.fake.DropAnswers("/1.0/kb/usages", 1) }},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			e, slug, tenantID := setupOneRollup(t, "zs-lost")
+			ctx := context.Background()
+			mode.lose(e)
+			report, err := e.svc.Forward(ctx)
+			if err != nil || report.Unconfirmed != 1 || report.Forwarded != 0 || report.Failed != 0 {
+				t.Fatalf("forward = %+v %v", report, err)
+			}
+			var reason string
+			if err := e.db.Pool.QueryRow(ctx, `SELECT closure_unresolved_reason FROM usage_rollups WHERE tenant_id = $1`, tenantID).Scan(&reason); err != nil || reason != "usage_send_unconfirmed" {
+				t.Fatalf("reason = %q %v", reason, err)
+			}
+			if n := len(e.fake.UsageBodies(slug)); n != 1 {
+				t.Fatalf("POSTs before the second pass = %d, want 1", n)
+			}
+			e.clock.advance(24 * time.Hour)
+			if _, err := e.svc.Forward(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if n := len(e.fake.UsageBodies(slug)); n != 1 {
+				t.Fatalf("a second POST was made: %d", n)
+			}
+			if recs := e.fake.UsageRecords(slug); len(recs) != 1 {
+				t.Fatalf("Kill Bill holds %d records, want exactly 1", len(recs))
+			}
+		})
 	}
 }
 

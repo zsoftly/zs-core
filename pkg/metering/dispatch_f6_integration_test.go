@@ -3,8 +3,8 @@
 package metering_test
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"testing"
 
 	"github.com/zsoftly/zs-core/internal/enginetest"
@@ -33,8 +33,10 @@ func TestNotSentAfterStartIsTransportUnconfirmedAndNeverResent(t *testing.T) {
 	}
 }
 
-// What Kill Bill recorded is what the rollup stored before the send.
-func TestStoredPayloadMatchesWhatKillBillRecorded(t *testing.T) {
+// The bytes Kill Bill received are exactly the body the rollup stored before
+// the send. jsonb reads back with its own key order, so the stored value is
+// parsed and written out again, which is how the body was built.
+func TestStoredPayloadIsExactlyTheBodyKillBillReceived(t *testing.T) {
 	e, slug, tenantID := setupOneRollup(t, "zs-wire")
 	ctx := context.Background()
 	if report, err := e.svc.Forward(ctx); err != nil || report.Forwarded != 1 {
@@ -48,14 +50,13 @@ func TestStoredPayloadMatchesWhatKillBillRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recs := e.fake.UsageRecords(slug)
-	if len(recs) != 1 || len(stored.UnitUsageRecords) != 1 || len(stored.UnitUsageRecords[0].UsageRecords) != 1 {
-		t.Fatalf("records = %+v stored = %s", recs, payload)
+	want, err := stored.Payload()
+	if err != nil {
+		t.Fatal(err)
 	}
-	amount, _ := json.Number(stored.UnitUsageRecords[0].UsageRecords[0].Amount).Float64()
-	if recs[0].SubscriptionID != stored.SubscriptionID || recs[0].TrackingID != stored.TrackingID ||
-		recs[0].Unit != stored.UnitUsageRecords[0].UnitType || float64(recs[0].AmountMicro)/1e6 != amount {
-		t.Fatalf("Kill Bill recorded %+v, stored %s", recs[0], payload)
+	bodies := e.fake.UsageBodies(slug)
+	if len(bodies) != 1 || !bytes.Equal(bodies[0], want) {
+		t.Fatalf("Kill Bill received %q, the stored send is %q", bodies, want)
 	}
 }
 
@@ -145,7 +146,7 @@ func TestBindTargetToAnotherTargetIsAMismatchNotALostClaim(t *testing.T) {
 		t.Fatalf("first bind = %v %v %v", bound, mismatch, err)
 	}
 	other := target
-	other.EndpointFingerprint = "a" + target.EndpointFingerprint[1:]
+	other.EndpointFingerprint = otherFingerprint(target.EndpointFingerprint)
 	if bound, mismatch, err := e.svc.BindTargetTo(ctx, due[0], sub, other); err != nil || bound || !mismatch {
 		t.Fatalf("bind to another target = %v %v %v, want a mismatch", bound, mismatch, err)
 	}
@@ -180,7 +181,7 @@ func TestTargetMismatchWaitsAndLeavesAnAuditRow(t *testing.T) {
 	}
 	// The rollup was bound while Kill Bill lived at another address.
 	moved := target
-	moved.EndpointFingerprint = "b" + target.EndpointFingerprint[1:]
+	moved.EndpointFingerprint = otherFingerprint(target.EndpointFingerprint)
 	if bound, _, err := e.svc.BindTargetTo(ctx, due[0], sub, moved); err != nil || !bound {
 		t.Fatalf("bind = %v %v", bound, err)
 	}
@@ -198,4 +199,13 @@ func TestTargetMismatchWaitsAndLeavesAnAuditRow(t *testing.T) {
 	if n := count(t, e.db, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'metering.usage.target_mismatch'`, tn.ID); n != 1 {
 		t.Fatalf("audit rows = %d, want 1", n)
 	}
+}
+
+// otherFingerprint is a valid fingerprint that differs from fp in its first
+// digit, so it can never equal fp whatever port the fake listens on.
+func otherFingerprint(fp string) string {
+	if fp[0] == '0' {
+		return "1" + fp[1:]
+	}
+	return "0" + fp[1:]
 }

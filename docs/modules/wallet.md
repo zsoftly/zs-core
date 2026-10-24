@@ -182,7 +182,7 @@ A caller that rolls its transaction back after `Settle` returned must retry with
 
 ## Known limits
 
-- A usage rollup whose answer Kill Bill lost, and that the forwarder has not resent yet, is an `unknown_usage` finding until it is resent, when the month's totals are compared.
+- A usage rollup whose answer Kill Bill lost is never resent. It stays unconfirmed, with its stored body, until staff resolve it against Kill Bill. Until then the month's totals may differ from Kill Bill's, and the difference is an `unknown_usage` finding. See [metering.md](metering.md#forwarding).
 - Unbilled usage counts recurring charges due by the end of the period. A plan billed over a period longer than a month and a day shows its usage only when the period nears its end.
 - `settled_minor` of a usage settlement uses the first tier of the phase's price, and so does the check against the hold. Tiered and blended prices are Kill Bill's to compute.
 - A library caller that rolled back a usage settlement and retries finds Kill Bill's duplicate with no earlier send recorded in Core, so Core cannot compare the quantities. It records the retry. A different quantity shows as `missing_usage` or `unknown_usage`.

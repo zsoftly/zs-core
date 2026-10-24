@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,7 +13,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/zsoftly/zs-core/internal/doctor"
+	"github.com/zsoftly/zs-core/internal/killbill"
+	"github.com/zsoftly/zs-core/internal/secrets"
+	"github.com/zsoftly/zs-core/pkg/billing"
+	"github.com/zsoftly/zs-core/pkg/metering"
+	"github.com/zsoftly/zs-core/pkg/tenant"
 )
 
 func TestRunUsageAndConfigErrors(t *testing.T) {
@@ -292,5 +301,25 @@ func TestTenantStartClosureFlagsAndNoEngineSettings(t *testing.T) {
 	}
 	if code := run([]string{"tenant", "suspend", "--brand", "zs-reference", "--tenant", "tnt_01m5qxsm2vefytm7qehn7fnrx5", "--reason", "left", "--operator", "me"}, environ, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "ZS_KEYCLOAK_URL") {
 		t.Fatalf("suspend without engine settings = %d %q, want the Keycloak setting asked for", code, errOut.String())
+	}
+}
+
+// The tenant sweeper gets the closure steps only when billing is configured,
+// because the drain they wait for is the usage forwarder's.
+func TestTenantSweeperGetsClosureStepsOnlyWithBilling(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var pool *pgxpool.Pool
+	ready := &billing.Service{DB: pool, KillBill: &killbill.Client{}, Secrets: secrets.Default{}}
+	if !ready.Ready() {
+		t.Fatal("the fixture billing service is not ready")
+	}
+	if s := newTenantSweeper(pool, tenant.Engines{}, &metering.Service{Billing: ready}, log); s.Closure == nil {
+		t.Fatal("no closure steps with billing configured")
+	}
+	if s := newTenantSweeper(pool, tenant.Engines{}, &metering.Service{Billing: &billing.Service{}}, log); s.Closure != nil {
+		t.Fatal("closure steps without billing: they would wait for ever for a drain")
+	}
+	if s := newTenantSweeper(pool, tenant.Engines{}, nil, log); s.Closure != nil {
+		t.Fatal("closure steps without a metering service")
 	}
 }

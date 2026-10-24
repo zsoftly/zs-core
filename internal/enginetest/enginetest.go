@@ -283,6 +283,19 @@ func (f *Fake) KillBill(t testing.TB) *killbill.Client {
 	return kb
 }
 
+// KillBillThrough returns a client of the fake Kill Bill whose HTTP transport
+// is wrap of the default one, so a test can answer some requests itself and
+// pass the others to the fake.
+func (f *Fake) KillBillThrough(t testing.TB, wrap func(http.RoundTripper) http.RoundTripper) *killbill.Client {
+	t.Helper()
+	kb, err := killbill.New(killbill.Config{URL: f.server.URL + "/kb", AdminUser: "admin", AdminPassword: "pw",
+		HTTPClient: &http.Client{Transport: wrap(http.DefaultTransport)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kb
+}
+
 // Secrets resolves the Kill Bill secrets of the brands the fake inserted.
 func (f *Fake) Secrets() secrets.Resolver {
 	return secrets.Default{LookupEnv: func(name string) (string, bool) {

@@ -4,6 +4,9 @@ package tenant_test
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -312,5 +315,43 @@ func TestEnginePrepareOpensBillingOfASuspendedTenantFirst(t *testing.T) {
 	other, _, _ := closingWithSubscriptions(t, e)
 	if _, err := engineSteps(e, &fakeDrain{done: true}).Prepare(ctx, e.db.Pool, other.Scope()); err != nil || len(accountOf(e, other).Blocking) != 0 {
 		t.Fatalf("prepare of an active tenant wrote %d blocking states, %v", len(accountOf(e, other).Blocking), err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// Kill Bill refuses the cancel with 500 and code 1031, as it does for a
+// subscription in a state it cannot be cancelled from, and the subscription is
+// still not cancelled when it is read: that is a case for a person, not a wait.
+func TestEnginePrepareSendsARefusedCancelThatChangedNothingToAPerson(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn, base, _ := closingWithSubscriptions(t, e)
+	refused := 0
+	engines := e.eng
+	engines.KillBill = e.fake.KillBillThrough(t, func(next http.RoundTripper) http.RoundTripper {
+		return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/subscriptions/") {
+				refused++
+				body := `{"className":"org.killbill.billing.entitlement.api.EntitlementApiException","code":1031,"message":"Subscription is in state ACTIVE: Failed to cancel"}`
+				return &http.Response{StatusCode: http.StatusInternalServerError, Header: http.Header{"Content-Type": {"application/json"}},
+					Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+			}
+			return next.RoundTrip(r)
+		})
+	})
+	steps := tenant.EngineClosureSteps{Engines: engines, Drain: &fakeDrain{done: true}, Today: func() string { return enginetest.CancelDay }}
+	got, err := steps.Prepare(ctx, e.db.Pool, tn.Scope())
+	if code(err) != "conflict" || got.Cancelled || refused == 0 {
+		t.Fatalf("prepare = %+v %v, refused cancels %d, want the manual-review conflict", got, err, refused)
+	}
+	if sub, err := e.fake.KillBill(t).Subscription(ctx, engineCreds(e), base); err != nil || sub.State == "CANCELLED" {
+		t.Fatalf("the subscription is %+v %v, want it left as it was", sub, err)
+	}
+	// It is the same answer on the next call: the closure does not wait quietly.
+	if _, err := steps.Prepare(ctx, e.db.Pool, tn.Scope()); code(err) != "conflict" {
+		t.Fatalf("second prepare = %v, want conflict again", err)
 	}
 }

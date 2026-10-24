@@ -20,8 +20,8 @@ const (
 
 // ClosureFindings lists what an operator has to look at for tenant closures:
 // closures that have not finished after an hour, closure review items nobody has
-// resolved, usage sends whose outcome Kill Bill never confirmed, and usage
-// claims whose forwarder is gone. Each is a warning, not a failure, because it
+// resolved, usage sends whose outcome Kill Bill never confirmed, usage rollups
+// that were rejected, and usage claims whose forwarder is gone. Each is a warning, not a failure, because it
 // is work waiting for a person and not a stack that does not match its release.
 // It reads and changes nothing, and a finding names a tenant, a state and a
 // reason code, never usage or an address. now is the time the ages are taken
@@ -102,6 +102,25 @@ WHERE status = 'pending' AND closure_unresolved_reason IS NOT NULL GROUP BY tena
 	}
 
 	rows, err = db.Query(ctx, `SELECT tenant_id, count(*) FROM usage_rollups
+WHERE send_protocol = 1 AND status = 'rejected' GROUP BY tenant_id ORDER BY tenant_id LIMIT $1`, closureFindingMax)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id idgen.UUID
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		add("usage_rejected", fmt.Sprintf("%d usage rollups of %s were rejected, so Kill Bill will not bill them: staff reassign or discard them, and a closing tenant is not drained until they do", n, idgen.Format(idgen.Tenant, id)))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	rows, err = db.Query(ctx, `SELECT tenant_id, count(*) FROM usage_rollups
 WHERE status = 'pending' AND claim_token IS NOT NULL AND claimed_until < $1::timestamptz - make_interval(secs => $2)
 GROUP BY tenant_id ORDER BY tenant_id LIMIT $3`, now, claimStrandedAfter.Seconds(), closureFindingMax)
 	if err != nil {
@@ -122,7 +141,7 @@ GROUP BY tenant_id ORDER BY tenant_id LIMIT $3`, now, claimStrandedAfter.Seconds
 	}
 
 	if len(findings) == 0 {
-		findings = append(findings, Finding{"core", "closures", OK, "no closure is stuck, no closure review item is open and no usage send is unconfirmed or stranded"})
+		findings = append(findings, Finding{"core", "closures", OK, "no closure is stuck, no closure review item is open and no usage send is unconfirmed, rejected or stranded"})
 	}
 	return findings, nil
 }

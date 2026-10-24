@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/zsoftly/zs-core/internal/doctor"
+	"github.com/zsoftly/zs-core/internal/enginetest"
+	"github.com/zsoftly/zs-core/pkg/metering"
 )
 
 // An unconfirmed usage send is reported with its tenant and its reason, so
@@ -71,5 +73,39 @@ func TestClosureFindingsReportAStrandedClaim(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("findings = %+v, want a stranded claim warning", fs)
+	}
+}
+
+// A rejected rollup holds the drain of a closing tenant, so it is reported: a
+// tenant cannot wait at cancelling with nothing to say why.
+func TestClosureFindingsReportARejectedRollup(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	b := e.brand("zs-doctor-rejected")
+	tn := e.tenant(b, "Doctor Rejected")
+	late := e.subscribe(b, tn, enginetest.PlanMetered)
+	e.fake.SetSubscriptionStart(b.Slug, late, e.clock.Now().Add(time.Hour))
+	if _, _, err := e.record(tn.Scope(), metering.Event{Meter: "api-calls", EventID: "early", QuantityMicro: 4_000_000}); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := e.svc.Forward(ctx); err != nil || report.Rejected != 1 {
+		t.Fatalf("forward = %+v %v", report, err)
+	}
+	e.closing(tn)
+	if done, err := e.svc.Drained(ctx, tn.Scope()); err != nil || done {
+		t.Fatalf("drained with a rejected rollup = %v %v, want false", done, err)
+	}
+	fs, err := doctor.ClosureFindings(ctx, e.db.Pool, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, f := range fs {
+		if f.Check == "usage_rejected" && f.Status == doctor.Warn && strings.Contains(f.Message, tn.PublicID()) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("findings = %+v, want a rejected usage warning for %s", fs, tn.PublicID())
 	}
 }

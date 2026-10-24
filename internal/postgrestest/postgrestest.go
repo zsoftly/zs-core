@@ -107,8 +107,10 @@ func NewSchema(t testing.TB) *DB {
 	t.Helper()
 	db := NewEmpty(t)
 	err := withDDLLock(func() error {
-		_, err := database.Migrate(context.Background(), db.Pool, migrations.FS)
-		return err
+		if _, err := database.Migrate(context.Background(), db.Pool, migrations.FS); err != nil {
+			return err
+		}
+		return disableSettlementStartRule(context.Background(), db.Pool)
 	})
 	if err != nil {
 		t.Fatalf("migrate test schema: %v", err)
@@ -393,6 +395,9 @@ func buildTemplate(ctx context.Context, srv server) (string, error) {
 	if _, err := database.Migrate(ctx, pool, migrations.FS); err != nil {
 		return "", fmt.Errorf("migrate template database: %w", err)
 	}
+	if err := disableSettlementStartRule(ctx, pool); err != nil {
+		return "", err
+	}
 	return name, nil
 }
 
@@ -432,3 +437,15 @@ func randomBytes(n int) []byte {
 
 // templateRequired reports whether a missing template database must fail.
 func templateRequired() bool { return os.Getenv(EnvRequireTemplate) == "1" }
+
+// disableSettlementStartRule turns off the trigger that makes a closure
+// settlement start at cancelling, on a test database, so a fixture can insert
+// a settlement at a later state. The test of that rule turns it back on in its
+// own transaction. Disabling a trigger takes ownership of the table, which a
+// deployment's application role does not have.
+func disableSettlementStartRule(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, `ALTER TABLE tenant_closure_settlements DISABLE TRIGGER tenant_closure_settlement_start`); err != nil {
+		return fmt.Errorf("disable the settlement start rule: %w", err)
+	}
+	return nil
+}

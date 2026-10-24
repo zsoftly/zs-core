@@ -114,18 +114,20 @@ func TestClosureCannotCompleteUntilLegacyUsageIsResolved(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	tn, eventID, _ := closingWithLegacyUsage(t, e, true, true)
-	refused := func(stage string) {
+	const eventsMessage = "closure has legacy usage events that staff have not reviewed"
+	const rollupsMessage = "closure has legacy usage rollups that staff have not reviewed"
+	refused := func(stage, message string) {
 		t.Helper()
 		var pgErr *pgconn.PgError
-		if err := complete(e, tn); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
-			t.Fatalf("%s: completion = %v, want a check violation", stage, err)
+		if err := complete(e, tn); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != message {
+			t.Fatalf("%s: completion = %v, want %q", stage, err, message)
 		}
 	}
-	refused("before any review is recorded")
+	refused("before any review is recorded", eventsMessage)
 	if _, err := tenant.RecordClosureReviews(ctx, e.db.Pool, tn.Scope(), reviewActor, "corr"); err != nil {
 		t.Fatal(err)
 	}
-	refused("with unresolved reviews")
+	refused("with unresolved reviews", eventsMessage)
 	items, err := tenant.ListClosureReviews(ctx, e.db.Pool, tn.Scope())
 	if err != nil || len(items) != 2 {
 		t.Fatalf("items = %+v %v", items, err)
@@ -136,7 +138,7 @@ func TestClosureCannotCompleteUntilLegacyUsageIsResolved(t *testing.T) {
 	if err := tenant.ResolveClosureReview(ctx, e.db.Pool, tn.Scope(), items[0].ID, reviewActor, "staff checked the usage with finance", "corr-resolve"); err != nil {
 		t.Fatal(err)
 	}
-	refused("with one review resolved")
+	refused("with one review resolved", rollupsMessage)
 	if err := tenant.ResolveClosureReview(ctx, e.db.Pool, tn.Scope(), items[1].ID, reviewActor, "staff checked the rollup with finance", "corr-resolve"); err != nil {
 		t.Fatal(err)
 	}
@@ -244,8 +246,8 @@ VALUES ($1, $2, $3, 'api-call', current_date, now(), now(), 9, 1, 'legacy-reject
 		t.Fatal(err)
 	}
 	var pgErr *pgconn.PgError
-	if err := complete(e, tn); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
-		t.Fatalf("completion with a rejected legacy rollup = %v, want a check violation", err)
+	if err := complete(e, tn); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != "closure has legacy usage rollups that staff have not reviewed" {
+		t.Fatalf("completion with a rejected legacy rollup = %v, want the rollups review message", err)
 	}
 	if result, err := tenant.RecordClosureReviews(ctx, e.db.Pool, tn.Scope(), reviewActor, "corr"); err != nil || result.Recorded != 1 {
 		t.Fatalf("record = %+v %v", result, err)
@@ -291,8 +293,8 @@ func TestClosureLegacyUsageThatGrowsAfterReviewNeedsAnotherReview(t *testing.T) 
 		t.Fatal(err)
 	}
 	var pgErr *pgconn.PgError
-	if err := complete(e, tn); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
-		t.Fatalf("completion after the usage grew = %v, want a check violation", err)
+	if err := complete(e, tn); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != "closure has legacy usage events that staff have not reviewed" {
+		t.Fatalf("completion after the usage grew = %v, want the events review message", err)
 	}
 	if result, err := tenant.RecordClosureReviews(ctx, e.db.Pool, tn.Scope(), reviewActor, "corr-2"); err != nil || result.Recorded != 1 {
 		t.Fatalf("second record = %+v %v", result, err)

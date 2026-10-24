@@ -33,6 +33,12 @@ type Sweeper struct {
 	// Batch is how many creations and tenants one query reads. Zero means
 	// 100.
 	Batch int
+	// Closure supplies the steps of a closure the sweep cannot do itself: the
+	// cancellation and drain before finance, and the account block after it.
+	// Nil leaves a closing tenant waiting at those steps.
+	Closure ClosureSteps
+	// ClosureWork is how many closing tenants one pass drives. Zero means 50.
+	ClosureWork int
 }
 
 // SweepReport counts what one pass did.
@@ -48,6 +54,14 @@ type SweepReport struct {
 	RecipientsUpdated    int
 	RecipientsDeferred   int
 	Errors               int
+	// ClosuresChecked counts the closing tenants the pass looked at, and the
+	// rest count what became of them.
+	ClosuresChecked      int
+	ClosuresAdvanced     int
+	ClosuresWaiting      int
+	ClosuresManualReview int
+	ClosuresBusy         int
+	ClosuresFailed       int
 }
 
 func (s *Sweeper) log() *slog.Logger {
@@ -105,6 +119,9 @@ func (s *Sweeper) SweepOnce(ctx context.Context) (report SweepReport, err error)
 	}()
 	correlationID := idgen.MustNewV7().String()
 	if err := s.completeCreations(ctx, guard, correlationID, &report); err != nil {
+		return report, err
+	}
+	if err := s.completeClosures(ctx, guard, correlationID, &report); err != nil {
 		return report, err
 	}
 	brands, err := brand.List(ctx, guard, s.log())

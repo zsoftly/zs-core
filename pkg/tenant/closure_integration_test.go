@@ -733,8 +733,13 @@ type kbMode struct {
 	dryOnce      sync.Once
 	// noClaim leaves the tenant ready to be claimed, instead of claimed.
 	noClaim bool
+	// startCancelling starts the settlement at cancelling, with none of the
+	// steps before finance done, and implies noClaim.
+	startCancelling bool
 	// inFlight, when set, runs while a dry run or a POST is in flight.
 	inFlight func()
+	// readFail makes the invoice readback answer 503.
+	readFail atomic.Int32
 }
 
 // claimedClosure is a closing tenant with a claimed, not yet executed,
@@ -749,12 +754,16 @@ func claimedClosure(t *testing.T, m *kbMode, posts, lookups *atomic.Int64) (*env
 	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = 'closing' WHERE brand_id = $1 AND id = $2`, tn.BrandID, tn.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements
+	if m.startCancelling {
+		if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status) VALUES ($1, $2, now(), 'cancelling')`, tn.BrandID, tn.ID); err != nil {
+			t.Fatal(err)
+		}
+	} else if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements
     (brand_id, tenant_id, cutoff_at, status, cancellation_completed_at, finance_target_date, drain_completed_at)
 VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.BrandID, tn.ID); err != nil {
 		t.Fatal(err)
 	}
-	if !m.noClaim {
+	if !m.noClaim && !m.startCancelling {
 		if claim, err := tenant.ProcessClosureInvoiceOnce(ctx, e.db.Pool, e.eng, tn.Scope()); err != nil || !claim.Claimed {
 			t.Fatalf("claim = %+v %v", claim, err)
 		}
@@ -813,6 +822,10 @@ VALUES ($1, $2, now(), 'finance_pending', now(), current_date, now())`, tn.Brand
 		id, date := invoiceID, targetDate
 		mu.Unlock()
 		if r.Method == http.MethodGet && id != "" && r.URL.Path == "/1.0/kb/invoices/"+id {
+			if m.readFail.Load() == 1 {
+				http.Error(w, "readback unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"invoiceId":"` + id + `","accountId":"` + tn.KillBillAccountID + `","status":"COMMITTED","currency":"CAD","targetDate":"` + date + `"}`))
 			return

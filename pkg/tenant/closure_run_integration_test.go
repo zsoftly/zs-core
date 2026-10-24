@@ -249,3 +249,25 @@ func TestClosureReviewFunctionsRunOnTheLifecycleGuard(t *testing.T) {
 		t.Fatalf("after release = %+v %v", after, err)
 	}
 }
+
+// A readback mismatch that a later readback matched is settled, so a transient
+// error afterwards is an error to retry, not manual review.
+func TestRunClosureInvoiceIgnoresASettledMismatchWhenTheReadbackFails(t *testing.T) {
+	m := &kbMode{noClaim: true}
+	var posts, lookups atomic.Int64
+	e, tn := claimedClosure(t, m, &posts, &lookups)
+	ctx := context.Background()
+	if first, err := tenant.RunClosureInvoice(ctx, e.db.Pool, e.eng, tn.Scope(), "corr-run"); err != nil || !first.Execution.Evidenced {
+		t.Fatalf("first pass = %+v %v", first, err)
+	}
+	// An earlier mismatch of the same invoice, which the evidenced readback settled.
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, invoice_id)
+SELECT $1, o.attempt_id, 'read_mismatch', o.invoice_id FROM tenant_closure_invoice_outcomes o WHERE o.kind = 'invoice_id'`, idgen.MustNewV7()); err != nil {
+		t.Fatal(err)
+	}
+	m.readFail.Store(1)
+	second, err := tenant.RunClosureInvoice(ctx, e.db.Pool, e.eng, tn.Scope(), "corr-run-2")
+	if err == nil || second.ManualReview || posts.Load() != 1 {
+		t.Fatalf("pass with a failing readback = %+v %v posts=%d, want an error and no manual review", second, err, posts.Load())
+	}
+}

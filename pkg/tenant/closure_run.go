@@ -65,6 +65,12 @@ func RunClosureInvoice(ctx context.Context, pool *pgxpool.Pool, eng Engines, sc 
 			err = errors.Join(err, releaseErr)
 		}
 	}()
+	return runClosure(ctx, guard, eng, sc, correlationID)
+}
+
+// runClosure is the body of RunClosureInvoice, for a caller that already holds
+// the tenant's lifecycle capability, such as the closure sweep.
+func runClosure(ctx context.Context, guard DB, eng Engines, sc scope.Scope, correlationID string) (result ClosureRunResult, err error) {
 	reviews, err := RecordClosureReviews(ctx, guard, sc, closureActor, correlationID)
 	if err != nil {
 		return result, err
@@ -117,7 +123,8 @@ func blockingClosureReviews(items []ClosureReview) int {
 }
 
 // closureOutcomeNeedsReview reports whether the tenant's closure invoice
-// attempt has an outcome that only a person can resolve.
+// attempt has an outcome that only a person can resolve, and no settled outcome
+// that makes it moot: a mismatch that a later readback matched is settled.
 func closureOutcomeNeedsReview(ctx context.Context, q Querier, sc scope.Scope) (bool, error) {
 	args, err := sc.Bind()
 	if err != nil {
@@ -126,7 +133,9 @@ func closureOutcomeNeedsReview(ctx context.Context, q Querier, sc scope.Scope) (
 	var review bool
 	if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes o
 JOIN tenant_closure_invoice_attempts a ON a.id = o.attempt_id
-WHERE a.brand_id = $1 AND a.tenant_id = $2 AND o.kind IN ('post_unknown', 'read_mismatch'))`, args...).Scan(&review); err != nil {
+WHERE a.brand_id = $1 AND a.tenant_id = $2 AND o.kind IN ('post_unknown', 'read_mismatch'))
+AND NOT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes o JOIN tenant_closure_invoice_attempts a ON a.id = o.attempt_id
+WHERE a.brand_id = $1 AND a.tenant_id = $2 AND o.kind IN ('evidenced', 'no_invoice'))`, args...).Scan(&review); err != nil {
 		return false, unavailable(err)
 	}
 	return review, nil

@@ -209,3 +209,67 @@ func TestClosureSettlementCannotSkipOrGoBackInTheDatabase(t *testing.T) {
 		}
 	}
 }
+
+// A settlement starts at cancelling, and nothing a session can set changes
+// that. The test databases turn the rule off for fixtures, so the test turns it
+// on in its own transaction, which needs ownership of the table.
+func TestClosureSettlementStartsAtCancellingWhateverIsSet(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn := e.mustOrg(e.person("owner@example.test"), "Tenant A")
+	insert := func(status string, settings ...string) error {
+		tx, err := e.db.Pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `ALTER TABLE tenant_closure_settlements ENABLE TRIGGER tenant_closure_settlement_start`); err != nil {
+			t.Fatal(err)
+		}
+		for _, setting := range settings {
+			if _, err := tx.Exec(ctx, setting); err != nil {
+				t.Fatalf("%s: %v", setting, err)
+			}
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status) VALUES ($1, $2, now(), $3)`, tn.BrandID, tn.ID, status)
+		return err
+	}
+	var pgErr *pgconn.PgError
+	for name, settings := range map[string][]string{
+		"plain":                   nil,
+		"the old fixture setting": {`SET LOCAL zs.test_settlement_fixture = 'on'`},
+		"another custom setting":  {`SET LOCAL zs.anything = 'on'`, `SET LOCAL zs.test_fixture = 'true'`},
+	} {
+		if err := insert("blocking", settings...); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("%s: insert at blocking = %v, want a check violation", name, err)
+		}
+	}
+	if err := insert("cancelling"); err != nil {
+		t.Fatalf("insert at cancelling = %v", err)
+	}
+}
+
+// A recorded step is never changed or cleared, and a completed settlement is
+// frozen whole.
+func TestClosureSettlementFreezesRecordedStepsAndCompletedRows(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	tn := settlementAt(t, e, "blocking", true, true)
+	settleInvoice(t, e, tn, "no_invoice")
+	violation := func(what, statement string) {
+		t.Helper()
+		var pgErr *pgconn.PgError
+		if _, err := e.db.Pool.Exec(ctx, statement, tn.ID); err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("%s = %v, want a check violation", what, err)
+		}
+	}
+	violation("clearing blocked_at", `UPDATE tenant_closure_settlements SET blocked_at = NULL WHERE tenant_id = $1`)
+	violation("rewriting cancellation_completed_at", `UPDATE tenant_closure_settlements SET cancellation_completed_at = now() + interval '1 day' WHERE tenant_id = $1`)
+	violation("rewriting drain_completed_at", `UPDATE tenant_closure_settlements SET drain_completed_at = NULL WHERE tenant_id = $1`)
+	done := settlementAt(t, e, "completed", true, true)
+	_, err := e.db.Pool.Exec(ctx, `UPDATE tenant_closure_settlements SET last_error = 'x' WHERE tenant_id = $1`, done.ID)
+	var pgErr *pgconn.PgError
+	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.Message != "a completed closure settlement is frozen" {
+		t.Fatalf("changing a completed settlement = %v, want it frozen", err)
+	}
+}

@@ -68,6 +68,11 @@ func AdvanceClosureSettlement(ctx context.Context, db DB, sc scope.Scope, actor 
 		if closureRank[to]-closureRank[from] != 1 {
 			return zserrors.New(zserrors.CodeNotReady, "A closure settlement cannot skip a state.")
 		}
+		if reason, err := closureAdvanceBlocker(ctx, tx, sc, to); err != nil {
+			return err
+		} else if reason != "" {
+			return zserrors.New(zserrors.CodeNotReady, reason)
+		}
 		var update string
 		switch to {
 		case ClosureFinancePending:
@@ -164,4 +169,42 @@ func closureStateError(err error) error {
 		return zserrors.Wrap(zserrors.CodeNotReady, "The closure settlement cannot move to that state yet.", err)
 	}
 	return unavailable(err)
+}
+
+// closureAdvanceBlocker says why the settlement cannot move to a state yet, or
+// returns "" when it can. It reads before the write, so a refusal is an answer
+// and not a statement error, which would end the lifecycle capability the
+// caller may hold. The triggers of migrations 26 and 27 check again.
+func closureAdvanceBlocker(ctx context.Context, tx pgx.Tx, sc scope.Scope, to ClosureState) (string, error) {
+	var drained, target, financed, blocked, settled bool
+	var review *string
+	err := tx.QueryRow(ctx, `SELECT s.drain_completed_at IS NOT NULL, s.finance_target_date IS NOT NULL, s.finance_completed_at IS NOT NULL, s.blocked_at IS NOT NULL,
+    EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes o JOIN tenant_closure_invoice_attempts a ON a.id = o.attempt_id
+            WHERE a.brand_id = s.brand_id AND a.tenant_id = s.tenant_id AND o.kind IN ('evidenced', 'no_invoice')),
+    tenant_closure_review_blocker(s.brand_id, s.tenant_id)
+FROM tenant_closure_settlements s WHERE s.brand_id = $1 AND s.tenant_id = $2`, sc.Brand, sc.Tenant).Scan(&drained, &target, &financed, &blocked, &settled, &review)
+	if err != nil {
+		return "", unavailable(err)
+	}
+	switch to {
+	case ClosureFinancePending:
+		if !drained || !target {
+			return "The settlement needs its usage drain and a finance target date before finance.", nil
+		}
+	case ClosureBlocking:
+		if !settled {
+			return "The settlement needs a settled invoice before blocking.", nil
+		}
+	case ClosureCompleted:
+		if !settled {
+			return "The settlement needs a settled invoice before it completes.", nil
+		}
+		if !financed || !blocked {
+			return "The settlement needs the account blocked before it completes.", nil
+		}
+		if review != nil {
+			return "The settlement has legacy usage that staff have not reviewed.", nil
+		}
+	}
+	return "", nil
 }

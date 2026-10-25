@@ -50,12 +50,64 @@ func unconfirmedRollup(t *testing.T, e *env, b enginetest.Brand, name string) (r
 	return idgen.Format(idgen.Rollup, id), tn.Scope(), tn.KillBillAccountID
 }
 
-// cancelled marks the cancellation of the tenant's closure as done on day.
-func (e *env) cancelled(sc scope.Scope, day string) {
+// closingAt makes the tenant closing with a settlement at status, the
+// cancellation done on cancelDay, and, when the settlement is past finance,
+// the finance step done too.
+func (e *env) closingAt(sc scope.Scope, status, cancelDay string) {
 	e.t.Helper()
-	if _, err := e.db.Pool.Exec(context.Background(), `UPDATE tenant_closure_settlements SET cancellation_completed_at = $3::timestamptz WHERE brand_id = $1 AND tenant_id = $2`, sc.Brand, sc.Tenant, day+"T12:00:00Z"); err != nil {
+	ctx := context.Background()
+	financed := status == "blocking"
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_settlements (brand_id, tenant_id, cutoff_at, status, cancellation_completed_at, drain_completed_at, finance_target_date, finance_completed_at)
+VALUES ($1, $2, now(), $3, $4::timestamptz, now(), current_date, CASE WHEN $5 THEN now() END)`, sc.Brand, sc.Tenant, status, cancelDay+"T12:00:00Z", financed); err != nil {
 		e.t.Fatal(err)
 	}
+	if _, err := e.db.Pool.Exec(ctx, `UPDATE tenants SET status = 'closing' WHERE id = $1`, sc.Tenant); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// noInvoiceOutcome records that the closure invoice found nothing to invoice.
+func (e *env) noInvoiceOutcome(sc scope.Scope, account string) {
+	e.t.Helper()
+	ctx := context.Background()
+	attempt := idgen.MustNewV7()
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_attempts (id, brand_id, tenant_id, killbill_tenant_id, killbill_account_id, target_date) VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, attempt, sc.Brand, sc.Tenant, account); err != nil {
+		e.t.Fatal(err)
+	}
+	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind) VALUES ($1, $2, 'no_invoice')`, idgen.MustNewV7(), attempt); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// withInvoices is the metering service with a Kill Bill that answers the
+// account's invoice history with the invoices given.
+func withInvoices(t *testing.T, e *env, invoices []killbill.Invoice) *metering.Service {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/invoices") {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(invoices)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	kb, err := killbill.New(killbill.Config{URL: server.URL, AdminUser: "admin", AdminPassword: "pw", HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bill := *e.svc.Billing
+	bill.KillBill = kb
+	return &metering.Service{DB: e.db.Pool, Billing: &bill, Now: e.clock.Now}
+}
+
+func rollupSubscription(t *testing.T, e *env, sc scope.Scope) string {
+	t.Helper()
+	var sub string
+	if err := e.db.Pool.QueryRow(context.Background(), `SELECT subscription_id::text FROM usage_rollups WHERE tenant_id = $1`, sc.Tenant).Scan(&sub); err != nil {
+		t.Fatal(err)
+	}
+	return sub
 }
 
 // A send that started and was never confirmed does not hold the drain: nothing
@@ -161,55 +213,96 @@ func TestStaffResolveNeedsACommittedInvoice(t *testing.T) {
 	}
 }
 
-// Kill Bill does not hold the record: once the cancellation is done and the
-// account has committed invoices after it, none of which carries the tracking
-// ID, staff record the usage as not billed, with the quantity and the reason.
-// The fake dates every invoice 2026-10-20, which stands for the invoice of the
-// cancel.
-func TestStaffResolveAnUnconfirmedRollupAsNotBilled(t *testing.T) {
+// Not billed says Kill Bill has not billed the record and will not. It needs the
+// cancel's own invoice, because that invoice bills the arrears and Kill Bill makes
+// it a little after the cancel, so an invoice of that day that is another one proves
+// nothing: a committed invoice dated on or after the cancellation that carries a
+// repair or usage item of the subscription of the rollup, or a finance step that
+// found nothing to invoice. It also needs the settlement past finance, the
+// cancel's own invoice trigger having run.
+func TestStaffResolveAsNotBilledNeedsTheCancelsOwnInvoice(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	b := e.brand("zs-resolve-lost")
-	rollup, sc, _ := unconfirmedRollup(t, e, b, "Lost Co")
-	e.closing(tenant.Tenant{BrandID: sc.Brand, ID: sc.Tenant})
-	// Not before the cancellation is done.
-	if _, _, err := e.svc.ResolveUnconfirmedRollup(ctx, sc, staffCall, rollup, metering.ResolveDecisionNotBilled); codeOf(err) != "conflict" {
-		t.Fatalf("not_billed before the cancellation = %v, want conflict", err)
+	invoice := func(status, date string, items ...killbill.InvoiceItem) killbill.Invoice {
+		return killbill.Invoice{InvoiceID: idgen.MustNewV7().String(), Status: status, InvoiceDate: date, Items: items}
 	}
-	// Cancelled after the last invoice there is: nothing after the cancel yet.
-	e.cancelled(sc, "2026-10-21")
-	if _, _, err := e.svc.ResolveUnconfirmedRollup(ctx, sc, staffCall, rollup, metering.ResolveDecisionNotBilled); codeOf(err) != "conflict" {
-		t.Fatalf("not_billed with no invoice after the cancellation = %v, want conflict", err)
+	type scenario struct {
+		name     string
+		settle   string
+		invoices func(sub string) []killbill.Invoice
+		noInv    bool
+		want     string
 	}
-
-	// Another tenant, cancelled before the invoice that exists.
-	rollup2, sc2, _ := unconfirmedRollup(t, e, b, "Lost Too")
-	e.closing(tenant.Tenant{BrandID: sc2.Brand, ID: sc2.Tenant})
-	e.cancelled(sc2, "2026-10-19")
-	got, replayed, err := e.svc.ResolveUnconfirmedRollup(ctx, sc2, staffCall, rollup2, metering.ResolveDecisionNotBilled)
-	if err != nil || replayed || got.Decision != "not_billed" || got.UnbilledQuantityMicro != 2_000_000 || got.InvoiceID != "" {
-		t.Fatalf("not_billed = %+v replayed %v %v, want the quantity 2000000 and no invoice", got, replayed, err)
-	}
-	if n := count(t, e.db, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'metering.rollup_resolved' AND details->>'decision' = 'not_billed' AND details->>'unbilled_quantity_micro' = '2000000'`, sc2.Tenant); n != 1 {
-		t.Fatalf("not_billed audits = %d, want 1 with the quantity", n)
-	}
-	if blocked := count(t, e.db, `SELECT count(*) FROM (SELECT tenant_closure_review_blocker($1, $2) AS b) q WHERE b IS NOT NULL`, sc2.Brand, sc2.Tenant); blocked != 0 {
-		t.Fatal("the closure is still blocked after the usage was recorded as not billed")
-	}
-	if blocked := count(t, e.db, `SELECT count(*) FROM (SELECT tenant_closure_review_blocker($1, $2) AS b) q WHERE b IS NOT NULL`, sc.Brand, sc.Tenant); blocked != 1 {
-		t.Fatal("the closure of the tenant whose usage is unresolved is not blocked")
+	for _, tc := range []scenario{
+		{name: "the finance step has not run", settle: "finance_pending", want: "conflict",
+			invoices: func(sub string) []killbill.Invoice {
+				return []killbill.Invoice{invoice("COMMITTED", "2026-10-20", killbill.InvoiceItem{ItemType: "REPAIR_ADJ", SubscriptionID: sub})}
+			}},
+		{name: "an invoice of the day that has no item of the subscription", settle: "blocking", want: "conflict",
+			invoices: func(string) []killbill.Invoice {
+				return []killbill.Invoice{invoice("COMMITTED", "2026-10-20", killbill.InvoiceItem{ItemType: "RECURRING", SubscriptionID: idgen.MustNewV7().String()})}
+			}},
+		{name: "an invoice of the day with a recurring item of the subscription", settle: "blocking", want: "conflict",
+			invoices: func(sub string) []killbill.Invoice {
+				return []killbill.Invoice{invoice("COMMITTED", "2026-10-20", killbill.InvoiceItem{ItemType: "RECURRING", SubscriptionID: sub})}
+			}},
+		{name: "a repair item of the subscription on an invoice before the cancellation", settle: "blocking", want: "conflict",
+			invoices: func(sub string) []killbill.Invoice {
+				return []killbill.Invoice{invoice("COMMITTED", "2026-10-10", killbill.InvoiceItem{ItemType: "REPAIR_ADJ", SubscriptionID: sub})}
+			}},
+		{name: "a repair item of the subscription on an invoice that is not committed", settle: "blocking", want: "conflict",
+			invoices: func(sub string) []killbill.Invoice {
+				return []killbill.Invoice{invoice("DRAFT", "2026-10-20", killbill.InvoiceItem{ItemType: "REPAIR_ADJ", SubscriptionID: sub})}
+			}},
+		{name: "no invoice at all", settle: "blocking", want: "conflict",
+			invoices: func(string) []killbill.Invoice { return nil }},
+		{name: "the cancel's own invoice with a repair item", settle: "blocking", want: "ok",
+			invoices: func(sub string) []killbill.Invoice {
+				return []killbill.Invoice{invoice("COMMITTED", "2026-10-20", killbill.InvoiceItem{ItemType: "REPAIR_ADJ", SubscriptionID: sub})}
+			}},
+		{name: "the cancel's own invoice with a usage item", settle: "blocking", want: "ok",
+			invoices: func(sub string) []killbill.Invoice {
+				return []killbill.Invoice{invoice("COMMITTED", "2026-10-20", killbill.InvoiceItem{ItemType: "USAGE", SubscriptionID: sub})}
+			}},
+		{name: "a finance step that found nothing to invoice", settle: "blocking", noInv: true, want: "ok",
+			invoices: func(string) []killbill.Invoice { return nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rollup, sc, account := unconfirmedRollup(t, e, b, "Lost "+tc.name)
+			e.closingAt(sc, tc.settle, "2026-10-19")
+			if tc.noInv {
+				e.noInvoiceOutcome(sc, account)
+			}
+			svc := withInvoices(t, e, tc.invoices(rollupSubscription(t, e, sc)))
+			got, _, err := svc.ResolveUnconfirmedRollup(ctx, sc, staffCall, rollup, metering.ResolveDecisionNotBilled)
+			if tc.want == "conflict" {
+				if codeOf(err) != "conflict" {
+					t.Fatalf("not_billed = %+v %v, want conflict", got, err)
+				}
+				return
+			}
+			if err != nil || got.Decision != "not_billed" || got.UnbilledQuantityMicro != 2_000_000 || got.InvoiceID != "" {
+				t.Fatalf("not_billed = %+v %v, want the quantity 2000000 and no invoice", got, err)
+			}
+			if n := count(t, e.db, `SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'metering.rollup_resolved' AND details->>'decision' = 'not_billed' AND details->>'unbilled_quantity_micro' = '2000000'`, sc.Tenant); n != 1 {
+				t.Fatalf("not_billed audits = %d, want 1 with the quantity", n)
+			}
+			if blocked := count(t, e.db, `SELECT count(*) FROM (SELECT tenant_closure_review_blocker($1, $2) AS b) q WHERE b IS NOT NULL`, sc.Brand, sc.Tenant); blocked != 0 {
+				t.Fatal("the closure is still blocked after the usage was recorded as not billed")
+			}
+		})
 	}
 }
 
-// Not billed is refused when a committed invoice does carry the record: that
-// is a forwarded record, and has to be confirmed as that.
+// Not billed is refused when a committed invoice does carry the record: that is
+// a forwarded record, and has to be confirmed as that.
 func TestStaffResolveNotBilledIsRefusedWhenAnInvoiceCarriesTheRecord(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	b := e.brand("zs-resolve-billed")
 	rollup, sc, account := unconfirmedRollup(t, e, b, "Billed Co")
-	e.closing(tenant.Tenant{BrandID: sc.Brand, ID: sc.Tenant})
-	e.cancelled(sc, "2026-10-19")
+	e.closingAt(sc, "blocking", "2026-10-19")
 	e.fake.InvoiceUsage(b.Slug, account, e.clock.Now().AddDate(0, 0, -2), e.clock.Now().AddDate(0, 0, 2))
 	if _, _, err := e.svc.ResolveUnconfirmedRollup(ctx, sc, staffCall, rollup, metering.ResolveDecisionNotBilled); codeOf(err) != "conflict" {
 		t.Fatalf("not_billed when an invoice carries the record = %v, want conflict", err)
@@ -264,10 +357,10 @@ func TestRollupResolutionsAreGuardedByTheDatabase(t *testing.T) {
 		var pgErr *pgconn.PgError
 		return errors.As(err, &pgErr) && pgErr.Code == "23514"
 	}
-	e.closing(tenant.Tenant{BrandID: sc.Brand, ID: sc.Tenant})
-	// not_billed before the cancellation is done.
+	e.closingAt(sc, "finance_pending", "2026-10-19")
+	// not_billed before the finance step is done.
 	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO usage_rollup_resolutions (brand_id, tenant_id, rollup_id, decision, unbilled_quantity_micro, resolved_by, note) VALUES ($1, $2, $3, 'not_billed', 2000000, 'sub:op', 'n')`, sc.Brand, sc.Tenant, id); !isCheck(err) {
-		t.Fatalf("not_billed before the cancellation = %v, want a check violation", err)
+		t.Fatalf("not_billed before the finance step = %v, want a check violation", err)
 	}
 	// A shape that is neither: forwarded with no invoice, not_billed with an invoice.
 	if _, err := e.db.Pool.Exec(ctx, `INSERT INTO usage_rollup_resolutions (brand_id, tenant_id, rollup_id, decision, resolved_by, note) VALUES ($1, $2, $3, 'forwarded', 'sub:op', 'n')`, sc.Brand, sc.Tenant, id); !isCheck(err) {

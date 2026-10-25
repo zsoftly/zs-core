@@ -28,8 +28,8 @@ type RollupResolution struct {
 
 // The decisions staff can record about an unconfirmed rollup. forwarded says
 // Kill Bill holds it: its tracking ID is on a committed invoice of the tenant's
-// account. not_billed says it does not: the cancellation is done, the account has
-// committed invoices after it, and none carries the tracking ID.
+// account. not_billed says Kill Bill has not billed it and will not: the
+// cancel's own invoice exists and does not carry the tracking ID.
 const (
 	ResolveDecisionForwarded = "forwarded"
 	ResolveDecisionNotBilled = "not_billed"
@@ -38,8 +38,8 @@ const (
 var (
 	errNotUnconfirmed = zserrors.New(zserrors.CodeConflict, "Only a rollup whose send Kill Bill never confirmed can be resolved.")
 	errNoEvidence     = zserrors.New(zserrors.CodeConflict, "No committed invoice of the tenant's account carries the tracking ID of this rollup.")
-	errNotCancelled   = zserrors.New(zserrors.CodeConflict, "The usage can be recorded as not billed once the cancellation of the closure is done.")
-	errNoLaterInvoice = zserrors.New(zserrors.CodeConflict, "The account has no committed invoice after the cancellation yet, so it cannot be said that Kill Bill does not bill the record.")
+	errNotCancelled   = zserrors.New(zserrors.CodeConflict, "The usage can be recorded as not billed once the finance step of the closure is done.")
+	errNoLaterInvoice = zserrors.New(zserrors.CodeConflict, "The invoice of the cancellation is not there yet, so it cannot be said that Kill Bill has not billed the record and will not.")
 	errCarried        = zserrors.New(zserrors.CodeConflict, "A committed invoice carries the tracking ID of this rollup: confirm it as forwarded.")
 	// confirmableReasons are the reasons of a send that started: the usage may
 	// be in Kill Bill. A claim that never started sent nothing.
@@ -58,6 +58,10 @@ type rollupState struct {
 	// cancelDay is the UTC day the cancellation of the closure was done, or
 	// empty when it was not.
 	cancelDay string
+	// financed says the finance step of the closure is done, and noInvoice that
+	// it found nothing to invoice.
+	financed, noInvoice bool
+	subscription        string
 }
 
 func readRollupState(ctx context.Context, tx pgx.Tx, sc scope.Scope, rollupID string) (rollupState, error) {
@@ -65,14 +69,18 @@ func readRollupState(ctx context.Context, tx pgx.Tx, sc scope.Scope, rollupID st
 	if err != nil {
 		return rollupState{}, err
 	}
-	st := rollupState{status: r.Status, tracking: r.TrackingID, rollupUID: r.id, quantity: r.QuantityMicro}
+	st := rollupState{status: r.Status, tracking: r.TrackingID, rollupUID: r.id, quantity: r.QuantityMicro, subscription: r.Subscription}
 	args, _ := sc.Bind(r.id)
 	if err := tx.QueryRow(ctx, `SELECT send_protocol, coalesce(closure_unresolved_reason, ''), send_started_at IS NOT NULL FROM usage_rollups WHERE brand_id = $1 AND tenant_id = $2 AND id = $3`, args...).
 		Scan(&st.protocol, &st.reason, &st.started); err != nil {
 		return rollupState{}, unavailable(err)
 	}
-	if err := tx.QueryRow(ctx, `SELECT coalesce((cancellation_completed_at AT TIME ZONE 'UTC')::date::text, '') FROM tenant_closure_settlements WHERE brand_id = $1 AND tenant_id = $2`, sc.Brand, sc.Tenant).
-		Scan(&st.cancelDay); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err := tx.QueryRow(ctx, `SELECT coalesce((s.cancellation_completed_at AT TIME ZONE 'UTC')::date::text, ''),
+    s.status IN ('blocking', 'completed') AND s.finance_completed_at IS NOT NULL,
+    EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes o JOIN tenant_closure_invoice_attempts a ON a.id = o.attempt_id
+            WHERE a.brand_id = s.brand_id AND a.tenant_id = s.tenant_id AND o.kind = 'no_invoice')
+FROM tenant_closure_settlements s WHERE s.brand_id = $1 AND s.tenant_id = $2`, sc.Brand, sc.Tenant).
+		Scan(&st.cancelDay, &st.financed, &st.noInvoice); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return rollupState{}, unavailable(err)
 	}
 	var res RollupResolution
@@ -100,10 +108,14 @@ func (st rollupState) confirmable() bool {
 //   - forwarded: the tracking ID of the rollup is on a committed invoice of the
 //     tenant's account. An invoice that is not committed is no evidence. This
 //     shows that Kill Bill billed the record, not its quantity.
-//   - not_billed: the cancellation of the closure is done, the account has
-//     committed invoices dated on or after the day of it, and none of the
-//     committed invoices carries the tracking ID. The resolution records the
-//     quantity of the frozen rollup that was lost, for finance.
+//   - not_billed: Kill Bill has not billed the record and will not. Kill Bill
+//     makes the invoice of a cancel a little after the cancel, so the
+//     settlement has to be past the finance step, whose own invoice trigger ran
+//     after it, and the cancel's own invoice has to be there: a committed invoice
+//     dated on or after the day of the cancellation with a repair or usage item
+//     of the subscription of the rollup, or a finance step that found nothing to
+//     invoice. No committed invoice may carry the tracking ID. The resolution
+//     records the quantity of the frozen rollup that was lost, for finance.
 //
 // Without the evidence the answer is a conflict. The decision is kept beside the
 // rollup and does not change it, is audited as metering.rollup_resolved with the
@@ -134,7 +146,7 @@ func (s *Service) ResolveUnconfirmedRollup(ctx context.Context, sc scope.Scope, 
 	if !st.confirmable() {
 		return RollupResolution{}, false, errNotUnconfirmed
 	}
-	if decision == ResolveDecisionNotBilled && st.cancelDay == "" {
+	if decision == ResolveDecisionNotBilled && !st.financed {
 		return RollupResolution{}, false, errNotCancelled
 	}
 	acct, err := s.Billing.TenantAccount(ctx, s.DB, sc)
@@ -154,7 +166,11 @@ func (s *Service) ResolveUnconfirmedRollup(ctx context.Context, sc scope.Scope, 
 			carrying = in.InvoiceID
 		}
 		if st.cancelDay != "" && len(in.InvoiceDate) >= 10 && in.InvoiceDate[:10] >= st.cancelDay {
-			later = true
+			for _, item := range in.Items {
+				if (item.ItemType == "REPAIR_ADJ" || item.ItemType == "USAGE") && st.subscription != "" && item.SubscriptionID == st.subscription {
+					later = true
+				}
+			}
 		}
 	}
 	invoiceID, unbilled := "", int64(0)
@@ -168,7 +184,7 @@ func (s *Service) ResolveUnconfirmedRollup(ctx context.Context, sc scope.Scope, 
 		if carrying != "" {
 			return RollupResolution{}, false, errCarried
 		}
-		if !later {
+		if !later && !st.noInvoice {
 			return RollupResolution{}, false, errNoLaterInvoice
 		}
 		unbilled = st.quantity

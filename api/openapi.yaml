@@ -2682,10 +2682,13 @@ paths:
         evidence is Kill Bill's, read here, and without it the answer is
         `409`. `forwarded`: the tracking ID of the rollup is on a committed
         invoice of the tenant's account; that shows Kill Bill billed the
-        record, not its quantity. `not_billed`: the cancellation of the
-        closure is done, the account has committed invoices dated on or after
-        it, and none of the committed invoices carries the tracking ID; the
-        quantity of the rollup is recorded as lost. The decision is kept
+        record, not its quantity. `not_billed`: Kill Bill has not billed the
+        record and will not. The settlement is past its finance step, and the
+        cancel's own invoice is there, a committed invoice dated on or after the
+        cancellation with a repair or usage item of the subscription of the
+        rollup, or the finance step found nothing to invoice; no committed
+        invoice carries the tracking ID. The quantity of the rollup is recorded
+        as lost. The decision is kept
         beside the rollup, which does not change, and nothing is sent again.
         It is audited as `metering.rollup_resolved`, and it is idempotent: a
         repeat returns the same answer. The closure of the tenant cannot

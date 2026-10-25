@@ -45,7 +45,7 @@ Completion is refused, by the application and by the database, until all of thes
 - Every usage send that started and was never confirmed has a staff resolution.
 - The closure invoice outcome is settled, and any `post_unknown` or `read_mismatch` outcome has been dealt with by staff.
 
-Staff resolve an unconfirmed send with `POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/resolve` (the `support` grant) or `zs-core usage resolve-rollup`, with one of two decisions. `forwarded` needs a committed invoice that carries the tracking ID, which shows that Kill Bill billed the record and not its quantity. `not_billed` needs the cancellation to be done and a committed invoice dated on or after it, none of which carries the tracking ID, and it records the lost quantity for finance. Neither sends anything. A rejected rollup is reassigned or discarded with the existing staff routes.
+Staff resolve an unconfirmed send with `POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/resolve` (the `support` grant) or `zs-core usage resolve-rollup`, with one of two decisions. `forwarded` needs a committed invoice that carries the tracking ID, which shows that Kill Bill billed the record and not its quantity. `not_billed` says Kill Bill has not billed the record and will not. It needs the settlement past its finance step and the cancel's own invoice, a committed invoice dated on or after the cancellation with a repair or usage item of the subscription of the rollup, or a finance step that found nothing to invoice, none of the committed invoices carrying the tracking ID. It records the lost quantity for finance. Neither sends anything. A rejected rollup is reassigned or discarded with the existing staff routes.
 
 `zs-core doctor` lists what waits for a person: `closure_stuck`, `closure_reviews`, `usage_unconfirmed`, `usage_rejected` and `usage_claims_stranded`. They are warnings, and a list longer than 100 says how many more there are.
 
@@ -58,7 +58,7 @@ Staff resolve an unconfirmed send with `POST /v1/staff/tenants/{id}/usage/rollup
 | Completion needs the review gate to be clear. | Completion trigger, migrations 26 and 28, and the gate function of migration 37. |
 | A settlement is never deleted and its start record never changes. | Migrations 30 and 34. |
 | A tenant is `closing` only with a settlement, `closed` is terminal, and a settlement is `completed` only with a closed tenant. | Deferred constraint triggers, migrations 32 and 33. |
-| A staff resolution of a rollup is never changed, and it needs the right state and evidence shape. | Migrations 35 and 37. |
+| A staff resolution of a rollup is never changed, and it needs the right state and evidence shape. | Migrations 35, 37 and 38. |
 
 The rules fire in every session replication role. A restore or a logical replication load into these tables meets them too. The harness of the tests turns the start rule and the tenant rules off on its databases so that fixtures can insert a settlement at a later state, and each test of the rules turns them on.
 
@@ -79,7 +79,7 @@ The rules fire in every session replication role. A restore or a logical replica
 - The sync of Organizations and recipients walks every tenant on each pass with no cursor or budget, and the closure pass runs after it.
 - The tables `tenant_closure_bundle_holds` and `closure_hold_resolution` are reserved and unused. A decision to drop them is open.
 - A real-stack test of the closure on Kill Bill is written by the integrations owner.
-- A `not_billed` decision relies on an invoice dated on or after the cancellation day, in UTC. An account in another timezone can differ by a day.
+- A `not_billed` decision relies on an invoice dated on or after the cancellation day, in UTC, and Kill Bill makes the invoice of a cancel a little after the cancel, which is why it also needs the finance step to be done. An account in another timezone can differ by a day.
 - The closure never calls the Kill Bill account close, so the account of a closed tenant stays blocked for ever.
 
 ## Where the code is

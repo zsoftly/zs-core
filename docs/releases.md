@@ -62,6 +62,8 @@ Most migrations apply while the service runs. List these in the release notes, w
 - `TenantStatus` gains `closing`, a tenant whose closure is in progress. It is an additive change to an enum, so a client that switches over the status exhaustively must handle the new value. A closing tenant answers `404 tenant_not_found` to its own members and API keys, so most clients never see it; staff routes and the operator commands do.
 - Error codes `tenant_busy` (`409`, retryable, with a `Retry-After` header) and `tenant_closing` (`409`) are new.
 - `POST /v1/staff/tenants/{id}/closure` is new and needs the new staff grant `closure`.
+- `POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/resolve` is new and needs the `support` grant. It takes the decision `forwarded`, which needs a committed invoice that carries the tracking ID of the rollup, or `not_billed`, which records that Kill Bill has not billed the record and will not. The operator command `zs-core usage resolve-rollup` does the same.
+- `zs-core doctor` has new warnings for a closure that needs a person: `closure_stuck`, `closure_reviews`, `usage_unconfirmed`, `usage_rejected` and `usage_claims_stranded`.
 
 ## Taking a release in a product
 

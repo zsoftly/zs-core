@@ -164,7 +164,7 @@ The tenant stack tests cover the Phase 3 gates with a real Keycloak and Kill Bil
   - Unreachable signing keys give 503.
   - An activation grant of `zs-second` acts in `zs-second` only.
   - Suspension adds the Kill Bill blocking state and disables the Organization, reads continue and writes stop.
-  - Reactivation lifts both, and closure closes the Kill Bill account. A closed tenant cannot be reactivated: `tenant_closed`.
+  - Reactivation lifts both, and the hard close closes the Kill Bill account, where a closure that settles final billing only blocks it. A closed tenant cannot be reactivated: `tenant_closed`.
 - `TestRequiredForStaffBindsBrokeredStaffLoginsOnTheStack` sets `zs-second` to `mfa: required_for_staff` with an extra identity provider. It creates a second realm that plays the provider and signs in through it as a browser would. The staff client is asked for a one-time password, the customer client gets an authorization code, and with `optional` the staff client gets a code too.
 - `TestStaffClientRefusesSSOWithoutSecondFactorOnTheStack` sets `zs-second` to `mfa: required_for_staff`. It signs in to the customer client with a password only, as a browser would, then asks the staff client for a code in the same browser. Keycloak asks for the password and a one-time password instead of reusing the session. Core answers `403 mfa_required` to a staff token without a second factor. With `mfa: required`, a password login reaches the one-time password after the password form.
 

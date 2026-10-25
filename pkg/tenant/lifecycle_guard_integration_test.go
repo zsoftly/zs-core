@@ -1013,3 +1013,133 @@ func TestLifecycleGuardInvalidatesAfterDeferredCommitFailure(t *testing.T) {
 		t.Fatalf("query after failed commit = %v", err)
 	}
 }
+
+// The transaction and the rows of the guard hide the connection: their Conn
+// methods return nil, so a caller cannot reach the borrowed session behind the
+// capability.
+func TestLifecycleGuardHidesTheConnection(t *testing.T) {
+	db := postgrestest.New(t)
+	ctx := context.Background()
+	guard, got, err := tenant.AcquireLifecycleGuard(ctx, db.Pool, lifecycleScope())
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = guard.Release() })
+	rows, err := guard.Query(ctx, `SELECT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows.Conn() != nil {
+		t.Fatal("the rows of the guard expose the connection")
+	}
+	rows.Close()
+	tx, err := guard.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.Conn() != nil {
+		t.Fatal("the transaction of the guard exposes the connection")
+	}
+	txRows, err := tx.Query(ctx, `SELECT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txRows.Conn() != nil {
+		t.Fatal("the rows of a transaction of the guard expose the connection")
+	}
+	txRows.Close()
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A statement whose context names another scope is refused before any SQL, even
+// when its arguments are bound to the scope of the guard.
+func TestLifecycleGuardRejectsAContextScopeMismatchBeforeSQL(t *testing.T) {
+	db := postgrestest.New(t)
+	tracer := &queryCounter{}
+	config := db.Pool.Config().Copy()
+	config.ConnConfig.Tracer = tracer
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	sc := lifecycleScope()
+	guard, got, err := tenant.AcquireLifecycleGuard(context.Background(), pool, sc)
+	if err != nil || !got {
+		t.Fatalf("guard = %v %v", got, err)
+	}
+	t.Cleanup(func() {
+		if err := guard.Release(); err != nil && !errors.Is(err, tenant.ErrLifecycleReleased) {
+			t.Error(err)
+		}
+	})
+	bound, err := sc.Bind()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, ctx := range map[string]context.Context{
+		"another tenant in the context": scope.WithContext(context.Background(), scope.Scope{Brand: sc.Brand, Tenant: idgen.MustNewV7()}),
+		"another brand in the context":  scope.WithBrand(context.Background(), idgen.MustNewV7()),
+	} {
+		tracer.starts.Store(0)
+		if rows, err := guard.Query(ctx, `SELECT $1::uuid, $2::uuid`, bound...); !errors.Is(err, tenant.ErrWrongScope) {
+			if rows != nil {
+				rows.Close()
+			}
+			t.Fatalf("%s = %v, want a wrong scope", name, err)
+		}
+		if got := tracer.starts.Load(); got != 0 {
+			t.Fatalf("%s issued %d queries", name, got)
+		}
+	}
+	// The same arguments with a context that names the guard's scope go through,
+	// so the refusals above were about the context.
+	tracer.starts.Store(0)
+	rows, err := guard.Query(scope.WithContext(context.Background(), sc), `SELECT $1::uuid, $2::uuid`, bound...)
+	if err != nil {
+		t.Fatalf("matching context = %v", err)
+	}
+	rows.Close()
+	if tracer.starts.Load() == 0 {
+		t.Fatal("the matching context issued no SQL")
+	}
+}
+
+// A tenant that is busy is skipped without letting go of the global lock of the
+// sweep: the parent stays usable and no other sweep can take the lock.
+func TestLifecycleSweepBusyChildKeepsTheGlobalLock(t *testing.T) {
+	db := postgrestest.New(t)
+	ctx := context.Background()
+	parent, got, err := tenant.AcquireLifecycleSweep(ctx, db.Pool)
+	if err != nil || !got {
+		t.Fatalf("sweep guard = %v %v", got, err)
+	}
+	t.Cleanup(func() { _ = parent.Release() })
+	sc := lifecycleScope()
+	holder, got, err := tenant.AcquireLifecycleGuard(ctx, db.Pool, sc)
+	if err != nil || !got {
+		t.Fatalf("tenant guard = %v %v", got, err)
+	}
+	child, got, err := parent.TryTenant(ctx, sc)
+	if err != nil || got || child != nil {
+		t.Fatalf("busy child = %v %v %v, want it skipped", child, got, err)
+	}
+	if contender, got, err := tenant.AcquireLifecycleSweep(ctx, db.Pool); err != nil || got || contender != nil {
+		t.Fatalf("another sweep took the global lock while a child was busy: %v %v %v", contender, got, err)
+	}
+	if err := parent.QueryRow(ctx, `SELECT 1`).Scan(new(int)); err != nil {
+		t.Fatalf("the parent is not usable after a busy child: %v", err)
+	}
+	if err := holder.Release(); err != nil {
+		t.Fatal(err)
+	}
+	child, got, err = parent.TryTenant(ctx, sc)
+	if err != nil || !got {
+		t.Fatalf("the tenant is free and the child was %v %v", got, err)
+	}
+	if err := child.Release(); err != nil {
+		t.Fatal(err)
+	}
+}

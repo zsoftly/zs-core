@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/zsoftly/zs-core/internal/killbill"
 	"github.com/zsoftly/zs-core/pkg/audit"
@@ -108,32 +109,43 @@ func recoveryPending() error {
 	return zserrors.New(zserrors.CodeBillingUnavailable, "Credit recovery requires manual review.")
 }
 
+// reviewNeeded is the one way a recovery that cannot prove its receipt ends:
+// the credit stays pending, nothing is posted, the answer is the same manual
+// review for every cause, and one log line names the credit and a fixed reason
+// code, never an amount or an address.
+func (s *Service) reviewNeeded(row creditRow, reason string) error {
+	s.log().Warn("credit recovery needs review", "credit_id", idgen.Format(idgen.Credit, row.id), "source", row.table, "reason", reason)
+	return recoveryPending()
+}
+
 func (s *Service) matchOriginalCredit(ctx context.Context, a account, row creditRow) (killbill.InvoiceItem, error) {
-	if row.originalEndpoint == nil || row.originalKBTenant == nil || row.originalKBAccount == nil || row.originalCurrency == nil || row.originalAmount == nil || row.originalDescription == nil ||
-		*row.originalKBTenant != a.brand.KillBillTenantID || *row.originalKBAccount != a.id() || *row.originalCurrency != row.currency || *row.originalAmount != row.amountMinor || *row.originalDescription != creditDescription(row.id) {
-		return killbill.InvoiceItem{}, recoveryPending()
+	if row.originalEndpoint == nil || row.originalKBTenant == nil || row.originalKBAccount == nil || row.originalCurrency == nil || row.originalAmount == nil || row.originalDescription == nil {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "target_missing")
+	}
+	if *row.originalKBTenant != a.brand.KillBillTenantID || *row.originalKBAccount != a.id() || *row.originalCurrency != row.currency || *row.originalAmount != row.amountMinor || *row.originalDescription != creditDescription(row.id) {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "target_mismatch")
 	}
 	wantEndpoint := "grant"
 	if row.table == "credit_code_redemptions" {
 		wantEndpoint = "redeem"
 	}
 	if *row.originalEndpoint != wantEndpoint {
-		return killbill.InvoiceItem{}, recoveryPending()
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "target_mismatch")
 	}
 	wantAmount, err := FromMinor(-row.amountMinor, row.currency)
 	if err != nil {
-		return killbill.InvoiceItem{}, recoveryPending()
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "target_mismatch")
 	}
 	items, err := s.KillBill.AccountInvoices(ctx, a.creds, a.id(), true)
 	if err != nil {
-		return killbill.InvoiceItem{}, kbError(err)
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "history_unavailable")
 	}
 	var candidate killbill.InvoiceItem
 	var invoice killbill.Invoice
 	count := 0
 	for _, in := range items {
 		if in.AccountID != a.id() {
-			return killbill.InvoiceItem{}, recoveryPending()
+			return killbill.InvoiceItem{}, s.reviewNeeded(row, "history_foreign_account")
 		}
 		for _, item := range in.Items {
 			if item.ItemType == "CREDIT_ADJ" && item.Description == *row.originalDescription {
@@ -142,16 +154,35 @@ func (s *Service) matchOriginalCredit(ctx context.Context, a account, row credit
 			}
 		}
 	}
-	if count != 1 || invoice.Status != "COMMITTED" || invoice.Currency != row.currency || candidate.InvoiceID == "" || candidate.InvoiceID != invoice.InvoiceID || candidate.InvoiceItemID == "" || candidate.AccountID != a.id() || candidate.Currency != row.currency || !sameDecimal(candidate.Amount, wantAmount) {
-		return killbill.InvoiceItem{}, recoveryPending()
+	switch {
+	case count == 0:
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_absent")
+	case count > 1:
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_ambiguous")
+	case invoice.Status != "COMMITTED":
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_not_committed")
+	case invoice.Currency != row.currency || candidate.InvoiceID == "" || candidate.InvoiceID != invoice.InvoiceID || candidate.InvoiceItemID == "" ||
+		candidate.AccountID != a.id() || candidate.Currency != row.currency || !sameDecimal(candidate.Amount, wantAmount):
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_mismatch")
 	}
 	if _, err := idgen.ParseUUID(invoice.InvoiceID); err != nil {
-		return killbill.InvoiceItem{}, recoveryPending()
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_mismatch")
 	}
 	if _, err := idgen.ParseUUID(candidate.InvoiceItemID); err != nil {
-		return killbill.InvoiceItem{}, recoveryPending()
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_mismatch")
 	}
 	return candidate, nil
+}
+
+// creditCompletionError maps the refusal of the database to put a receipt on a
+// second credit to the manual review the recovery ends in, and anything else
+// to a database failure.
+func creditCompletionError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23514" {
+		return recoveryPending()
+	}
+	return unavailable(err)
 }
 
 func sameDecimal(got, want json.Number) bool {
@@ -577,7 +608,7 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3`, append(args, row.id)...))
 			return nil
 		}
 		if err != nil {
-			return unavailable(err)
+			return creditCompletionError(err)
 		}
 		row = completed
 		if err := BumpWalletVersion(ctx, tx, sc); err != nil {
@@ -779,7 +810,7 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3`, append(args, row.id)...))
 			return nil
 		}
 		if err != nil {
-			return unavailable(err)
+			return creditCompletionError(err)
 		}
 		row = completed
 		if err := BumpWalletVersion(ctx, tx, sc); err != nil {

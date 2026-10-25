@@ -99,14 +99,15 @@ func (c EngineClosureSteps) Prepare(ctx context.Context, db DB, sc scope.Scope) 
 	// A tenant that was suspended has its billing blocked. The closed state,
 	// which leaves billing open, is written first, so that the final invoice is
 	// not computed under a billing block. It does not make the suspended period
-	// billable: usage during a suspension is unbilled either way.
+	// billable: usage dated within the suspension is unbilled either way.
 	if err := c.openBilling(ctx, kb, be.creds, account, cc); err != nil {
 		return ClosurePrepared{}, err
 	}
 	// The usage goes to Kill Bill first so that it is in the repair invoice the
 	// cancel produces, and does not depend on a later invoice run. Kill Bill
-	// accepts and bills usage on a cancelled subscription, as measured on
-	// 0.24.22; draining first is for the invoice, not because it would refuse.
+	// accepts and bills usage on a cancelled subscription on the next invoice
+	// run, as measured on 0.24.22; draining first is for the invoice, not
+	// because it would refuse.
 	// Nothing is cancelled until the drain says the usage is all there, and a
 	// closing tenant takes no new usage, so none arrives after it. Without a
 	// drain nothing is cancelled and the closure waits.

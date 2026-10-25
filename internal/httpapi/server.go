@@ -216,6 +216,7 @@ func New(opts Options) http.Handler {
 	mux.Handle("POST /v1/tenants/{id}/usage/batch", s.member(s.recordUsageBatch))
 	mux.Handle("POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/reassign", s.authenticate(http.HandlerFunc(s.reassignUsageRollup)))
 	mux.Handle("POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/discard", s.authenticate(http.HandlerFunc(s.discardUsageRollup)))
+	mux.Handle("POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/resolve", s.authenticate(http.HandlerFunc(s.resolveUsageRollup)))
 	mux.Handle("GET /v1/tenants/{id}/usage/events", s.member(s.listUsageEvents))
 	mux.Handle("GET /v1/tenants/{id}/usage/summary", s.member(s.getUsageSummary))
 	mux.Handle("GET /v1/tenants/{id}/usage/billed", s.member(s.getBilledUsage))

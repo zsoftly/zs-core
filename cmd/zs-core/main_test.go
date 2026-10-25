@@ -323,3 +323,18 @@ func TestTenantSweeperGetsClosureStepsOnlyWithBilling(t *testing.T) {
 		t.Fatal("closure steps without a metering service")
 	}
 }
+
+// resolve-rollup needs all its flags before it asks for any setting.
+func TestUsageResolveRollupFlags(t *testing.T) {
+	var out, errOut bytes.Buffer
+	for _, args := range [][]string{
+		{"usage", "resolve-rollup"},
+		{"usage", "resolve-rollup", "--brand", "zs-reference", "--tenant", "tnt_01m5qxsm2vefytm7qehn7fnrx5", "--rollup", "rol_x", "--operator", "me"},
+		{"usage", "resolve-rollup", "--brand", "zs-reference", "--tenant", "not-a-tenant", "--rollup", "rol_x", "--operator", "me", "--reason", "r"},
+	} {
+		errOut.Reset()
+		if code := run(args, nil, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "resolve-rollup") {
+			t.Errorf("%v = %d %q, want a usage error", args, code, errOut.String())
+		}
+	}
+}

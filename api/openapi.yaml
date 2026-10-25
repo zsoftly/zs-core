@@ -2670,6 +2670,45 @@ paths:
         "404": {$ref: "#/components/responses/NotFound"}
         "409": {$ref: "#/components/responses/Conflict"}
         "503": {$ref: "#/components/responses/Unavailable"}
+  /v1/staff/tenants/{id}/usage/rollups/{rollup}/resolve:
+    post:
+      tags: [metering]
+      operationId: resolveUsageRollup
+      summary: Confirm that Kill Bill holds an unconfirmed usage rollup.
+      description: |
+        Staff with the `support` grant in the tenant's brand only; anyone
+        else gets `404`. Needs a reason. The rollup must be one whose send
+        started and whose outcome Kill Bill never confirmed. The evidence is
+        Kill Bill's: the tracking ID of the rollup must be on an invoice of
+        the tenant's account, which is read, and without it the answer is
+        `409`. The confirmation is kept beside the rollup, which does not
+        change, and nothing is sent again. It is audited as
+        `metering.rollup_resolved` with the reason and the invoice, and it is
+        idempotent: a repeat returns the same answer. A closing tenant is
+        drained once all its unconfirmed rollups are confirmed.
+      security: [{bearer: []}]
+      parameters:
+        - $ref: "#/components/parameters/TenantIdPath"
+        - $ref: "#/components/parameters/RollupIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UsageRollupResolve"}
+      responses:
+        "200":
+          description: The confirmation.
+          headers:
+            X-Request-ID: {$ref: "#/components/headers/RequestId"}
+            Cache-Control: {$ref: "#/components/headers/CacheControl"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UsageRollupResolution"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthenticated"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
 components:
   securitySchemes:
     bearer:
@@ -4128,6 +4167,22 @@ components:
       additionalProperties: false
       properties:
         reason: {type: string, minLength: 1, maxLength: 1000}
+    UsageRollupResolve:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason: {type: string, minLength: 1, maxLength: 1000}
+    UsageRollupResolution:
+      type: object
+      required: [rollup_id, decision, invoice_id, resolved_by, resolved_at]
+      additionalProperties: false
+      properties:
+        rollup_id: {type: string}
+        decision: {type: string, enum: [forwarded]}
+        invoice_id: {type: string, description: The Kill Bill invoice that bills the rollup.}
+        resolved_by: {type: string}
+        resolved_at: {type: string, format: date-time}
     UsageRollup:
       type: object
       required: [id, killbill_unit, day, period_start, record_at, quantity_micro, events, killbill_tracking_id, status, attempts, forwarded_at, rejected_at, discarded_at]

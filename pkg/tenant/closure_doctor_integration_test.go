@@ -95,3 +95,34 @@ func TestClosureFindingsReportOpenReviews(t *testing.T) {
 		t.Fatalf("a resolved review is still reported: %+v", fs)
 	}
 }
+
+// A kind with more findings than the limit lists the limit and says how many
+// are left out, never silently.
+func TestClosureFindingsSayHowManyAreLeftOut(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	for range 3 {
+		tn := settlementAt(t, e, "cancelling", false, false)
+		if _, err := e.db.Pool.Exec(ctx, `UPDATE tenant_closure_settlements SET created_at = now() - interval '3 hours' WHERE tenant_id = $1`, tn.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	was := doctor.ClosureFindingMax
+	doctor.ClosureFindingMax = 2
+	t.Cleanup(func() { doctor.ClosureFindingMax = was })
+	fs := closureFindings(t, e)
+	listed, more := 0, false
+	for _, f := range fs {
+		if f.Check != "closure_stuck" {
+			continue
+		}
+		if strings.HasPrefix(f.Message, "and 1 more") {
+			more = true
+		} else {
+			listed++
+		}
+	}
+	if listed != 2 || !more {
+		t.Fatalf("findings = %+v, want 2 listed and an 'and 1 more' warning", fs)
+	}
+}

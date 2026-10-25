@@ -41,7 +41,8 @@ func (s *Service) Drained(ctx context.Context, sc scope.Scope) (bool, error) {
 	var left bool
 	if err := s.DB.QueryRow(ctx, `SELECT
     EXISTS (SELECT 1 FROM usage_events WHERE brand_id = $1 AND tenant_id = $2 AND acceptance_protocol = 1 AND rollup_id IS NULL AND reservation_id IS NULL)
- OR EXISTS (SELECT 1 FROM usage_rollups WHERE brand_id = $1 AND tenant_id = $2 AND send_protocol = 1 AND status IN ('pending', 'rejected'))
+ OR EXISTS (SELECT 1 FROM usage_rollups u WHERE u.brand_id = $1 AND u.tenant_id = $2 AND u.send_protocol = 1 AND u.status IN ('pending', 'rejected')
+    AND NOT EXISTS (SELECT 1 FROM usage_rollup_resolutions x WHERE x.rollup_id = u.id))
  OR EXISTS (SELECT 1 FROM reservations WHERE brand_id = $1 AND tenant_id = $2 AND status = 'held')`, args...).Scan(&left); err != nil {
 		return false, unavailable(err)
 	}

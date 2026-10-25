@@ -16,6 +16,7 @@
 //	zs-core credit sweep   run one pass of the credit expiry sweeper
 //	zs-core wallet sweep   expire reservations past their lease and reconcile wallets once
 //	zs-core usage forward  forward recorded usage to Kill Bill once
+//	zs-core usage resolve-rollup  confirm that Kill Bill holds an unconfirmed usage rollup
 //	zs-core plugin ddl show|apply  print or apply a pinned plugin's DDL
 //	zs-core plugin mirror sync     download the pinned plugin jars into the mirror
 //
@@ -80,6 +81,7 @@ Commands:
   credit sweep   expire the credits Core issued that are past their expiry, once
   wallet sweep   expire reservations past their lease and reconcile every wallet with Kill Bill, once
   usage forward  forward recorded usage to Kill Bill as usage records, once
+  usage resolve-rollup  confirm, against a Kill Bill invoice, a rollup whose send was never confirmed
   plugin ddl show <name>   print the DDL of a pinned plugin's jar, read from the mirror or the repository
                    --components <file>    components file (default components.yaml)
   plugin ddl apply <name>|--all  create the plugin's missing tables in the Kill Bill database

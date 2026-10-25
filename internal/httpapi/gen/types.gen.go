@@ -800,6 +800,21 @@ func (e UsageRollupStatus) Valid() bool {
 	}
 }
 
+// Defines values for UsageRollupResolutionDecision.
+const (
+	UsageRollupResolutionDecisionForwarded UsageRollupResolutionDecision = "forwarded"
+)
+
+// Valid indicates whether the value is a known member of the UsageRollupResolutionDecision enum.
+func (e UsageRollupResolutionDecision) Valid() bool {
+	switch e {
+	case UsageRollupResolutionDecisionForwarded:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for WalletViewHoldReasons.
 const (
 	WalletViewHoldReasonsAccountBlocked             WalletViewHoldReasons = "account_blocked"
@@ -2262,6 +2277,25 @@ type UsageRollupReassign struct {
 	Subscription KillBillId `json:"subscription"`
 }
 
+// UsageRollupResolution defines model for UsageRollupResolution.
+type UsageRollupResolution struct {
+	Decision UsageRollupResolutionDecision `json:"decision"`
+
+	// InvoiceId The Kill Bill invoice that bills the rollup.
+	InvoiceId  string    `json:"invoice_id"`
+	ResolvedAt time.Time `json:"resolved_at"`
+	ResolvedBy string    `json:"resolved_by"`
+	RollupId   string    `json:"rollup_id"`
+}
+
+// UsageRollupResolutionDecision defines model for UsageRollupResolution.Decision.
+type UsageRollupResolutionDecision string
+
+// UsageRollupResolve defines model for UsageRollupResolve.
+type UsageRollupResolve struct {
+	Reason string `json:"reason"`
+}
+
 // UsageSettlement defines model for UsageSettlement.
 type UsageSettlement struct {
 	EventId       *string `json:"event_id,omitempty"`
@@ -2659,6 +2693,9 @@ type DiscardUsageRollupJSONRequestBody = UsageRollupDiscard
 
 // ReassignUsageRollupJSONRequestBody defines body for ReassignUsageRollup for application/json ContentType.
 type ReassignUsageRollupJSONRequestBody = UsageRollupReassign
+
+// ResolveUsageRollupJSONRequestBody defines body for ResolveUsageRollup for application/json ContentType.
+type ResolveUsageRollupJSONRequestBody = UsageRollupResolve
 
 // CreateTenantJSONRequestBody defines body for CreateTenant for application/json ContentType.
 type CreateTenantJSONRequestBody = TenantCreate

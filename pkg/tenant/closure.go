@@ -174,6 +174,37 @@ WHERE a.brand_id = $1 AND a.tenant_id = $2 FOR UPDATE`, sc.Brand, sc.Tenant).Sca
 		}
 		return nil
 	}
+	// recordNoInvoice records no_invoice under the attempt lock, unless one of
+	// the kinds that rule it out is recorded: the answer is read from the
+	// outcomes, not from the insert, because a refused statement would
+	// invalidate the lifecycle capability. Every statement of this write runs
+	// apart from the caller's context, so a stop after the answer cannot leave
+	// it unrecorded.
+	recordNoInvoice := func(refusedBy ...string) error {
+		writeCtx := context.WithoutCancel(ctx)
+		return withClosureWriteRetries(func() error {
+			return pgx.BeginFunc(writeCtx, db, func(tx pgx.Tx) error {
+				if err := lock(writeCtx, tx); err != nil {
+					return err
+				}
+				var refused bool
+				if err := tx.QueryRow(writeCtx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes
+WHERE attempt_id = $1 AND kind = ANY ($2))`, attemptID, refusedBy).Scan(&refused); err != nil {
+					return unavailable(err)
+				}
+				if refused {
+					return manualReview
+				}
+				if _, err := tx.Exec(writeCtx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind)
+SELECT $3, $4, 'no_invoice'
+WHERE EXISTS (SELECT 1 FROM tenant_closure_invoice_attempts WHERE id = $4 AND brand_id = $1 AND tenant_id = $2)
+ON CONFLICT (attempt_id, kind) DO NOTHING`, sc.Brand, sc.Tenant, idgen.MustNewV7(), attemptID); err != nil {
+					return unavailable(err)
+				}
+				return nil
+			})
+		})
+	}
 	// First read what is already recorded. Nothing is started yet.
 	err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
 		if err := lock(ctx, tx); err != nil {
@@ -198,8 +229,10 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 	if err != nil {
 		return ClosureExecutionResult{}, err
 	}
-	// A recorded start or invoice always wins: a real invoice is never hidden.
-	if noInvoice && !recorded {
+	// A recorded invoice always wins: a real invoice is never hidden. The
+	// outcome rules keep no_invoice and an invoice apart, so no_invoice with a
+	// start is a trigger that found nothing to invoice.
+	if noInvoice && invoiceID == "" {
 		return ClosureExecutionResult{NoInvoice: true}, nil
 	}
 	if recorded && invoiceID == "" {
@@ -245,32 +278,7 @@ WHERE started.attempt_id = $1 AND started.kind = 'started'`, attemptID).Scan(&ex
 			// The dry run may be stale: another executor can have started and
 			// posted since this one read. So no_invoice is recorded under the
 			// attempt lock, and only while nothing has been started.
-			// Every statement of this write runs apart from the caller's context,
-			// so a stop after the dry run cannot leave the answer unrecorded.
-			writeCtx := context.WithoutCancel(ctx)
-			err := withClosureWriteRetries(func() error {
-				return pgx.BeginFunc(writeCtx, db, func(tx pgx.Tx) error {
-					if err := lock(writeCtx, tx); err != nil {
-						return err
-					}
-					var begun bool
-					if err := tx.QueryRow(writeCtx, `SELECT EXISTS (SELECT 1 FROM tenant_closure_invoice_outcomes
-WHERE attempt_id = $1 AND kind IN ('started', 'invoice_id', 'post_unknown'))`, attemptID).Scan(&begun); err != nil {
-						return unavailable(err)
-					}
-					if begun {
-						return manualReview
-					}
-					if _, err := tx.Exec(writeCtx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind)
-SELECT $3, $4, 'no_invoice'
-WHERE EXISTS (SELECT 1 FROM tenant_closure_invoice_attempts WHERE id = $4 AND brand_id = $1 AND tenant_id = $2)
-ON CONFLICT (attempt_id, kind) DO NOTHING`, sc.Brand, sc.Tenant, idgen.MustNewV7(), attemptID); err != nil {
-						return unavailable(err)
-					}
-					return nil
-				})
-			})
-			if err != nil {
+			if err := recordNoInvoice("started", "invoice_id", "post_unknown"); err != nil {
 				return ClosureExecutionResult{}, err
 			}
 			return ClosureExecutionResult{NoInvoice: true}, nil
@@ -316,12 +324,27 @@ ON CONFLICT (attempt_id, kind) DO NOTHING`, sc.Brand, sc.Tenant, idgen.MustNewV7
 		invoiceID, err = eng.KillBill.TriggerInvoice(postCtx, be.creds, callContext("", "closure invoice"), accountID, targetDate.Format(time.DateOnly))
 		cancelPost()
 		if err != nil {
-			// Any failure of the real POST, a bare 404 included, proves nothing:
-			// it is an unknown outcome for manual review, never posted again.
-			if persistErr := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "post_unknown", ""); persistErr != nil {
-				return ClosureExecutionResult{}, errors.Join(engineError(err), persistErr)
+			// Kill Bill answers the bare 404 when there is nothing to invoice, and
+			// the dry run just showed something, so the invoice of the cancel
+			// can have been made in between. Only a second dry run that finds
+			// nothing, together with the invoices of the account, says which.
+			// Any other failure of the real POST proves nothing: it is an
+			// unknown outcome for manual review, never posted again.
+			answer := settleTriggerNotFound(ctx, db, sc, eng.KillBill, be.creds, err, accountID, targetDate.Format(time.DateOnly))
+			switch {
+			case answer.nothing:
+				if persistErr := recordNoInvoice("invoice_id", "post_unknown"); persistErr != nil {
+					return ClosureExecutionResult{Posted: true}, persistErr
+				}
+				return ClosureExecutionResult{Posted: true, NoInvoice: true}, nil
+			case answer.invoiceID != "":
+				invoiceID, err = answer.invoiceID, nil
+			default:
+				if persistErr := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "post_unknown", ""); persistErr != nil {
+					return ClosureExecutionResult{}, errors.Join(engineError(err), persistErr)
+				}
+				return ClosureExecutionResult{}, engineError(err)
 			}
-			return ClosureExecutionResult{}, engineError(err)
 		}
 		if err := recordClosureInvoiceOutcome(ctx, db, sc, attemptID, "invoice_id", invoiceID); err != nil {
 			return ClosureExecutionResult{}, err

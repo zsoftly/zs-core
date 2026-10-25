@@ -1052,8 +1052,10 @@ FOR EACH ROW WHEN (NEW.kind = 'invoice_id') EXECUTE FUNCTION closure_outcome_fai
 	}
 }
 
-// A started attempt and a no_invoice outcome exclude each other, in both
-// directions, so a real invoice can never be hidden by an answer of nothing.
+// An invoice ID or an unknown outcome and a no_invoice outcome exclude each
+// other, so a real invoice can never be hidden by an answer of nothing. A start
+// alone does not: a trigger that answers nothing to invoice is recorded after
+// its start, as the test of the executor shows.
 func TestClosureInvoiceNoInvoiceAndStartExcludeEachOther(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -1089,7 +1091,10 @@ VALUES ($1, $2, $3, $2, $4::uuid, $5::date)`, id, tn.BrandID, tn.ID, tn.KillBill
 	if err := insert(attempt, "started", nil, "CAD"); err != nil {
 		t.Fatal(err)
 	}
-	violation(insert(attempt, "no_invoice", nil, nil), "no_invoice after started")
+	if err := insert(attempt, "post_unknown", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	violation(insert(attempt, "no_invoice", nil, nil), "no_invoice after post_unknown")
 	recorded := idgen.MustNewV7()
 	if err := insert(attempt, "invoice_id", recorded, nil); err != nil {
 		t.Fatal(err)
@@ -1119,6 +1124,12 @@ VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, attempt, tn.BrandID, tn.ID, tn
 	var pgErr *pgconn.PgError
 	if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
 		t.Fatalf("started after no_invoice = %v, want a check violation", err)
+	}
+	for kind, invoice := range map[string]any{"post_unknown": nil, "invoice_id": idgen.MustNewV7()} {
+		_, err := e.db.Pool.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, invoice_id) VALUES ($1, $2, $3, $4)`, idgen.MustNewV7(), attempt, kind, invoice)
+		if err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+			t.Fatalf("%s after no_invoice = %v, want a check violation", kind, err)
+		}
 	}
 }
 
@@ -1178,9 +1189,9 @@ FOR EACH ROW WHEN (NEW.kind = 'invoice_id') EXECUTE FUNCTION closure_outcome_alw
 	}
 }
 
-// The database alone keeps a start and no_invoice from both being recorded,
-// even when two transactions insert them at the same time: the second waits
-// for the first and then finds it.
+// The database alone keeps an unknown outcome and no_invoice from both being
+// recorded, even when two transactions insert them at the same time: the
+// second waits for the first and then finds it.
 func TestClosureInvoiceExclusionHoldsForConcurrentInserts(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -1205,7 +1216,7 @@ VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, attempt, tn.BrandID, tn.ID, tn
 		t.Fatal(err)
 	}
 	defer second.Rollback(ctx)
-	if _, err := first.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind, expected_currency) VALUES ($1, $2, 'started', 'CAD')`, idgen.MustNewV7(), attempt); err != nil {
+	if _, err := first.Exec(ctx, `INSERT INTO tenant_closure_invoice_outcomes (id, attempt_id, kind) VALUES ($1, $2, 'post_unknown')`, idgen.MustNewV7(), attempt); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
@@ -1216,7 +1227,7 @@ VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, attempt, tn.BrandID, tn.ID, tn
 	// The second insert must wait for the first transaction.
 	select {
 	case err := <-done:
-		t.Fatalf("no_invoice was not held back by a concurrent start: %v", err)
+		t.Fatalf("no_invoice was not held back by a concurrent unknown outcome: %v", err)
 	case <-time.After(1500 * time.Millisecond):
 	}
 	if err := first.Commit(ctx); err != nil {
@@ -1224,10 +1235,10 @@ VALUES ($1, $2, $3, $2, $4::uuid, current_date)`, attempt, tn.BrandID, tn.ID, tn
 	}
 	var pgErr *pgconn.PgError
 	if err := <-done; err == nil || !errors.As(err, &pgErr) || pgErr.Code != "23514" {
-		t.Fatalf("no_invoice after the concurrent start = %v, want a check violation", err)
+		t.Fatalf("no_invoice after the concurrent unknown outcome = %v, want a check violation", err)
 	}
-	var started, noInvoice int
-	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'started'), count(*) FILTER (WHERE kind = 'no_invoice') FROM tenant_closure_invoice_outcomes`).Scan(&started, &noInvoice); err != nil || started != 1 || noInvoice != 0 {
-		t.Fatalf("started = %d no_invoice = %d, %v", started, noInvoice, err)
+	var unknown, noInvoice int
+	if err := e.db.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind = 'post_unknown'), count(*) FILTER (WHERE kind = 'no_invoice') FROM tenant_closure_invoice_outcomes`).Scan(&unknown, &noInvoice); err != nil || unknown != 1 || noInvoice != 0 {
+		t.Fatalf("post_unknown = %d no_invoice = %d, %v", unknown, noInvoice, err)
 	}
 }

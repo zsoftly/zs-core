@@ -110,6 +110,7 @@ func runUsageResolve(args, environ []string, stdout, stderr io.Writer) int {
 	rollup := fs.String("rollup", "", "rollup ID, rol_...")
 	reason := fs.String("reason", "", "why, recorded in audit")
 	operator := fs.String("operator", "", "who acts, recorded in audit")
+	decision := fs.String("decision", "forwarded", "forwarded: a committed invoice carries the record; not_billed: Kill Bill does not hold it")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -129,12 +130,15 @@ func runUsageResolve(args, environ []string, stdout, stderr io.Writer) int {
 		}
 		m := &metering.Service{DB: pool, Billing: svc}
 		call := metering.StaffCall{Call: metering.Call{Actor: operatorActor(*operator), CorrelationID: idgen.MustNewV7().String()}, Reason: *reason}
-		res, replayed, err := m.ResolveUnconfirmedRollup(ctx, scope.Scope{Brand: rec.ID, Tenant: id}, call, *rollup)
+		res, replayed, err := m.ResolveUnconfirmedRollup(ctx, scope.Scope{Brand: rec.ID, Tenant: id}, call, *rollup, *decision)
 		if err != nil {
 			return "", false, err
 		}
 		if replayed {
 			return fmt.Sprintf("%s was already confirmed as %s by %s, invoice %s", res.RollupID, res.Decision, res.ResolvedBy, res.InvoiceID), false, nil
+		}
+		if res.Decision == metering.ResolveDecisionNotBilled {
+			return fmt.Sprintf("%s recorded as not billed, %d micro-units lost", res.RollupID, res.UnbilledQuantityMicro), false, nil
 		}
 		return fmt.Sprintf("%s confirmed as %s, invoice %s", res.RollupID, res.Decision, res.InvoiceID), false, nil
 	})

@@ -71,7 +71,7 @@ func TestStaffResolveRollupRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := "/v1/staff/tenants/" + id + "/usage/rollups/" + idgen.Format(idgen.Rollup, rollup) + "/resolve"
-	body := map[string]any{"reason": "checked against Kill Bill"}
+	body := map[string]any{"reason": "checked against Kill Bill", "decision": "forwarded"}
 
 	for name, tok := range map[string]string{
 		"customer":       a.token(owner, mfa()),
@@ -85,8 +85,14 @@ func TestStaffResolveRollupRoute(t *testing.T) {
 	if r := a.call(http.MethodPost, path, supportTok, body); r.status != http.StatusConflict || r.code() != "conflict" {
 		t.Fatalf("no invoice carries the tracking ID = %d %v, want a conflict", r.status, r.body)
 	}
-	if r := a.call(http.MethodPost, path, supportTok, map[string]any{}); r.status != http.StatusBadRequest {
+	if r := a.call(http.MethodPost, path, supportTok, map[string]any{"decision": "forwarded"}); r.status != http.StatusBadRequest {
 		t.Fatalf("no reason = %d %v, want 400", r.status, r.body)
+	}
+	if r := a.call(http.MethodPost, path, supportTok, map[string]any{"reason": "x"}); r.status != http.StatusBadRequest {
+		t.Fatalf("no decision = %d %v, want 400", r.status, r.body)
+	}
+	if r := a.call(http.MethodPost, path, supportTok, map[string]any{"reason": "x", "decision": "forfeit"}); r.status != http.StatusBadRequest {
+		t.Fatalf("unknown decision = %d %v, want 400", r.status, r.body)
 	}
 	invoice := a.fake.InvoiceUsage(b.Slug, account, time.Now().AddDate(0, 0, -2), time.Now().AddDate(0, 0, 2))
 	first := a.call(http.MethodPost, path, supportTok, body)

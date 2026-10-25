@@ -109,3 +109,28 @@ func TestClosureFindingsReportARejectedRollup(t *testing.T) {
 		t.Fatalf("findings = %+v, want a rejected usage warning for %s", fs, tn.PublicID())
 	}
 }
+
+// A rollup that is unconfirmed already has its reason and is reported as that,
+// not as a stranded claim, though its claim was never released.
+func TestClosureFindingsDoNotCallAnUnconfirmedRollupStranded(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	b := e.brand("zs-doctor-notstranded")
+	unconfirmedRollup(t, e, b, "Not Stranded")
+	fs, err := doctor.ClosureFindings(ctx, e.db.Pool, time.Now().Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unconfirmed := false
+	for _, f := range fs {
+		if f.Check == "usage_claims_stranded" {
+			t.Fatalf("an unconfirmed rollup was reported as a stranded claim: %+v", f)
+		}
+		if f.Check == "usage_unconfirmed" {
+			unconfirmed = true
+		}
+	}
+	if !unconfirmed {
+		t.Fatalf("findings = %+v, want the rollup reported as unconfirmed", fs)
+	}
+}

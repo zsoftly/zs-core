@@ -47,7 +47,9 @@ VALUES ($1, $2, $3, $4, 700, 'CAD', 'user', $5, 'receipt', 'redeem', $2, $6::uui
 			id, a.BrandID, a.ID, codeID, e.owner.Identity.PublicID(), a.KillBillAccountID, description); err != nil {
 			t.Fatal(err)
 		}
-		return id, description, func(svc *billing.Service) (billing.Credit, bool, error) { return svc.Redeem(ctx, a.Scope(), e.call(), key) }
+		return id, description, func(svc *billing.Service) (billing.Credit, bool, error) {
+			return svc.Redeem(ctx, a.Scope(), e.call(), key)
+		}
 	}
 	req := billing.StaffCredit{AmountMinor: 700, Currency: "CAD", IdempotencyKey: key}
 	payload, err := json.Marshal(map[string]any{"amount_minor": req.AmountMinor, "currency": req.Currency, "reason": "goodwill", "expires_at": req.ExpiresAt})
@@ -174,7 +176,10 @@ func TestCreditReceiptOwnershipIsSerialized(t *testing.T) {
 	receiptID := idgen.MustNewV7().String()
 	var wg sync.WaitGroup
 	var won atomic.Int64
-	for _, stmt := range []struct{ table string; id idgen.UUID }{{"credit_code_redemptions", redeemID}, {"staff_credits", grantID}} {
+	for _, stmt := range []struct {
+		table string
+		id    idgen.UUID
+	}{{"credit_code_redemptions", redeemID}, {"staff_credits", grantID}} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

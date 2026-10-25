@@ -2677,15 +2677,19 @@ paths:
       summary: Confirm that Kill Bill holds an unconfirmed usage rollup.
       description: |
         Staff with the `support` grant in the tenant's brand only; anyone
-        else gets `404`. Needs a reason. The rollup must be one whose send
-        started and whose outcome Kill Bill never confirmed. The evidence is
-        Kill Bill's: the tracking ID of the rollup must be on an invoice of
-        the tenant's account, which is read, and without it the answer is
-        `409`. The confirmation is kept beside the rollup, which does not
-        change, and nothing is sent again. It is audited as
-        `metering.rollup_resolved` with the reason and the invoice, and it is
-        idempotent: a repeat returns the same answer. A closing tenant is
-        drained once all its unconfirmed rollups are confirmed.
+        else gets `404`. Needs a reason and a decision. The rollup must be one
+        whose send started and whose outcome Kill Bill never confirmed. The
+        evidence is Kill Bill's, read here, and without it the answer is
+        `409`. `forwarded`: the tracking ID of the rollup is on a committed
+        invoice of the tenant's account; that shows Kill Bill billed the
+        record, not its quantity. `not_billed`: the cancellation of the
+        closure is done, the account has committed invoices dated on or after
+        it, and none of the committed invoices carries the tracking ID; the
+        quantity of the rollup is recorded as lost. The decision is kept
+        beside the rollup, which does not change, and nothing is sent again.
+        It is audited as `metering.rollup_resolved`, and it is idempotent: a
+        repeat returns the same answer. The closure of the tenant cannot
+        complete while a rollup of this kind is unresolved.
       security: [{bearer: []}]
       parameters:
         - $ref: "#/components/parameters/TenantIdPath"
@@ -4169,18 +4173,20 @@ components:
         reason: {type: string, minLength: 1, maxLength: 1000}
     UsageRollupResolve:
       type: object
-      required: [reason]
+      required: [reason, decision]
       additionalProperties: false
       properties:
         reason: {type: string, minLength: 1, maxLength: 1000}
+        decision: {type: string, enum: [forwarded, not_billed]}
     UsageRollupResolution:
       type: object
-      required: [rollup_id, decision, invoice_id, resolved_by, resolved_at]
+      required: [rollup_id, decision, resolved_by, resolved_at]
       additionalProperties: false
       properties:
         rollup_id: {type: string}
-        decision: {type: string, enum: [forwarded]}
-        invoice_id: {type: string, description: The Kill Bill invoice that bills the rollup.}
+        decision: {type: string, enum: [forwarded, not_billed]}
+        invoice_id: {type: string, description: The committed Kill Bill invoice that bills the rollup, for a forwarded decision.}
+        unbilled_quantity_micro: {type: integer, format: int64, description: The quantity of the rollup that was lost, for a not_billed decision.}
         resolved_by: {type: string}
         resolved_at: {type: string, format: date-time}
     UsageRollup:

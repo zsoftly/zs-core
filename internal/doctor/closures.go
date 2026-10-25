@@ -104,7 +104,10 @@ GROUP BY tenant_id, closure_unresolved_reason ORDER BY tenant_id, closure_unreso
 		if err := r.Scan(&id, &reason, &n); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%d usage rollups of %s are unconfirmed (%s): staff confirm them against Kill Bill, and the tenant is not drained until they do", n, idgen.Format(idgen.Tenant, id), reason), nil
+		if reason == "usage_claim_unconfirmed" {
+			return fmt.Sprintf("%d usage rollups of %s were claimed and never sent (%s): the tenant is not drained until they are sent", n, idgen.Format(idgen.Tenant, id), reason), nil
+		}
+		return fmt.Sprintf("%d usage rollups of %s are unconfirmed (%s): staff resolve them with the resolve route or `zs-core usage resolve-rollup`, and the closure of the tenant cannot complete until they do", n, idgen.Format(idgen.Tenant, id), reason), nil
 	}); err != nil {
 		return nil, err
 	}
@@ -122,7 +125,9 @@ WHERE send_protocol = 1 AND status = 'rejected' GROUP BY tenant_id ORDER BY tena
 	}
 
 	if err := section("usage_claims_stranded", `SELECT tenant_id, count(*) FROM usage_rollups
-WHERE status = 'pending' AND claim_token IS NOT NULL AND claimed_until < $1::timestamptz - make_interval(secs => $2)
+WHERE status = 'pending' AND claim_token IS NOT NULL AND closure_unresolved_reason IS NULL
+  AND claimed_until < $1::timestamptz - make_interval(secs => $2)
+  AND NOT EXISTS (SELECT 1 FROM usage_rollup_resolutions x WHERE x.rollup_id = usage_rollups.id)
 GROUP BY tenant_id ORDER BY tenant_id`, []any{now, claimStrandedAfter.Seconds()}, func(r pgx.Rows) (string, error) {
 		var id idgen.UUID
 		var n int

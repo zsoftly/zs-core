@@ -320,12 +320,17 @@ func (s *server) resolveUsageRollup(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, _, err := s.meteringService().ResolveUnconfirmedRollup(r.Context(), sc, call, r.PathValue("rollup"))
+	res, _, err := s.meteringService().ResolveUnconfirmedRollup(r.Context(), sc, call, r.PathValue("rollup"), string(body.Decision))
 	if err != nil {
 		s.writeError(w, r, err)
 		return
 	}
-	s.writeJSON(w, r, http.StatusOK, gen.UsageRollupResolution{
-		RollupId: res.RollupID, Decision: gen.UsageRollupResolutionDecision(res.Decision), InvoiceId: res.InvoiceID, ResolvedBy: res.ResolvedBy, ResolvedAt: res.ResolvedAt,
-	})
+	out := gen.UsageRollupResolution{RollupId: res.RollupID, Decision: gen.UsageRollupResolutionDecision(res.Decision), ResolvedBy: res.ResolvedBy, ResolvedAt: res.ResolvedAt}
+	if res.InvoiceID != "" {
+		out.InvoiceId = &res.InvoiceID
+	}
+	if res.UnbilledQuantityMicro > 0 {
+		out.UnbilledQuantityMicro = &res.UnbilledQuantityMicro
+	}
+	s.writeJSON(w, r, http.StatusOK, out)
 }

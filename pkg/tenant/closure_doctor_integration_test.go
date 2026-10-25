@@ -98,6 +98,10 @@ func TestClosureFindingsReportOpenReviews(t *testing.T) {
 
 // A kind with more findings than the limit lists the limit and says how many
 // are left out, never silently.
+//
+// It sets doctor.ClosureFindingMax, which is global, so it must not run in
+// parallel with another test of the closure findings: none of them calls
+// t.Parallel, and this one must not either.
 func TestClosureFindingsSayHowManyAreLeftOut(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()

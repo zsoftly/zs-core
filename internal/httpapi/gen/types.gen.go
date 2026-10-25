@@ -803,12 +803,33 @@ func (e UsageRollupStatus) Valid() bool {
 // Defines values for UsageRollupResolutionDecision.
 const (
 	UsageRollupResolutionDecisionForwarded UsageRollupResolutionDecision = "forwarded"
+	UsageRollupResolutionDecisionNotBilled UsageRollupResolutionDecision = "not_billed"
 )
 
 // Valid indicates whether the value is a known member of the UsageRollupResolutionDecision enum.
 func (e UsageRollupResolutionDecision) Valid() bool {
 	switch e {
 	case UsageRollupResolutionDecisionForwarded:
+		return true
+	case UsageRollupResolutionDecisionNotBilled:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for UsageRollupResolveDecision.
+const (
+	UsageRollupResolveDecisionForwarded UsageRollupResolveDecision = "forwarded"
+	UsageRollupResolveDecisionNotBilled UsageRollupResolveDecision = "not_billed"
+)
+
+// Valid indicates whether the value is a known member of the UsageRollupResolveDecision enum.
+func (e UsageRollupResolveDecision) Valid() bool {
+	switch e {
+	case UsageRollupResolveDecisionForwarded:
+		return true
+	case UsageRollupResolveDecisionNotBilled:
 		return true
 	default:
 		return false
@@ -2281,11 +2302,14 @@ type UsageRollupReassign struct {
 type UsageRollupResolution struct {
 	Decision UsageRollupResolutionDecision `json:"decision"`
 
-	// InvoiceId The Kill Bill invoice that bills the rollup.
-	InvoiceId  string    `json:"invoice_id"`
+	// InvoiceId The committed Kill Bill invoice that bills the rollup
+	InvoiceId  *string   `json:"invoice_id,omitempty"`
 	ResolvedAt time.Time `json:"resolved_at"`
 	ResolvedBy string    `json:"resolved_by"`
 	RollupId   string    `json:"rollup_id"`
+
+	// UnbilledQuantityMicro The quantity of the rollup that was lost
+	UnbilledQuantityMicro *int64 `json:"unbilled_quantity_micro,omitempty"`
 }
 
 // UsageRollupResolutionDecision defines model for UsageRollupResolution.Decision.
@@ -2293,8 +2317,12 @@ type UsageRollupResolutionDecision string
 
 // UsageRollupResolve defines model for UsageRollupResolve.
 type UsageRollupResolve struct {
-	Reason string `json:"reason"`
+	Decision UsageRollupResolveDecision `json:"decision"`
+	Reason   string                     `json:"reason"`
 }
+
+// UsageRollupResolveDecision defines model for UsageRollupResolve.Decision.
+type UsageRollupResolveDecision string
 
 // UsageSettlement defines model for UsageSettlement.
 type UsageSettlement struct {

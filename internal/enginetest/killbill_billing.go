@@ -39,6 +39,14 @@ type KillBillWrite struct {
 	Method, Path, APIKey, CreatedBy, Reason, Comment string
 }
 
+// Reads returns the paths of the Kill Bill reads the fake served, oldest
+// first, so a test can count the calls a piece of code makes.
+func (f *Fake) Reads() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.reads...)
+}
+
 // Writes returns the Kill Bill writes the fake received, oldest first.
 func (f *Fake) Writes() []KillBillWrite {
 	f.mu.Lock()
@@ -82,6 +90,11 @@ func (in *kbInvoice) balance() int64 {
 
 type kbSub struct {
 	id, bundleID, accountID, externalKey, plan, product, state, phase, cancelled, start string
+	// category is "" for a base subscription and "ADD_ON" for an add-on.
+	category string
+	// scheduled is true while a cancel waits for a future day: the state is
+	// still ACTIVE and cancelled holds the day it takes effect.
+	scheduled bool
 }
 
 type kbTxn struct {
@@ -287,6 +300,16 @@ func kbError(w http.ResponseWriter, status, code int) {
 	reply(w, status, map[string]any{"code": code, "message": "fake Kill Bill refusal"})
 }
 
+// kbException answers as Kill Bill does for a Java exception: the class, a
+// code (0 for none) and a message.
+func kbException(w http.ResponseWriter, status int, className string, code int, message string) {
+	var c any
+	if code != 0 {
+		c = code
+	}
+	reply(w, status, map[string]any{"className": className, "code": c, "message": message, "causeClassName": nil, "causeMessage": nil, "stackTrace": []any{}})
+}
+
 func (f *Fake) account(apiKey, id string) *Account {
 	for _, a := range f.accounts[apiKey] {
 		if a.ID == id {
@@ -321,9 +344,16 @@ func (t *kbTenant) plan(name string) (killbill.CatalogProduct, killbill.CatalogP
 	return killbill.CatalogProduct{}, killbill.CatalogPlan{}, false
 }
 
+func (s *kbSub) productCategory() string {
+	if s.category == "" {
+		return "BASE"
+	}
+	return s.category
+}
+
 func (s *kbSub) json() killbill.Subscription {
 	return killbill.Subscription{AccountID: s.accountID, BundleID: s.bundleID, SubscriptionID: s.id, ExternalKey: s.externalKey,
-		StartDate: s.start, ProductName: s.product, ProductCategory: "BASE", BillingPeriod: "MONTHLY",
+		StartDate: s.start, ProductName: s.product, ProductCategory: s.productCategory(), BillingPeriod: "MONTHLY",
 		PhaseType: s.phase, PriceList: "DEFAULT", PlanName: s.plan, State: s.state, CancelledDate: s.cancelled}
 }
 
@@ -592,6 +622,22 @@ func (f *Fake) serveBilling(w http.ResponseWriter, r *http.Request, apiKey, path
 		}
 		s := &kbSub{id: idgen.MustNewV7().String(), bundleID: idgen.MustNewV7().String(), accountID: a.ID, externalKey: in.ExternalKey,
 			plan: plan.Name, product: prod.Name, state: "ACTIVE", phase: plan.Phases[0].Type, start: DefaultSubscriptionStart}
+		if in.BundleID != "" {
+			// A bundle ID makes the subscription an add-on of that bundle,
+			// which must be one of the account's with a base subscription
+			// that is still active.
+			var base *kbSub
+			for _, x := range t.subs {
+				if x.bundleID == in.BundleID && x.accountID == a.ID && x.category == "" {
+					base = x
+				}
+			}
+			if base == nil || base.state != "ACTIVE" {
+				kbException(w, http.StatusNotFound, "org.killbill.billing.util.callcontext.InternalCallContextFactory$ObjectDoesNotExist", 0, "Object id="+in.BundleID+" type=BUNDLE doesn't exist!")
+				return true
+			}
+			s.bundleID, s.category = in.BundleID, "ADD_ON"
+		}
 		t.subs = append(t.subs, s)
 		t.addInvoice(a.ID, a.Currency, []*kbItem{{typ: "FIXED", amount: 0, description: plan.Name + "-trial", subscriptionID: s.id, plan: plan.Name}})
 		w.Header().Set("Location", "http://fake/1.0/kb/subscriptions/"+s.id)
@@ -604,7 +650,15 @@ func (f *Fake) serveBilling(w http.ResponseWriter, r *http.Request, apiKey, path
 			}
 		}
 		if s == nil {
-			kbError(w, http.StatusNotFound, 1091)
+			if f.subscriptionOfAnotherTenant(apiKey, parts[1]) {
+				// Kill Bill 0.24.22 answers a subscription of another Kill
+				// Bill tenant with a server error, not a 404.
+				kbException(w, http.StatusInternalServerError, "java.lang.IllegalStateException", 0,
+					"Object id="+parts[1]+" type=SUBSCRIPTION doesn't belong to tenant id="+f.tenantIDs[apiKey])
+				return true
+			}
+			kbException(w, http.StatusNotFound, "org.killbill.billing.util.callcontext.InternalCallContextFactory$ObjectDoesNotExist", 0,
+				"Object id="+parts[1]+" type=SUBSCRIPTION doesn't exist!")
 			return true
 		}
 		switch r.Method {
@@ -623,11 +677,7 @@ func (f *Fake) serveBilling(w http.ResponseWriter, r *http.Request, apiKey, path
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodDelete:
-			if q.Get("entitlementPolicy") == killbill.PolicyImmediate {
-				s.state = "CANCELLED"
-			}
-			s.cancelled = "2026-11-03"
-			w.WriteHeader(http.StatusNoContent)
+			f.cancelSubscription(w, t, s, q)
 		}
 	case len(parts) == 2 && parts[0] == "invoices" && r.Method == http.MethodGet:
 		for _, in := range t.invoices {
@@ -1113,4 +1163,109 @@ func (f *Fake) InvoiceUsage(apiKey, accountID string, from, to time.Time) string
 	in := t.addInvoice(accountID, "CAD", items)
 	in.trackingIDs = tracking
 	return in.id
+}
+
+// CancelDay is the day the fake takes to be today for a cancel. A cancel with
+// an immediate policy is dated this day, and so is a cancel with
+// END_OF_TERM, whose term the fake does not model.
+const CancelDay = "2026-11-03"
+
+func (f *Fake) subscriptionOfAnotherTenant(apiKey, id string) bool {
+	for key, t := range f.billing {
+		if key == apiKey {
+			continue
+		}
+		for _, s := range t.subs {
+			if s.id == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cancelSubscription models DELETE /1.0/kb/subscriptions/{id} of Kill Bill
+// 0.24.22 as the real stack answered it:
+//   - a subscription that is CANCELLED is refused with HTTP 500 and error
+//     code 1031;
+//   - an entitlementPolicy or billingPolicy cancels by policy: IMMEDIATE ends
+//     the subscription at once and END_OF_TERM schedules the cancel, which can
+//     be repeated and can still be made immediate;
+//   - without a policy, a requestedDate before today is refused with 400 and
+//     code 1001, today ends the subscription and a later day schedules the
+//     cancel; on a scheduled cancel the same day is accepted again, an earlier
+//     day moves it earlier and a later day is refused like a cancelled
+//     subscription, with code 1031 and the state PENDING CANCELLED;
+//   - without either, the cancel is immediate;
+//   - cancelling a base subscription cancels its add-ons with it.
+func (f *Fake) cancelSubscription(w http.ResponseWriter, t *kbTenant, s *kbSub, q url.Values) {
+	if s.state == "CANCELLED" {
+		kbException(w, http.StatusInternalServerError, "org.killbill.billing.entitlement.api.EntitlementApiException", 1031,
+			"Subscription "+s.id+" is in state CANCELLED: Failed to cancel")
+		return
+	}
+	policy := q.Get("entitlementPolicy")
+	if policy == "" {
+		policy = q.Get("billingPolicy")
+	}
+	date := q.Get("requestedDate")
+	switch {
+	case policy != "":
+		if policy != killbill.PolicyImmediate && policy != killbill.PolicyEndOfTerm {
+			http.Error(w, "404 page not found", http.StatusNotFound)
+			return
+		}
+		if policy == killbill.PolicyImmediate {
+			f.endSubscription(t, s, CancelDay)
+		} else {
+			f.scheduleCancel(t, s, CancelDay)
+		}
+	case date != "":
+		switch {
+		case date < CancelDay:
+			kbException(w, http.StatusBadRequest, "org.killbill.billing.entitlement.api.EntitlementApiException", 1001,
+				"Requested date "+date+" is not allowed to be prior to the previous transition")
+			return
+		case s.scheduled && date > s.cancelled:
+			kbException(w, http.StatusInternalServerError, "org.killbill.billing.entitlement.api.EntitlementApiException", 1031,
+				"Subscription "+s.id+" is in state PENDING CANCELLED: Failed to cancel")
+			return
+		case s.scheduled && date == s.cancelled:
+			// Already scheduled for that day: nothing changes.
+		case date == CancelDay:
+			f.endSubscription(t, s, date)
+		default:
+			f.scheduleCancel(t, s, date)
+		}
+	default:
+		f.endSubscription(t, s, CancelDay)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// endSubscription cancels s and, for a base subscription, its add-ons.
+func (f *Fake) endSubscription(t *kbTenant, s *kbSub, day string) {
+	for _, x := range f.cancelGroup(t, s) {
+		x.state, x.cancelled, x.scheduled = "CANCELLED", day, false
+	}
+}
+
+// scheduleCancel schedules the cancel of s and of its add-ons for day.
+func (f *Fake) scheduleCancel(t *kbTenant, s *kbSub, day string) {
+	for _, x := range f.cancelGroup(t, s) {
+		x.cancelled, x.scheduled = day, true
+	}
+}
+
+func (f *Fake) cancelGroup(t *kbTenant, s *kbSub) []*kbSub {
+	group := []*kbSub{s}
+	if s.category != "" {
+		return group
+	}
+	for _, x := range t.subs {
+		if x != s && x.bundleID == s.bundleID && x.category == "ADD_ON" && x.state != "CANCELLED" {
+			group = append(group, x)
+		}
+	}
+	return group
 }

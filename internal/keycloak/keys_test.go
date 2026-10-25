@@ -269,6 +269,10 @@ func (b oneBrand) BrandByRealm(_ context.Context, realm string) (identity.BrandC
 	return b.cfg, nil
 }
 
+// hungFetch is how long a key fetch from a Keycloak that never answers may
+// take before it gives up.
+const hungFetch = 5 * time.Second
+
 // A Keycloak that accepts connections and never answers does not hold up
 // verification with cached keys, and a request that needs a refresh returns
 // when its own context ends.
@@ -276,7 +280,7 @@ func TestHungKeycloakDoesNotBlockCachedVerification(t *testing.T) {
 	kc := newFakeKeycloak(t)
 	start := time.Now()
 	clk := &clock{now: start}
-	ks := NewKeySet(kc.URL, KeySetOptions{Now: clk.Now, FetchTimeout: 5 * time.Second})
+	ks := NewKeySet(kc.URL, KeySetOptions{Now: clk.Now, FetchTimeout: hungFetch})
 	v := &identity.Verifier{
 		Brands: oneBrand{identity.BrandConfig{ID: idgen.MustNewV7(), Slug: testRealm, Realm: testRealm, CustomerClientID: "zs-customer", StaffClientID: "zs-staff"}},
 		Keys:   ks, Now: clk.Now,
@@ -295,21 +299,36 @@ func TestHungKeycloakDoesNotBlockCachedVerification(t *testing.T) {
 
 	kc.hang.Store(true)
 	clk.Add(DefaultKeyTTL + time.Second) // stale: a refresh is due and hangs
+	// The property is that no verification waits for the hung fetch, which
+	// would take hungFetch. The bound is a fraction of that, so a loaded
+	// machine cannot trip it and a verification that waited would still fail it.
+	const bound = hungFetch / 5
 	var wg sync.WaitGroup
 	errs := make(chan error, 20)
+	took := make(chan time.Duration, 20)
 	began := time.Now()
 	for range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			one := time.Now()
 			_, err := v.Verify(ctx, tok())
+			took <- time.Since(one)
 			errs <- err
 		}()
 	}
 	wg.Wait()
 	close(errs)
-	if elapsed := time.Since(began); elapsed > 100*time.Millisecond {
-		t.Fatalf("20 verifications with cached keys took %v behind a hung Keycloak", elapsed)
+	close(took)
+	var slowest time.Duration
+	for d := range took {
+		slowest = max(slowest, d)
+	}
+	if slowest > bound {
+		t.Fatalf("a verification with cached keys took %v behind a hung Keycloak; the hung fetch takes %v", slowest, hungFetch)
+	}
+	if elapsed := time.Since(began); elapsed > bound {
+		t.Fatalf("20 verifications with cached keys took %v behind a hung Keycloak; the hung fetch takes %v", elapsed, hungFetch)
 	}
 	for err := range errs {
 		if err != nil {

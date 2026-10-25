@@ -99,3 +99,23 @@ func TestCursor(t *testing.T) {
 		}
 	}
 }
+
+// The fingerprint is stored evidence that later rules compare, so its bytes
+// are fixed: this vector must never change without a new domain tag.
+func TestEventSetFingerprintKnownVector(t *testing.T) {
+	brandID, _ := idgen.ParseUUID("018f0000-0000-7000-8000-000000000001")
+	tenantID, _ := idgen.ParseUUID("018f0000-0000-7000-8000-000000000002")
+	a, _ := idgen.ParseUUID("018f0000-0000-7000-8000-0000000000a1")
+	b, _ := idgen.ParseUUID("018f0000-0000-7000-8000-0000000000b2")
+	sc := scope.Scope{Brand: brandID, Tenant: tenantID}
+	day := time.Date(2026, 10, 24, 15, 4, 5, 0, time.UTC)
+	const want = "60d45b6fc8795245e6b9554b8e00b118f2629313fd176b545e128cdaeb7c861f"
+	for name, ids := range map[string][]idgen.UUID{"sorted": {a, b}, "reversed": {b, a}} {
+		if got := EventSetFingerprint(sc, "api-call", "", day, ids); got != want {
+			t.Fatalf("%s fingerprint = %s, want %s", name, got, want)
+		}
+	}
+	if EventSetFingerprint(sc, "api-call", "", day, []idgen.UUID{a}) == want {
+		t.Fatal("another event set, same fingerprint")
+	}
+}

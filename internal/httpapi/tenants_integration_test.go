@@ -50,6 +50,7 @@ func newTenantAPI(t *testing.T) *tenantAPI {
 type reply struct {
 	status int
 	body   map[string]any
+	header http.Header
 }
 
 func (r reply) code() string {
@@ -84,7 +85,7 @@ func (a *tenantAPI) call(method, path, credential string, body any) reply {
 		a.t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	out := reply{status: resp.StatusCode, body: map[string]any{}}
+	out := reply{status: resp.StatusCode, body: map[string]any{}, header: resp.Header}
 	_ = json.NewDecoder(resp.Body).Decode(&out.body)
 	if resp.Header.Get("Cache-Control") != "no-store" {
 		a.t.Fatalf("%s %s: Cache-Control %q", method, path, resp.Header.Get("Cache-Control"))
@@ -508,4 +509,134 @@ func grantStaff(t *testing.T, db *postgrestest.DB, b enginetest.Brand, p enginet
 func jsonOf(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// A tenant whose closure has started answers nothing: its members and its API
+// keys are refused on reads and on writes alike.
+func TestClosingTenantRefusesMembersAndAPIKeys(t *testing.T) {
+	a := newTenantAPI(t)
+	postgrestest.EnableSettlementStartRule(t, a.db)
+	b := a.fake.InsertBrand(t, a.db.Pool, "zs-api")
+	owner := a.person(b, "owner@example.test")
+	id := a.createTenant(owner, "Closing")
+	base := "/v1/tenants/" + id
+	key := a.call(http.MethodPost, base+"/api-keys", a.token(owner, mfa()), map[string]any{"name": "ci", "permissions": []string{"team:manage", "member:read"}})
+	secret := key.str("secret")
+	tid, _ := idgen.ParseAs(idgen.Tenant, id)
+	if r := a.call(http.MethodGet, base+"/members", secret, nil); r.status != http.StatusOK {
+		t.Fatalf("key before the closure = %d %v", r.status, r.body)
+	}
+	if _, err := tenant.StartClosure(context.Background(), a.db.Pool, scope.Scope{Brand: b.ID, Tenant: tid},
+		events.Actor{Type: events.ActorService, ID: "test"}, tenant.ClosureRequest{Reason: "customer left", RequestID: "closing-request-0001"}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	tok := a.token(owner, mfa())
+	for name, r := range map[string]reply{
+		"member read":  a.call(http.MethodGet, base, tok, nil),
+		"member write": a.call(http.MethodPatch, base, tok, map[string]any{"name": "x"}),
+		"key read":     a.call(http.MethodGet, base+"/members", secret, nil),
+		"key write":    a.call(http.MethodPost, base+"/teams", secret, map[string]any{"name": "Ops"}),
+	} {
+		if r.status != http.StatusNotFound || r.code() != "tenant_not_found" {
+			t.Errorf("%s of a closing tenant = %d %v, want tenant_not_found", name, r.status, r.body)
+		}
+	}
+}
+
+func TestStaffClosureRoute(t *testing.T) {
+	a := newTenantAPI(t)
+	postgrestest.EnableSettlementStartRule(t, a.db)
+	brandA := a.fake.InsertBrand(t, a.db.Pool, "zs-alpha")
+	brandB := a.fake.InsertBrand(t, a.db.Pool, "zs-beta")
+	owner := a.person(brandA, "owner@example.test")
+	tenantA := a.createTenant(owner, "Alpha")
+	path := "/v1/staff/tenants/" + tenantA + "/closure"
+	staff := a.person(brandA, "staff@example.test")
+	staffTok := a.token(staff, enginetest.TokenOptions{Staff: true})
+	body := map[string]any{"reason": "customer asked to leave", "request_id": "closure-request-0001"}
+
+	if r := a.call(http.MethodPost, path, staffTok, body); r.status != http.StatusNotFound {
+		t.Fatalf("staff without a grant = %d %v", r.status, r.body)
+	}
+	grantStaff(t, a.db, brandA, staff, identity.StaffActivation)
+	if r := a.call(http.MethodPost, path, staffTok, body); r.status != http.StatusNotFound {
+		t.Fatalf("staff with another grant = %d %v", r.status, r.body)
+	}
+	grantStaff(t, a.db, brandA, staff, identity.StaffOperator)
+	if r := a.call(http.MethodPost, path, staffTok, body); r.status != http.StatusNotFound {
+		t.Fatalf("staff with the operator grant = %d %v, want 404: operator does not imply closure", r.status, r.body)
+	}
+	grantStaff(t, a.db, brandA, staff, identity.StaffClosure)
+	// While another owner holds the lifecycle capability of the tenant, the
+	// start is a retryable 409 tenant_busy with a Retry-After.
+	tidA, _ := idgen.ParseAs(idgen.Tenant, tenantA)
+	held, got, err := tenant.AcquireLifecycleGuard(context.Background(), a.db.Pool, scope.Scope{Brand: brandA.ID, Tenant: tidA})
+	if err != nil || !got {
+		t.Fatalf("acquire = %v %v", got, err)
+	}
+	busy := a.call(http.MethodPost, path, staffTok, body)
+	if busy.status != http.StatusConflict || busy.code() != "tenant_busy" || busy.header.Get("Retry-After") == "" ||
+		busy.body["error"].(map[string]any)["retryable"] != true {
+		t.Fatalf("busy = %d %v retry-after %q", busy.status, busy.body, busy.header.Get("Retry-After"))
+	}
+	if err := held.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if r := a.call(http.MethodPost, path, a.token(owner, mfa()), body); r.status != http.StatusNotFound {
+		t.Fatalf("customer on the staff route = %d %v", r.status, r.body)
+	}
+	first := a.call(http.MethodPost, path, staffTok, body)
+	if first.status != http.StatusCreated || first.str("state") != "cancelling" || first.str("reason") != "customer asked to leave" ||
+		first.str("request_id") != "closure-request-0001" || first.str("cutoff_at") == "" {
+		t.Fatalf("start = %d %v", first.status, first.body)
+	}
+	replay := a.call(http.MethodPost, path, staffTok, body)
+	if replay.status != http.StatusOK || replay.str("cutoff_at") != first.str("cutoff_at") || replay.str("request_id") != "closure-request-0001" {
+		t.Fatalf("replay = %d %v", replay.status, replay.body)
+	}
+	other := map[string]any{"reason": "a different reason", "request_id": "closure-request-0001"}
+	if r := a.call(http.MethodPost, path, staffTok, other); r.status != http.StatusConflict || r.code() != "idempotency_key_conflict" {
+		t.Fatalf("same request ID, other reason = %d %v", r.status, r.body)
+	}
+	second := a.call(http.MethodPost, path, staffTok, map[string]any{"reason": "second caller", "request_id": "closure-request-0002"})
+	if second.status != http.StatusOK || second.str("request_id") != "closure-request-0001" || second.str("reason") != "customer asked to leave" {
+		t.Fatalf("another request ID = %d %v", second.status, second.body)
+	}
+	for name, bad := range map[string]map[string]any{
+		"no reason":        {"request_id": "closure-request-0003"},
+		"blank reason":     {"reason": "  ", "request_id": "closure-request-0003"},
+		"short request ID": {"reason": "r", "request_id": "short"},
+		"no request ID":    {"reason": "r"},
+	} {
+		if r := a.call(http.MethodPost, path, staffTok, bad); r.status != http.StatusBadRequest {
+			t.Errorf("%s = %d %v, want 400", name, r.status, r.body)
+		}
+	}
+	if r := a.call(http.MethodGet, "/v1/tenants/"+tenantA, a.token(owner, mfa()), nil); r.status != http.StatusNotFound || r.code() != "tenant_not_found" {
+		t.Fatalf("owner read of a closing tenant = %d %v", r.status, r.body)
+	}
+	var actorType, actorID, reason string
+	tid, _ := idgen.ParseAs(idgen.Tenant, tenantA)
+	if err := a.db.Pool.QueryRow(context.Background(), `SELECT actor_type, actor_id, reason FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.closure_started'`, tid).Scan(&actorType, &actorID, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if actorType != "staff" || actorID == "" || reason != "customer asked to leave" {
+		t.Fatalf("audit = %q %q %q", actorType, actorID, reason)
+	}
+
+	// A staff member of another brand, with the grant, does not reach this tenant.
+	staffB := a.person(brandB, "staff-b@example.test")
+	grantStaff(t, a.db, brandB, staffB, identity.StaffClosure)
+	if r := a.call(http.MethodPost, path, a.token(staffB, enginetest.TokenOptions{Staff: true}), body); r.status != http.StatusNotFound {
+		t.Fatalf("staff of another brand = %d %v", r.status, r.body)
+	}
+	// A closed tenant cannot start a closure.
+	closed := a.createTenant(owner, "Closed")
+	cid, _ := idgen.ParseAs(idgen.Tenant, closed)
+	if _, err := a.db.Pool.Exec(context.Background(), `UPDATE tenants SET status = 'closed' WHERE id = $1`, cid); err != nil {
+		t.Fatal(err)
+	}
+	if r := a.call(http.MethodPost, "/v1/staff/tenants/"+closed+"/closure", staffTok, body); r.status != http.StatusConflict || r.code() != "tenant_closed" {
+		t.Fatalf("closed tenant = %d %v", r.status, r.body)
+	}
 }

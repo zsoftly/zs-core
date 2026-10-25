@@ -59,13 +59,30 @@ Each recording call that records something writes one `metering.usage.recorded` 
 
 `serve` forwards every `ZS_METERING_FORWARD_INTERVAL`, and a relay that claims only `metering.usage.recorded` forwards a tenant as soon as it records. `zs-core usage forward` runs one pass. A pass does three things:
 
-1. It puts every event that is in no rollup into one, per tenant, Kill Bill unit, requested subscription and day. The rollup's tracking ID is `zs-usg-` and a digest of the brand, the tenant, the unit, the requested subscription, the day and the IDs of its events. Its record date is the latest `occurred_at` of its events, and its period starts at the earliest.
+1. It puts every event that is in no rollup into one, per tenant, Kill Bill unit, requested subscription and day. Only events accepted under dispatch protocol 1 are rolled up, and each rollup stores a fingerprint of the event set it holds. The rollup's tracking ID is `zs-usg-` and a digest of the brand, the tenant, the unit, the requested subscription, the day and the IDs of its events. Its record date is the latest `occurred_at` of its events, and its period starts at the earliest.
 2. It sends each due rollup with `POST /1.0/kb/usages`. A rollup without a requested subscription goes to the tenant's first active subscription whose plan prices the unit and that started by the start of the rollup's period. That choice is stored before the first send and never changes, so a retry of the tracking ID never reaches another subscription. A requested subscription must belong to the tenant, be active and price the unit. Kill Bill checks none of this. Core checks it and never sends usage to another account.
 3. It emits `metering.forward_backlog`, at most once a day per tenant, for a tenant with an event received more than 24 hours ago that Kill Bill does not hold yet. The events of a discarded rollup do not count.
 
-A forwarder claims due rollups ten at a time, under a claim token, for two minutes. Before each send it renews its claim. Every change it then makes to the rollup, forwarded, rejected or retried, carries the token. A rollup whose claim ran out and that another forwarder took is skipped, never sent. So two forwarders never send one rollup at once, however slow Kill Bill answers.
+A forwarder claims one due rollup at a time, under a claim token, for two minutes, and sends it before it claims the next. Only an unsent rollup can be claimed, and only once. The claim is the durable record that a send may follow, so an expired claim is never taken over. A forwarder that stops gives back the rollups it claimed and never started. A crash strands at most the one rollup it held. Every change the forwarder makes to a rollup carries the token, so two forwarders never send one rollup at once, however slow Kill Bill answers.
 
-A rollup Kill Bill did not take waits 10 seconds, then twice as long each time, up to a day. Its last error code is kept. A retry after a lost answer meets Kill Bill's refusal of a known tracking ID, which Core counts as forwarded. Each forwarded rollup is audited as `metering.usage.forwarded` with the subscription, the tracking ID, the unit and the quantity, and moves the tenant's wallet version on, since Kill Bill's unbilled amount grew.
+Before it sends, the forwarder stores the Kill Bill endpoint, tenant and account the usage will land in, once. A rollup already bound to another target waits with `usage_target_unconfirmed` and an audit event, `metering.usage.target_mismatch`, and is never rebound. The forwarder then stores the request body and the start time, and only then posts exactly those bytes.
+
+A failure before the send starts proves Kill Bill saw nothing, so the rollup goes back to unsent. It waits 10 seconds, then twice as long each time, up to a day. Its last error is one of four fixed codes:
+
+| Code | Meaning |
+| --- | --- |
+| `usage_preflight_unavailable` | Kill Bill is down or unreachable, or the tenant account could not be loaded |
+| `usage_subscription_unconfirmed` | Kill Bill did not confirm the subscription |
+| `usage_target_unconfirmed` | The Kill Bill target could not be read or does not match the stored one |
+| `usage_payload_not_ready` | The request body could not be built |
+
+After the send starts, only two answers are final. A `2xx`, or Kill Bill's refusal of a tracking ID it already holds (`400`, error code 50000), marks the rollup and its events forwarded. Core tries that database write three times. Anything else is an unknown outcome: a timeout, a connection closed after the write, a `5xx`, a `408` or `429`, any other `4xx`, or a refused connection. An unknown outcome is never retried. The rollup stays pending with its stored body and a fixed reason, `usage_send_unconfirmed`, or `usage_transport_unconfirmed` when the answer proves Kill Bill recorded nothing but the start was already stored. It is audited as `metering.usage.send_unconfirmed`, counted in the `Unconfirmed` figure of the forward report and in the `unconfirmed` field of the pass log, and staff resolve it against Kill Bill by hand. This is why Kill Bill recording a rollup twice cannot happen on a retry: there is no retry.
+
+Every pass starts with a sweep that never sends. A claim that ran out before any send started becomes `usage_claim_unconfirmed`, and a started send that nobody finished within ten minutes becomes `usage_send_unconfirmed`. Each is audited as `metering.usage.send_unconfirmed` and counted.
+
+Usage accepted before dispatch protocol 1 is read-only under the database guard. The forwarder never rolls it up, claims a legacy rollup or changes it. `LegacyUnrolled` counts a tenant's legacy events that are in no rollup, so unbilled legacy usage is never silent. A closing tenant that holds such usage cannot complete closure until staff resolve a review item for it. See [tenants.md](tenants.md#suspension-and-closure).
+
+Each forwarded rollup is audited as `metering.usage.forwarded` with the subscription, the tracking ID, the unit and the quantity, and moves the tenant's wallet version on, since Kill Bill's unbilled amount grew.
 
 Kill Bill 0.24.22 records usage dated before its subscription started, and usage on a cancelled subscription, and bills neither. So the forwarder rejects such a rollup instead of sending it:
 
@@ -126,3 +143,16 @@ All three need `usage:read`. `RebuildSummaries` recomputes a tenant's summaries 
 - A meter's change of Kill Bill unit applies to events recorded after it. Events already recorded keep the unit of their time.
 - A rollup whose period starts before its subscription started is rejected as a whole, also when some of its events came after the start. Staff reassign it, or discard it.
 - A rollup that keeps failing is retried once a day without end. Its last error and the backlog event say why.
+
+## Closing tenants
+
+Once a tenant's closure has started, `RecordUsage` and `RecordUsageBatch` refuse its usage with `tenant_not_found`, as they do for a closed tenant: the closure invoices what was accepted before it. The settlement of a reservation held before the closure is still taken. `Service.Drained` is what a closure asks before it cancels the subscriptions: it forwards the tenant's usage and answers true only when no protocol 1 event is unrolled, no protocol 1 rollup is pending or rejected, and no reservation is held. See [tenants.md](tenants.md).
+
+## Resolving an unconfirmed rollup
+
+A rollup whose send started and whose outcome Kill Bill never confirmed is frozen: it is never sent again and its record never changes. It does not hold the drain of a closing tenant, but the closure cannot complete while it is unresolved. Staff resolve it with `POST /v1/staff/tenants/{id}/usage/rollups/{rollup}/resolve`, which needs the `support` grant, or `zs-core usage resolve-rollup --brand --tenant --rollup --reason --operator [--decision forwarded|not_billed]`. The evidence is Kill Bill's, which Core reads, and without it the answer is `409`.
+
+- `forwarded`: the tracking ID of the rollup is on a committed invoice of the tenant's account. An invoice that is not committed is no evidence. This shows that Kill Bill billed the record, not its quantity.
+- `not_billed`: Kill Bill has not billed the record and will not. Kill Bill makes the invoice of a cancel a little after the cancel, so the settlement must be past its finance step, and the cancel's own invoice must be there: a committed invoice dated on or after the day of the cancellation with a repair or usage item of the subscription of the rollup, or a finance step that found nothing to invoice. No committed invoice may carry the tracking ID. The quantity of the frozen rollup is recorded as lost, and the audit entry carries it. A record that Kill Bill holds, from the same day or under a billing block, can be held and yet never billed, which is why this says billed and not held.
+
+The decision is kept in `usage_rollup_resolutions` beside the rollup, with the invoice or the quantity, who and why, and cannot be changed or removed. It is audited as `metering.rollup_resolved`, it is idempotent, and it sends nothing. A resolved rollup is no longer reported by `zs-core doctor`. Only a send that started can be resolved this way: a claim that never started sent nothing, holds the drain, and is sent by the forwarder. Sending a rollup once more is not offered, because it would need a change to the guard on the rollup table.

@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/zsoftly/zs-core/internal/killbill"
 	"github.com/zsoftly/zs-core/pkg/audit"
@@ -87,26 +89,132 @@ func (s *Service) findItem(ctx context.Context, a account, itemType, description
 // writeCredit writes the Kill Bill credit of a pending credit row, unless a
 // previous attempt already did. resumed is true when the row was pending
 // from an earlier request.
-func (s *Service) writeCredit(ctx context.Context, a account, call Call, id idgen.UUID, amountMinor int64, currency string, resumed bool) (killbill.InvoiceItem, error) {
-	desc := creditDescription(id)
+func (s *Service) writeCredit(ctx context.Context, a account, call Call, row creditRow, resumed bool) (killbill.InvoiceItem, error) {
+	desc := creditDescription(row.id)
 	if resumed {
-		item, found, err := s.findItem(ctx, a, "CREDIT_ADJ", desc)
-		if err != nil {
-			return killbill.InvoiceItem{}, err
-		}
-		if found {
-			return item, nil
-		}
+		return s.matchOriginalCredit(ctx, a, row)
 	}
-	amount, err := FromMinor(amountMinor, currency)
+	amount, err := FromMinor(row.amountMinor, row.currency)
 	if err != nil {
 		return killbill.InvoiceItem{}, validation("The currency is not supported.")
 	}
-	item, err := s.KillBill.CreateCredit(ctx, a.creds, call.kb(), killbillItem(a.id(), amount, currency, desc))
+	item, err := s.KillBill.CreateCredit(ctx, a.creds, call.kb(), killbillItem(a.id(), amount, row.currency, desc))
 	if err != nil {
 		return killbill.InvoiceItem{}, err
 	}
 	return item, nil
+}
+
+func recoveryPending() error {
+	return zserrors.New(zserrors.CodeBillingUnavailable, "Credit recovery requires manual review.")
+}
+
+// reviewNeeded is the one way a recovery that cannot prove its receipt ends:
+// the credit stays pending, nothing is posted, the answer is the same manual
+// review for every cause, and one log line names the credit and a fixed reason
+// code, never an amount or an address.
+func (s *Service) reviewNeeded(row creditRow, reason string) error {
+	s.log().Warn("credit recovery needs review", "credit_id", idgen.Format(idgen.Credit, row.id), "source", row.table, "reason", reason)
+	return recoveryPending()
+}
+
+func (s *Service) matchOriginalCredit(ctx context.Context, a account, row creditRow) (killbill.InvoiceItem, error) {
+	if row.originalEndpoint == nil || row.originalKBTenant == nil || row.originalKBAccount == nil || row.originalCurrency == nil || row.originalAmount == nil || row.originalDescription == nil {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "target_missing")
+	}
+	if *row.originalKBTenant != a.brand.KillBillTenantID || *row.originalKBAccount != a.id() || *row.originalCurrency != row.currency || *row.originalAmount != row.amountMinor || *row.originalDescription != creditDescription(row.id) {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "target_mismatch")
+	}
+	wantEndpoint := "grant"
+	if row.table == "credit_code_redemptions" {
+		wantEndpoint = "redeem"
+	}
+	if *row.originalEndpoint != wantEndpoint {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "target_mismatch")
+	}
+	wantAmount, err := FromMinor(-row.amountMinor, row.currency)
+	if err != nil {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "target_mismatch")
+	}
+	items, err := s.KillBill.AccountInvoices(ctx, a.creds, a.id(), true)
+	if err != nil {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "history_unavailable")
+	}
+	var candidate killbill.InvoiceItem
+	var invoice killbill.Invoice
+	count := 0
+	for _, in := range items {
+		if in.AccountID != a.id() {
+			return killbill.InvoiceItem{}, s.reviewNeeded(row, "history_foreign_account")
+		}
+		for _, item := range in.Items {
+			if item.ItemType == "CREDIT_ADJ" && item.Description == *row.originalDescription {
+				candidate, invoice = item, in
+				count++
+			}
+		}
+	}
+	switch {
+	case count == 0:
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_absent")
+	case count > 1:
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_ambiguous")
+	case invoice.Status != "COMMITTED":
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_not_committed")
+	case invoice.Currency != row.currency || candidate.InvoiceID == "" || candidate.InvoiceID != invoice.InvoiceID || candidate.InvoiceItemID == "" ||
+		candidate.AccountID != a.id() || candidate.Currency != row.currency || !sameDecimal(candidate.Amount, wantAmount):
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_mismatch")
+	}
+	if _, err := idgen.ParseUUID(invoice.InvoiceID); err != nil {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_mismatch")
+	}
+	if _, err := idgen.ParseUUID(candidate.InvoiceItemID); err != nil {
+		return killbill.InvoiceItem{}, s.reviewNeeded(row, "receipt_mismatch")
+	}
+	return candidate, nil
+}
+
+// creditCompletionError maps the refusal of the database to put a receipt on a
+// second credit to the manual review the recovery ends in, and anything else
+// to a database failure.
+func creditCompletionError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23514" {
+		return recoveryPending()
+	}
+	return unavailable(err)
+}
+
+func sameDecimal(got, want json.Number) bool {
+	g, ok := creditDecimal(got)
+	if !ok {
+		return false
+	}
+	w, ok := creditDecimal(want)
+	return ok && g.Cmp(w) == 0
+}
+
+var creditDecimalPattern = regexp.MustCompile(`^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$`)
+
+func creditDecimal(v json.Number) (*big.Rat, bool) {
+	if len(v) == 0 || len(v) > 256 || !creditDecimalPattern.MatchString(string(v)) {
+		return nil, false
+	}
+	if i := strings.IndexAny(string(v), "eE"); i >= 0 {
+		exponent := string(v)[i+1:]
+		if exponent[0] == '+' || exponent[0] == '-' {
+			exponent = exponent[1:]
+		}
+		value := 0
+		for _, digit := range exponent {
+			value = value*10 + int(digit-'0')
+			if value > 512 {
+				return nil, false
+			}
+		}
+	}
+	r, ok := new(big.Rat).SetString(string(v))
+	return r, ok
 }
 
 func killbillItem(accountID string, amount json.Number, currency, description string) killbill.InvoiceItem {
@@ -307,19 +415,25 @@ func containsString(list []string, v string) bool {
 
 // creditRow is a pending or completed credit of either table.
 type creditRow struct {
-	table         string
-	id            idgen.UUID
-	codeID        idgen.UUID
-	status        string
-	claimedUntil  *time.Time
-	amountMinor   int64
-	currency      string
-	kbCreditID    *string
-	expiresAt     *time.Time
-	expiredAt     *time.Time
-	reversedMinor int64
-	createdAt     time.Time
-	fingerprint   string
+	table               string
+	id                  idgen.UUID
+	codeID              idgen.UUID
+	status              string
+	claimedUntil        *time.Time
+	amountMinor         int64
+	currency            string
+	kbCreditID          *string
+	expiresAt           *time.Time
+	expiredAt           *time.Time
+	reversedMinor       int64
+	createdAt           time.Time
+	fingerprint         string
+	originalEndpoint    *string
+	originalKBTenant    *string
+	originalKBAccount   *string
+	originalCurrency    *string
+	originalAmount      *int64
+	originalDescription *string
 }
 
 func (r creditRow) credit() Credit {
@@ -335,12 +449,14 @@ func (r creditRow) credit() Credit {
 }
 
 const redemptionColumns = `id, credit_code_id, status, claimed_until, amount_minor, currency, killbill_credit_id::text, expires_at,
-       expired_at, reversed_minor, created_at`
+       expired_at, reversed_minor, created_at, original_endpoint_kind, original_killbill_tenant_id::text, original_killbill_account_id::text,
+       original_currency, original_amount_minor, original_description`
 
 func scanRedemption(row pgx.Row) (creditRow, error) {
 	r := creditRow{table: "credit_code_redemptions"}
 	err := row.Scan(&r.id, &r.codeID, &r.status, &r.claimedUntil, &r.amountMinor, &r.currency, &r.kbCreditID, &r.expiresAt,
-		&r.expiredAt, &r.reversedMinor, &r.createdAt)
+		&r.expiredAt, &r.reversedMinor, &r.createdAt, &r.originalEndpoint, &r.originalKBTenant, &r.originalKBAccount,
+		&r.originalCurrency, &r.originalAmount, &r.originalDescription)
 	return r, err
 }
 
@@ -442,9 +558,10 @@ WHERE brand_id = $1 AND tenant_id = $2 AND credit_code_id = $3 ORDER BY created_
 		row = creditRow{table: "credit_code_redemptions", id: idgen.MustNewV7(), codeID: codeID, status: "pending",
 			amountMinor: amount, currency: currency, expiresAt: expires, createdAt: now}
 		if _, err := tx.Exec(ctx, `INSERT INTO credit_code_redemptions (id, brand_id, tenant_id, credit_code_id, claimed_until,
-    amount_minor, currency, expires_at, actor_type, actor_id, correlation_id, created_at)
-VALUES ($3, $1, $2, $4, $5, $6, $7, $8, $9, $10, $11, $12)`, append(args, row.id, codeID, now.Add(CreditLease), amount, currency, expires,
-			string(call.Actor.Type), nullable(call.Actor.ID), call.CorrelationID, now)...); err != nil {
+    amount_minor, currency, expires_at, actor_type, actor_id, correlation_id, created_at,
+    original_endpoint_kind, original_killbill_tenant_id, original_killbill_account_id, original_currency, original_amount_minor, original_description)
+VALUES ($3, $1, $2, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'redeem', $13::uuid, $14::uuid, $15, $16, $17)`, append(args, row.id, codeID, now.Add(CreditLease), amount, currency, expires,
+			string(call.Actor.Type), nullable(call.Actor.ID), call.CorrelationID, now, a.brand.KillBillTenantID, a.id(), currency, amount, creditDescription(row.id))...); err != nil {
 			return unavailable(err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE credit_codes SET redemptions = redemptions + 1, updated_at = now() WHERE id = $1`, codeID); err != nil {
@@ -458,19 +575,40 @@ VALUES ($3, $1, $2, $4, $5, $6, $7, $8, $9, $10, $11, $12)`, append(args, row.id
 	if done {
 		return row.credit(), false, nil
 	}
+	if resume && row.originalEndpoint == nil {
+		err := zserrors.New(zserrors.CodeBillingUnavailable, "Credit recovery requires manual review.")
+		s.releaseCredit(ctx, sc, row, err)
+		return Credit{}, false, err
+	}
 	kbCall := call
 	kbCall.Reason = norm
-	item, err := s.writeCredit(ctx, a, kbCall, row.id, row.amountMinor, row.currency, resume)
+	item, err := s.writeCredit(ctx, a, kbCall, row, resume)
 	if err != nil {
-		s.releaseCredit(ctx, sc, row, err)
+		cleanupCause := err
+		if resume {
+			cleanupCause = recoveryPending()
+		}
+		s.releaseCredit(ctx, sc, row, cleanupCause)
 		return Credit{}, false, kbError(err)
 	}
 	err = inTx(ctx, s.DB, func(tx pgx.Tx) error {
 		completed, err := scanRedemption(tx.QueryRow(ctx, `UPDATE credit_code_redemptions SET status = 'completed', claimed_until = NULL,
     killbill_credit_id = $4::uuid, killbill_invoice_id = $5::uuid, completed_at = now()
-WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 RETURNING `+redemptionColumns, append(args, row.id, item.InvoiceItemID, nullable(item.InvoiceID))...))
+	WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' RETURNING `+redemptionColumns, append(args, row.id, item.InvoiceItemID, nullable(item.InvoiceID))...))
+		if errors.Is(err, pgx.ErrNoRows) {
+			current, currentErr := scanRedemption(tx.QueryRow(ctx, `SELECT `+redemptionColumns+` FROM credit_code_redemptions
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3`, append(args, row.id)...))
+			if currentErr != nil {
+				return unavailable(currentErr)
+			}
+			if current.status != "completed" {
+				return recoveryPending()
+			}
+			row, done = current, true
+			return nil
+		}
 		if err != nil {
-			return unavailable(err)
+			return creditCompletionError(err)
 		}
 		row = completed
 		if err := BumpWalletVersion(ctx, tx, sc); err != nil {
@@ -485,6 +623,9 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 RETURNING `+redemptionColumns
 	})
 	if err != nil {
 		return Credit{}, false, err
+	}
+	if done {
+		return row.credit(), false, nil
 	}
 	return row.credit(), true, nil
 }
@@ -527,12 +668,14 @@ type StaffCredit struct {
 }
 
 const staffCreditColumns = `id, status, claimed_until, amount_minor, currency, killbill_credit_id::text, expires_at, expired_at,
-       reversed_minor, created_at, fingerprint`
+       reversed_minor, created_at, fingerprint, original_endpoint_kind, original_killbill_tenant_id::text, original_killbill_account_id::text,
+       original_currency, original_amount_minor, original_description`
 
 func scanStaffCredit(row pgx.Row) (creditRow, error) {
 	r := creditRow{table: "staff_credits"}
 	err := row.Scan(&r.id, &r.status, &r.claimedUntil, &r.amountMinor, &r.currency, &r.kbCreditID, &r.expiresAt, &r.expiredAt,
-		&r.reversedMinor, &r.createdAt, &r.fingerprint)
+		&r.reversedMinor, &r.createdAt, &r.fingerprint, &r.originalEndpoint, &r.originalKBTenant, &r.originalKBAccount,
+		&r.originalCurrency, &r.originalAmount, &r.originalDescription)
 	return r, err
 }
 
@@ -593,11 +736,12 @@ func (s *Service) GrantCredit(ctx context.Context, sc scope.Scope, call Call, re
 	err = inTx(ctx, s.DB, func(tx pgx.Tx) error {
 		newID := idgen.MustNewV7()
 		tag, err := tx.Exec(ctx, `INSERT INTO staff_credits (id, brand_id, tenant_id, idempotency_key, fingerprint, claimed_until,
-    amount_minor, currency, reason, expires_at, actor_type, actor_id, correlation_id, created_at)
-VALUES ($3, $1, $2, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+    amount_minor, currency, reason, expires_at, actor_type, actor_id, correlation_id, created_at,
+    original_endpoint_kind, original_killbill_tenant_id, original_killbill_account_id, original_currency, original_amount_minor, original_description)
+VALUES ($3, $1, $2, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'grant', $15::uuid, $16::uuid, $17, $18, $19)
 ON CONFLICT (brand_id, tenant_id, actor_id, idempotency_key) DO NOTHING`, append(args, newID, req.IdempotencyKey, fingerprint,
 			now.Add(CreditLease), req.AmountMinor, req.Currency, strings.TrimSpace(call.Reason), req.ExpiresAt,
-			string(call.Actor.Type), call.Actor.ID, call.CorrelationID, now)...)
+			string(call.Actor.Type), call.Actor.ID, call.CorrelationID, now, a.brand.KillBillTenantID, a.id(), req.Currency, req.AmountMinor, creditDescription(newID))...)
 		if err != nil {
 			return unavailable(err)
 		}
@@ -635,17 +779,38 @@ WHERE brand_id = $1 AND tenant_id = $2 AND actor_id = $3 AND idempotency_key = $
 	if done {
 		return row.credit(), false, nil
 	}
-	item, err := s.writeCredit(ctx, a, call, row.id, row.amountMinor, row.currency, resume)
-	if err != nil {
+	if resume && row.originalEndpoint == nil {
+		err := zserrors.New(zserrors.CodeBillingUnavailable, "Credit recovery requires manual review.")
 		s.releaseCredit(ctx, sc, row, err)
+		return Credit{}, false, err
+	}
+	item, err := s.writeCredit(ctx, a, call, row, resume)
+	if err != nil {
+		cleanupCause := err
+		if resume {
+			cleanupCause = recoveryPending()
+		}
+		s.releaseCredit(ctx, sc, row, cleanupCause)
 		return Credit{}, false, kbError(err)
 	}
 	err = inTx(ctx, s.DB, func(tx pgx.Tx) error {
 		completed, err := scanStaffCredit(tx.QueryRow(ctx, `UPDATE staff_credits SET status = 'completed', claimed_until = NULL,
     killbill_credit_id = $4::uuid, killbill_invoice_id = $5::uuid, completed_at = now()
-WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 RETURNING `+staffCreditColumns, append(args, row.id, item.InvoiceItemID, nullable(item.InvoiceID))...))
+	WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 AND status = 'pending' RETURNING `+staffCreditColumns, append(args, row.id, item.InvoiceItemID, nullable(item.InvoiceID))...))
+		if errors.Is(err, pgx.ErrNoRows) {
+			current, currentErr := scanStaffCredit(tx.QueryRow(ctx, `SELECT `+staffCreditColumns+` FROM staff_credits
+WHERE brand_id = $1 AND tenant_id = $2 AND id = $3`, append(args, row.id)...))
+			if currentErr != nil {
+				return unavailable(currentErr)
+			}
+			if current.status != "completed" {
+				return recoveryPending()
+			}
+			row, done = current, true
+			return nil
+		}
 		if err != nil {
-			return unavailable(err)
+			return creditCompletionError(err)
 		}
 		row = completed
 		if err := BumpWalletVersion(ctx, tx, sc); err != nil {
@@ -664,6 +829,9 @@ WHERE brand_id = $1 AND tenant_id = $2 AND id = $3 RETURNING `+staffCreditColumn
 	})
 	if err != nil {
 		return Credit{}, false, err
+	}
+	if done {
+		return row.credit(), false, nil
 	}
 	return row.credit(), true, nil
 }

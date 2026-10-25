@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/zsoftly/zs-core/pkg/idgen"
 )
 
 // Price is an amount in one currency. Value keeps Kill Bill's decimal text.
@@ -241,6 +243,24 @@ func (c *Client) AccountInvoices(ctx context.Context, creds TenantCredentials, a
 		return nil, err
 	}
 	return out, nil
+}
+
+// TriggerInvoice asks Kill Bill to create a future invoice for one account
+// and target date. A created invoice is identified only by a 201 Location.
+func (c *Client) TriggerInvoice(ctx context.Context, creds TenantCredentials, cc CallContext, accountID, targetDate string) (string, error) {
+	q := url.Values{"accountId": {accountID}, "targetDate": {targetDate}}
+	resp, err := c.do(ctx, request{op: "trigger invoice", method: http.MethodPost, path: "/1.0/kb/invoices?" + q.Encode(), tenant: &creds, call: &cc})
+	if err != nil {
+		return "", err
+	}
+	if resp.Status != http.StatusCreated {
+		return "", fmt.Errorf("killbill trigger invoice: unexpected HTTP %d", resp.Status)
+	}
+	id := locationID(resp)
+	if _, err := idgen.ParseUUID(id); err != nil {
+		return "", fmt.Errorf("killbill trigger invoice: invalid Location")
+	}
+	return id, nil
 }
 
 // Invoice returns an invoice with its items, or ErrNotFound.

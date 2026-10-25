@@ -21,6 +21,7 @@ import (
 	"github.com/zsoftly/zs-core/pkg/billing"
 	zserrors "github.com/zsoftly/zs-core/pkg/errors"
 	"github.com/zsoftly/zs-core/pkg/events"
+	"github.com/zsoftly/zs-core/pkg/idempotency"
 	"github.com/zsoftly/zs-core/pkg/idgen"
 	"github.com/zsoftly/zs-core/pkg/tenant"
 )
@@ -257,6 +258,127 @@ func TestRedeemResumesAfterKillBillFails(t *testing.T) {
 	if n := e.fake.CreditItems("zs-acme", a.KillBillAccountID); n != 1 {
 		t.Fatalf("Kill Bill credits = %d, want 1", n)
 	}
+}
+
+// A pending attempt created before original credit targets were recorded is
+// not safe to resume by issuing another Kill Bill credit.
+func TestCreditRecoveryDoesNotPostForLegacyPendingAttempt(t *testing.T) {
+	ctx := context.Background()
+	creditWrites := func(e *env) int {
+		n := 0
+		for _, write := range e.fake.Writes() {
+			if write.Method == http.MethodPost && strings.HasPrefix(write.Path, "/1.0/kb/credits") {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("redeem", func(t *testing.T) {
+		e := newEnv(t)
+		code := e.code(billing.NewCreditCode{Code: "LEGACY-REDEEM", AmountMinor: 700, Currency: "CAD", Reason: "x", CreatedBy: "ops"})
+		a := e.tenant("Tenant A")
+		codeID, err := idgen.ParseAs(idgen.CreditCode, code.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.db.Pool.Exec(ctx, `INSERT INTO credit_code_redemptions
+    (id, brand_id, tenant_id, credit_code_id, amount_minor, currency, actor_type, actor_id, correlation_id)
+VALUES ($1, $2, $3, $4, 700, 'CAD', 'user', $5, 'legacy')`, idgen.MustNewV7(), a.BrandID, a.ID, codeID, e.owner.Identity.PublicID()); err != nil {
+			t.Fatal(err)
+		}
+		before := creditWrites(e)
+		_, created, err := e.svc.Redeem(ctx, a.Scope(), e.call(), "LEGACY-REDEEM")
+		if created || err == nil || strings.HasPrefix(codeOf(err), "untyped:") {
+			t.Fatalf("legacy retry = created %v, err %v", created, err)
+		}
+		if after := creditWrites(e); after != before {
+			t.Fatalf("legacy retry credit POSTs = %d, want %d", after, before)
+		}
+		var status string
+		if err := e.db.Pool.QueryRow(ctx, `SELECT status FROM credit_code_redemptions WHERE tenant_id = $1`, a.ID).Scan(&status); err != nil || status != "pending" {
+			t.Fatalf("legacy redemption status = %q, %v", status, err)
+		}
+	})
+
+	t.Run("grant", func(t *testing.T) {
+		e := newEnv(t)
+		a := e.tenant("Tenant A")
+		req := billing.StaffCredit{AmountMinor: 700, Currency: "CAD", IdempotencyKey: "legacy-grant"}
+		payload, err := json.Marshal(map[string]any{"amount_minor": req.AmountMinor, "currency": req.Currency, "reason": "goodwill", "expires_at": req.ExpiresAt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fingerprint, err := idempotency.Fingerprint("billing.credit.grant", payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.db.Pool.Exec(ctx, `INSERT INTO staff_credits
+    (id, brand_id, tenant_id, idempotency_key, fingerprint, amount_minor, currency, reason, actor_type, actor_id, correlation_id)
+VALUES ($1, $2, $3, $4, $5, 700, 'CAD', 'goodwill', 'staff', 'sub:staff-1', 'legacy')`,
+			idgen.MustNewV7(), a.BrandID, a.ID, req.IdempotencyKey, fingerprint); err != nil {
+			t.Fatal(err)
+		}
+		before := creditWrites(e)
+		_, created, err := e.svc.GrantCredit(ctx, a.Scope(), e.staff("goodwill"), req)
+		if created || err == nil || strings.HasPrefix(codeOf(err), "untyped:") {
+			t.Fatalf("legacy retry = created %v, err %v", created, err)
+		}
+		if after := creditWrites(e); after != before {
+			t.Fatalf("legacy retry credit POSTs = %d, want %d", after, before)
+		}
+		var status string
+		if err := e.db.Pool.QueryRow(ctx, `SELECT status FROM staff_credits WHERE tenant_id = $1`, a.ID).Scan(&status); err != nil || status != "pending" {
+			t.Fatalf("legacy staff credit status = %q, %v", status, err)
+		}
+	})
+}
+
+func TestFirstCreditAttemptStoresRecoveryTarget(t *testing.T) {
+	ctx := context.Background()
+	target := func(t *testing.T, e *env, accountID, table string, where string, args ...any) {
+		t.Helper()
+		var rowID idgen.UUID
+		var endpoint, kbTenant, account, currency, description *string
+		var amount *int64
+		query := `SELECT id, original_endpoint_kind, original_killbill_tenant_id::text, original_killbill_account_id::text,
+    original_currency, original_amount_minor, original_description FROM ` + table + ` WHERE ` + where
+		if err := e.db.Pool.QueryRow(ctx, query, args...).Scan(&rowID, &endpoint, &kbTenant, &account, &currency, &amount, &description); err != nil {
+			t.Fatal(err)
+		}
+		if endpoint == nil || kbTenant == nil || account == nil || currency == nil || amount == nil || description == nil {
+			t.Fatalf("recovery target has NULL field: endpoint=%v tenant=%v account=%v currency=%v amount=%v description=%v", endpoint, kbTenant, account, currency, amount, description)
+		}
+		wantEndpoint := "redeem"
+		if table == "staff_credits" {
+			wantEndpoint = "grant"
+		}
+		wantDescription := "zs-core credit " + idgen.Format(idgen.Credit, rowID)
+		if *endpoint != wantEndpoint || *kbTenant != e.brand.ID.String() || *account != accountID || *currency != "CAD" || *amount != 700 || *description != wantDescription {
+			t.Fatalf("recovery target = endpoint=%q tenant=%q account=%q currency=%q amount=%d description=%q", *endpoint, *kbTenant, *account, *currency, *amount, *description)
+		}
+	}
+
+	t.Run("redeem", func(t *testing.T) {
+		e := newEnv(t)
+		e.code(billing.NewCreditCode{Code: "TARGET-REDEEM", AmountMinor: 700, Currency: "CAD", Reason: "x", CreatedBy: "ops"})
+		a := e.tenant("Tenant A")
+		e.fake.SetDown(false, true)
+		if _, _, err := e.svc.Redeem(ctx, a.Scope(), e.call(), "TARGET-REDEEM"); codeOf(err) != "billing_unavailable" {
+			t.Fatalf("first redeem = %v", err)
+		}
+		target(t, e, a.KillBillAccountID, "credit_code_redemptions", "tenant_id = $1", a.ID)
+	})
+
+	t.Run("grant", func(t *testing.T) {
+		e := newEnv(t)
+		a := e.tenant("Tenant A")
+		e.fake.SetDown(false, true)
+		if _, _, err := e.svc.GrantCredit(ctx, a.Scope(), e.staff("goodwill"), billing.StaffCredit{AmountMinor: 700, Currency: "CAD", IdempotencyKey: "target-grant"}); codeOf(err) != "billing_unavailable" {
+			t.Fatalf("first grant = %v", err)
+		}
+		target(t, e, a.KillBillAccountID, "staff_credits", "tenant_id = $1", a.ID)
+	})
 }
 
 func TestStaffCreditsAndExpirySweeper(t *testing.T) {

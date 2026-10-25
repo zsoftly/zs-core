@@ -45,10 +45,12 @@ const (
 type Status string
 
 // Tenant statuses. Suspended blocks every write in Core and reads continue.
-// Closed is terminal.
+// Closing is a closure in progress: the tenant answers nothing while its final
+// billing is settled. Closed is terminal.
 const (
 	StatusActive    Status = "active"
 	StatusSuspended Status = "suspended"
+	StatusClosing   Status = "closing"
 	StatusClosed    Status = "closed"
 )
 

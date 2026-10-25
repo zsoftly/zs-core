@@ -68,6 +68,7 @@ Rules:
 - Accepting an invitation always creates a new membership with a new `mem_` ID. A removed member who comes back never gets the old membership, or its API keys, back.
 - Suspending a tenant blocks every write in Core and sets the Kill Bill account to blocked through the entitlement blocking API. Reads continue. The writes that only give back what the tenant holds still go through: settling, releasing and extending a reservation, and releasing a quota lease. Closing is terminal and closes the Kill Bill account. It revokes every API key of the tenant. Suspending, reactivating or closing a closed tenant is `409 tenant_closed`. The check runs again under the tenant lock, so a reactivation that races a close is refused. No HTTP route suspends, reactivates or closes a tenant in v1. Use `zs-core tenant suspend|reactivate|close`.
 - Activation: `GET /v1/tenants/{id}/activation`; `POST /v1/staff/tenants/{id}/activation` with the `activation` grant, `{state, reason, request_id}`, idempotent on `request_id`.
+- Closure: `POST /v1/staff/tenants/{id}/closure` with the `closure` grant, `{reason, request_id}`, idempotent on `request_id`. It starts the closure settlement and moves the tenant to `closing`.
 
 ## API keys
 
@@ -89,7 +90,7 @@ Rules:
 
 ## Staff grants
 
-Table `staff_grants`: `id` (`grt_`), `brand_id`, `issuer`, `subject`, `scope` (`operator`, `activation`, `billing`, `support`), `status`, `granted_by`, `reason`.
+Table `staff_grants`: `id` (`grt_`), `brand_id`, `issuer`, `subject`, `scope` (`operator`, `activation`, `billing`, `support`, `closure`), `status`, `granted_by`, `reason`.
 
 Staff tokens are verified against the brand's staff client. Authority comes only from an active grant with the needed scope in the same brand. A missing grant returns `404`. With a grant, a brand on `mfa: required` or `required_for_staff` also needs a second factor in the token, or the route answers `403 mfa_required`. No HTTP route creates or revokes grants in v1. `zs-core grant add` creates one and `zs-core grant revoke --brand --issuer --subject --scope --reason --operator` sets it to `revoked`. Both are audited, as `staff.grant.added` and `staff.grant.revoked`. A revoked grant stops working at once, because verification requires an `active` grant. Migrations create no grants. Keycloak realm roles never grant staff authority.
 
@@ -118,6 +119,7 @@ The Phase 1 trusted-header mode is removed here.
 | `GET, POST /v1/tenants/{id}/invitations`; `DELETE .../invitations/{inv}` | member | `member:invite` |
 | `POST /v1/invitations/accept` | token, verified email, recent auth | none |
 | `GET /v1/tenants/{id}/activation`; `POST /v1/staff/tenants/{id}/activation` | member; staff `activation` | `tenant:read`; n/a |
+| `POST /v1/staff/tenants/{id}/closure` | staff `closure` | n/a |
 | `GET, POST /v1/tenants/{id}/api-keys`; `DELETE .../api-keys/{key}` | member, recent MFA on create | `apikey:*` |
 | `GET /v1/tenants/{id}/audit/events` | member or API key | `audit:read` |
 | `GET /v1/brands/{id}`; `POST /v1/brands/{id}/apply` | staff `operator` | n/a |
@@ -141,6 +143,9 @@ Built-in permissions: `tenant:read`, `tenant:update`, `tenant:transfer`, `member
 | ZS-1608 | `tenant_kind_unsupported` | 409 |
 | ZS-1609 | `recent_auth_required` | 403 |
 | ZS-1610 | `tenant_closed` | 409 |
+| ZS-1611 | `tenant_busy` | 409 |
+| ZS-1612 | `tenant_closing` | 409 |
+| ZS-1613 | `closure_cancel_review` | 409 |
 | ZS-1700 | `api_key_invalid` | 401 |
 | ZS-1701 | `api_key_owner_removed` | 401 |
 
@@ -158,7 +163,7 @@ Built-in permissions: `tenant:read`, `tenant:update`, `tenant:transfer`, `member
 - Two owners demoting each other at once leave one owner. An owner demoted while promoting a member cannot make that member an owner.
 - Two acceptances of one invitation add one membership.
 - An invitation whose inviter lost the authority is refused and revoked.
-- A reactivation that races a close is refused with `tenant_closed`.
+- A reactivation that comes while a close runs is refused with `tenant_busy`, and one that comes after it with `tenant_closed`.
 - A tenant name of 101 characters is refused, and a personal tenant takes a long display name cut to 100 characters. The test Kill Bill refuses longer names, as Kill Bill does.
 - 100 tenant writes queue 100 `tenant.mirror` events and start no goroutine each.
 - With `mfa: required_for_staff`, a person signed in to the customer client without a second factor is asked for it by the staff client in the same browser, and Core refuses a staff token without a second factor.

@@ -399,9 +399,10 @@ func contains(list []string, want string) bool {
 	return false
 }
 
-// Closed is terminal. A reactivation that started before a close committed
-// is refused under the tenant lock with tenant_closed, and the tenant stays
-// closed. Suspend and reactivate of a closed tenant are tenant_closed too.
+// Closed is terminal. A reactivation that comes while a close holds the
+// lifecycle capability of the tenant is refused as busy and touches nothing,
+// and one that comes after the close is tenant_closed. Suspend and reactivate
+// of a closed tenant are tenant_closed too.
 func TestCloseIsTerminalUnderConcurrentReactivation(t *testing.T) {
 	e := newEnv(t)
 	ownerP := e.person("owner@example.test")
@@ -419,20 +420,17 @@ func TestCloseIsTerminalUnderConcurrentReactivation(t *testing.T) {
 		closeDone <- err
 	}()
 	e.waitBlocked(pid, 1)
-	reactivateDone := make(chan error, 1)
-	go func() {
-		_, err := tenant.Reactivate(ctx, e.db.Pool, e.eng, sc, operator, "paid", "test")
-		reactivateDone <- err
-	}()
-	e.waitBlocked(pid, 2)
+	if _, err := tenant.Reactivate(ctx, e.db.Pool, e.eng, sc, operator, "paid", "test"); code(err) != "tenant_busy" {
+		t.Fatalf("reactivation racing a close: %v, want tenant_busy", err)
+	}
 	if err := holder.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-closeDone; err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if err := <-reactivateDone; code(err) != "tenant_closed" {
-		t.Fatalf("reactivation racing a close: %v", err)
+	if _, err := tenant.Reactivate(ctx, e.db.Pool, e.eng, sc, operator, "paid", "test"); code(err) != "tenant_closed" {
+		t.Fatalf("reactivation after the close: %v", err)
 	}
 	got, err := tenant.Get(ctx, e.db.Pool, sc)
 	if err != nil || got.Status != tenant.StatusClosed {

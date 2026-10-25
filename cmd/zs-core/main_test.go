@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,7 +13,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/zsoftly/zs-core/internal/doctor"
+	"github.com/zsoftly/zs-core/internal/killbill"
+	"github.com/zsoftly/zs-core/internal/secrets"
+	"github.com/zsoftly/zs-core/pkg/billing"
+	"github.com/zsoftly/zs-core/pkg/metering"
+	"github.com/zsoftly/zs-core/pkg/tenant"
 )
 
 func TestRunUsageAndConfigErrors(t *testing.T) {
@@ -268,6 +277,64 @@ func TestPluginUsageAndConfigurationErrors(t *testing.T) {
 		var out, errOut bytes.Buffer
 		if code := run(c.args, c.env, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), c.want) {
 			t.Errorf("%v: exit %d %q, want %q", c.args, code, errOut.String(), c.want)
+		}
+	}
+}
+
+// start-closure needs its flags, and does not ask for engine settings: it only
+// writes Core, so with no Keycloak or Kill Bill setting it gets as far as the
+// database, where this configuration has none.
+func TestTenantStartClosureFlagsAndNoEngineSettings(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := run([]string{"tenant", "start-closure", "--brand", "zs-reference"}, nil, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "--reason") {
+		t.Fatalf("missing flags = %d %q", code, errOut.String())
+	}
+	errOut.Reset()
+	environ := []string{"ZS_DATABASE_URL=postgres://u:pw-123@127.0.0.1:1/x?connect_timeout=1"}
+	args := []string{"tenant", "start-closure", "--brand", "zs-reference", "--tenant", "tnt_01m5qxsm2vefytm7qehn7fnrx5", "--reason", "left", "--operator", "me"}
+	if code := run(args, environ, &out, &errOut); code == 0 || strings.Contains(errOut.String(), "ZS_KEYCLOAK_URL") || strings.Contains(errOut.String(), "ZS_KILLBILL_URL") {
+		t.Fatalf("start-closure = %d %q, want a database error and no engine settings asked for", code, errOut.String())
+	}
+	errOut.Reset()
+	if code := run(append([]string{}, args[:1]...), nil, &out, &errOut); code != 2 {
+		t.Fatalf("tenant alone = %d", code)
+	}
+	if code := run([]string{"tenant", "suspend", "--brand", "zs-reference", "--tenant", "tnt_01m5qxsm2vefytm7qehn7fnrx5", "--reason", "left", "--operator", "me"}, environ, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "ZS_KEYCLOAK_URL") {
+		t.Fatalf("suspend without engine settings = %d %q, want the Keycloak setting asked for", code, errOut.String())
+	}
+}
+
+// The tenant sweeper gets the closure steps only when billing is configured,
+// because the drain they wait for is the usage forwarder's.
+func TestTenantSweeperGetsClosureStepsOnlyWithBilling(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var pool *pgxpool.Pool
+	ready := &billing.Service{DB: pool, KillBill: &killbill.Client{}, Secrets: secrets.Default{}}
+	if !ready.Ready() {
+		t.Fatal("the fixture billing service is not ready")
+	}
+	if s := newTenantSweeper(pool, tenant.Engines{}, &metering.Service{Billing: ready}, log); s.Closure == nil {
+		t.Fatal("no closure steps with billing configured")
+	}
+	if s := newTenantSweeper(pool, tenant.Engines{}, &metering.Service{Billing: &billing.Service{}}, log); s.Closure != nil {
+		t.Fatal("closure steps without billing: they would wait for ever for a drain")
+	}
+	if s := newTenantSweeper(pool, tenant.Engines{}, nil, log); s.Closure != nil {
+		t.Fatal("closure steps without a metering service")
+	}
+}
+
+// resolve-rollup needs all its flags before it asks for any setting.
+func TestUsageResolveRollupFlags(t *testing.T) {
+	var out, errOut bytes.Buffer
+	for _, args := range [][]string{
+		{"usage", "resolve-rollup"},
+		{"usage", "resolve-rollup", "--brand", "zs-reference", "--tenant", "tnt_01m5qxsm2vefytm7qehn7fnrx5", "--rollup", "rol_x", "--operator", "me"},
+		{"usage", "resolve-rollup", "--brand", "zs-reference", "--tenant", "not-a-tenant", "--rollup", "rol_x", "--operator", "me", "--reason", "r"},
+	} {
+		errOut.Reset()
+		if code := run(args, nil, &out, &errOut); code != 2 || !strings.Contains(errOut.String(), "resolve-rollup") {
+			t.Errorf("%v = %d %q, want a usage error", args, code, errOut.String())
 		}
 	}
 }

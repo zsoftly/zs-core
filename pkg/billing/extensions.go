@@ -61,6 +61,39 @@ func (s *Service) TenantAccount(ctx context.Context, q Querier, sc scope.Scope) 
 	return &TenantAccount{s: s, a: account{tenant: t, brand: rec, creds: killbill.TenantCredentials{APIKey: rec.KillBillAPIKey, APISecret: secret}}}, nil
 }
 
+// KillBillTenantID looks up the Kill Bill tenant of the brand's API key. It
+// is the same for every tenant of the brand, so a caller that sends many
+// rollups in one pass reads it once.
+func (k *TenantAccount) KillBillTenantID(ctx context.Context) (string, error) {
+	t, err := k.s.KillBill.TenantByAPIKey(ctx, k.a.creds.APIKey)
+	if err != nil {
+		return "", kbError(err)
+	}
+	return t.TenantID, nil
+}
+
+// UsageTargetOf is where usage lands for a subscription that UsageSubscriptionAt
+// just confirmed, built from the Kill Bill tenant ID of KillBillTenantID. It
+// reads nothing from Kill Bill, so the subscription is not read a second
+// time, and it refuses a subscription that is not this account's own. For
+// any other subscription use UsageTarget.
+func (k *TenantAccount) UsageTargetOf(tenantID string, confirmed killbill.Subscription) (killbill.UsageTarget, error) {
+	if confirmed.AccountID == "" || !strings.EqualFold(confirmed.AccountID, k.ID()) {
+		return killbill.UsageTarget{}, zserrors.New(zserrors.CodeBillingRejected, "The subscription does not belong to the tenant's account.")
+	}
+	return killbill.UsageTarget{EndpointFingerprint: k.s.KillBill.EndpointFingerprint(), TenantID: tenantID, AccountID: k.ID()}, nil
+}
+
+// UsageTarget returns the Kill Bill endpoint, tenant and account that usage
+// for the subscription lands in, as the tenant's own credentials see it.
+func (k *TenantAccount) UsageTarget(ctx context.Context, subscriptionID string) (killbill.UsageTarget, error) {
+	t, err := k.s.KillBill.UsageTarget(ctx, k.a.creds, subscriptionID)
+	if err != nil {
+		return killbill.UsageTarget{}, kbError(err)
+	}
+	return t, nil
+}
+
 // ID returns the Kill Bill account ID.
 func (k *TenantAccount) ID() string { return k.a.id() }
 
@@ -416,19 +449,11 @@ func (k *TenantAccount) RecordUsage(ctx context.Context, call Call, subscription
 	if err := call.validate(); err != nil {
 		return false, err
 	}
-	if err := checkKillBillID(subscriptionID); err != nil {
+	rec, err := usageRecord(subscriptionID, unit, trackingID, amounts)
+	if err != nil {
 		return false, err
 	}
-	rec := killbill.SubscriptionUsageRecord{SubscriptionID: subscriptionID, TrackingID: trackingID,
-		UnitUsageRecords: []killbill.UnitUsageRecords{{UnitType: unit}}}
-	for _, a := range amounts {
-		if a.AmountMicro <= 0 {
-			return false, validation("Usage amounts must be positive.")
-		}
-		rec.UnitUsageRecords[0].UsageRecords = append(rec.UnitUsageRecords[0].UsageRecords,
-			killbill.UsageRecord{RecordDate: a.At.UTC().Format("2006-01-02T15:04:05.000Z"), Amount: MicroToDecimal(a.AmountMicro)})
-	}
-	err := k.s.KillBill.RecordUsage(ctx, k.a.creds, call.kb(), rec)
+	err = k.s.KillBill.RecordUsage(ctx, k.a.creds, call.kb(), rec)
 	if errors.Is(err, killbill.ErrTrackingIDExists) {
 		return true, nil
 	}
@@ -436,6 +461,51 @@ func (k *TenantAccount) RecordUsage(ctx context.Context, call Call, subscription
 		return false, kbError(err)
 	}
 	return false, nil
+}
+
+func usageRecord(subscriptionID, unit, trackingID string, amounts []UsageAmount) (killbill.SubscriptionUsageRecord, error) {
+	if err := checkKillBillID(subscriptionID); err != nil {
+		return killbill.SubscriptionUsageRecord{}, err
+	}
+	rec := killbill.SubscriptionUsageRecord{SubscriptionID: subscriptionID, TrackingID: trackingID,
+		UnitUsageRecords: []killbill.UnitUsageRecords{{UnitType: unit}}}
+	for _, a := range amounts {
+		if a.AmountMicro <= 0 {
+			return killbill.SubscriptionUsageRecord{}, validation("Usage amounts must be positive.")
+		}
+		rec.UnitUsageRecords[0].UsageRecords = append(rec.UnitUsageRecords[0].UsageRecords,
+			killbill.UsageRecord{RecordDate: a.At.UTC().Format("2006-01-02T15:04:05.000Z"), Amount: MicroToDecimal(a.AmountMicro)})
+	}
+	return rec, nil
+}
+
+// UsagePayload is the exact body of the usage POST for the amounts, built
+// before anything is sent so the caller can store it first and send those
+// bytes with SendUsage.
+func (k *TenantAccount) UsagePayload(subscriptionID, unit, trackingID string, amounts []UsageAmount) ([]byte, error) {
+	rec, err := usageRecord(subscriptionID, unit, trackingID, amounts)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := rec.Payload()
+	if err != nil {
+		return nil, validation("The usage record is not valid.")
+	}
+	return payload, nil
+}
+
+// SendUsage posts a payload built by UsagePayload. The result says what the
+// answer proves, and only UsageSent and UsageHeld mean Kill Bill holds the
+// usage. The error never holds Kill Bill's message.
+func (k *TenantAccount) SendUsage(ctx context.Context, call Call, payload []byte) (killbill.UsageSendResult, error) {
+	if err := call.validate(); err != nil {
+		return killbill.UsageSendResult{Outcome: killbill.UsageNotSent}, err
+	}
+	res, err := k.s.KillBill.SendUsage(ctx, k.a.creds, call.kb(), payload)
+	if err != nil {
+		return res, kbError(err)
+	}
+	return res, nil
 }
 
 // BilledUnit is the usage of a unit Kill Bill holds for a period.

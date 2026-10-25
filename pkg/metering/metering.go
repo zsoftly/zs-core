@@ -96,6 +96,9 @@ type Service struct {
 	Log     *slog.Logger
 	// Now defaults to time.Now.
 	Now func() time.Time
+	// ClaimTTL is how long a forwarder holds a claim; it defaults to two
+	// minutes.
+	ClaimTTL time.Duration
 }
 
 func (s *Service) now() time.Time {
@@ -187,7 +190,7 @@ type recording struct {
 	meters          map[string]brand.MeterRecord
 }
 
-func (s *Service) begin(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Call) (*recording, error) {
+func (s *Service) begin(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Call, settlement bool) (*recording, error) {
 	if err := call.validate(); err != nil {
 		return nil, err
 	}
@@ -201,6 +204,13 @@ func (s *Service) begin(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Cal
 	// A suspended tenant's work that already ran is still billed. A
 	// closed tenant has no billing surface.
 	if t.Status == tenant.StatusClosed {
+		return nil, errTenantNotActive
+	}
+	// Once a closure has started, raw usage is refused: the closure invoices
+	// what was accepted before it. The settlement of a reservation held before
+	// it is still taken, because the drain waits for each one to be settled or
+	// released.
+	if t.Status == tenant.StatusClosing && !settlement {
 		return nil, errTenantNotActive
 	}
 	rec, err := brand.Get(ctx, tx, sc.Brand)
@@ -361,8 +371,9 @@ WHERE brand_id = $1 AND tenant_id = $2 AND meter_id = $3 AND event_id = $4`, arg
 	insertArgs, _ := sc.Bind(id, m.ID, ev.EventID, m.KillBillUnit, ev.QuantityMicro, dims, dimsKey, nullable(ev.ResourceRef), sub, rsv, ev.OccurredAt, r.now,
 		forwardedAt, tracking)
 	if _, err := tx.Exec(ctx, `INSERT INTO usage_events (brand_id, tenant_id, id, meter_id, event_id, killbill_unit, quantity_micro,
-    dimensions, dimensions_key, resource_ref, subscription_id, reservation_id, occurred_at, received_at, forwarded_at, killbill_tracking_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::uuid, $12, $13, $14, $15, $16)`, insertArgs...); err != nil {
+    dimensions, dimensions_key, resource_ref, subscription_id, reservation_id, occurred_at, received_at, forwarded_at, killbill_tracking_id,
+    acceptance_protocol)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::uuid, $12::uuid, $13, $14, $15, $16, CASE WHEN $12::uuid IS NULL THEN 1 ELSE 0 END)`, insertArgs...); err != nil {
 		return Usage{}, false, unavailable(err)
 	}
 	if err := addToSummary(ctx, tx, sc, m.ID, ev.OccurredAt, dims, dimsKey, ev.QuantityMicro); err != nil {
@@ -452,7 +463,7 @@ func (s *Service) RecordUsageBatch(ctx context.Context, tx pgx.Tx, sc scope.Scop
 }
 
 func (s *Service) recordBatch(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Call, batch []Event) ([]Usage, []bool, error) {
-	r, err := s.begin(ctx, tx, sc, call)
+	r, err := s.begin(ctx, tx, sc, call, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -522,7 +533,7 @@ func (s *Service) recorded(ctx context.Context, tx pgx.Tx, sc scope.Scope, call 
 // unit, and the event a settlement records on it, normalized. ok is false
 // when no meter maps to the unit.
 func (s *Service) settledMeter(ctx context.Context, tx pgx.Tx, sc scope.Scope, call Call, unit string, ev Event) (*recording, brand.MeterRecord, Event, bool, error) {
-	r, err := s.begin(ctx, tx, sc, call)
+	r, err := s.begin(ctx, tx, sc, call, true)
 	if err != nil {
 		return nil, brand.MeterRecord{}, Event{}, false, err
 	}

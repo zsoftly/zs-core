@@ -19,10 +19,12 @@ import (
 	"github.com/zsoftly/zs-core/pkg/tenant"
 )
 
-// runTenant implements `zs-core tenant suspend|reactivate|close|sweep`. No
+// runTenant implements `zs-core tenant suspend|reactivate|close|start-closure|sweep`. No
 // HTTP route suspends, reactivates or closes a tenant in v1; these commands
-// do, and they are audited. sweep runs one pass of the sweeper that serve
-// runs on a timer.
+// do, and they are audited. start-closure starts the closure of a tenant: it
+// moves the tenant to closing and the sweeper settles its final billing, which
+// close does not. sweep runs one pass of the sweeper that serve runs on a
+// timer.
 func runTenant(args, environ []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usage)
@@ -30,7 +32,7 @@ func runTenant(args, environ []string, stdout, stderr io.Writer) int {
 	}
 	sub := args[0]
 	switch sub {
-	case "suspend", "reactivate", "close", "sweep":
+	case "suspend", "reactivate", "close", "start-closure", "sweep":
 	default:
 		fmt.Fprint(stderr, usage)
 		return 2
@@ -40,6 +42,7 @@ func runTenant(args, environ []string, stdout, stderr io.Writer) int {
 	tenantID := fs.String("tenant", "", "tenant ID, tnt_...")
 	reason := fs.String("reason", "", "why, recorded in audit and in Kill Bill")
 	operator := fs.String("operator", "", "who acts, recorded in audit")
+	requestID := fs.String("request-id", "", "start-closure only: makes a repeat of the same request a replay; 8 to 255 characters, default a new one")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
 	}
@@ -56,17 +59,20 @@ func runTenant(args, environ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	kc, err := newKeycloak(cfg)
-	if err != nil {
-		fmt.Fprintf(stderr, "tenant %s needs ZS_KEYCLOAK_URL and Keycloak admin credentials: %v\n", sub, err)
-		return 2
+	var engines tenant.Engines
+	if sub != "start-closure" {
+		kc, err := newKeycloak(cfg)
+		if err != nil {
+			fmt.Fprintf(stderr, "tenant %s needs ZS_KEYCLOAK_URL and Keycloak admin credentials: %v\n", sub, err)
+			return 2
+		}
+		kb, err := newKillBill(cfg)
+		if err != nil {
+			fmt.Fprintf(stderr, "tenant %s needs ZS_KILLBILL_URL and Kill Bill admin credentials: %v\n", sub, err)
+			return 2
+		}
+		engines = tenant.Engines{Keycloak: kc, KillBill: kb, Secrets: secrets.Default{Dir: cfg.SecretsDir}}
 	}
-	kb, err := newKillBill(cfg)
-	if err != nil {
-		fmt.Fprintf(stderr, "tenant %s needs ZS_KILLBILL_URL and Kill Bill admin credentials: %v\n", sub, err)
-		return 2
-	}
-	engines := tenant.Engines{Keycloak: kc, KillBill: kb, Secrets: secrets.Default{Dir: cfg.SecretsDir}}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -109,6 +115,23 @@ func runTenant(args, environ []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	sc := scope.Scope{Brand: rec.ID, Tenant: id}
+	if sub == "start-closure" {
+		rid := strings.TrimSpace(*requestID)
+		if rid == "" {
+			rid = idgen.MustNewV7().String()
+		}
+		res, err := tenant.StartClosure(ctx, pool, sc, operatorActor(*operator), tenant.ClosureRequest{Reason: *reason, RequestID: rid}, idgen.MustNewV7().String())
+		if err != nil {
+			fmt.Fprintf(stderr, "tenant start-closure: %v\n", err)
+			return 1
+		}
+		if res.Started {
+			fmt.Fprintf(stdout, "%s %s in %s is closing, cutoff %s; the sweeper settles its final billing\n", res.Tenant.PublicID(), res.Tenant.Name, rec.Slug, res.CutoffAt.UTC().Format(time.RFC3339))
+		} else {
+			fmt.Fprintf(stdout, "%s %s in %s was already closing, cutoff %s\n", res.Tenant.PublicID(), res.Tenant.Name, rec.Slug, res.CutoffAt.UTC().Format(time.RFC3339))
+		}
+		return 0
+	}
 	op := map[string]func(context.Context, tenant.DB, tenant.Engines, scope.Scope, events.Actor, string, string) (tenant.Tenant, error){
 		"suspend": tenant.Suspend, "reactivate": tenant.Reactivate, "close": tenant.Close,
 	}[sub]

@@ -68,7 +68,9 @@ func (tx *sharedApplyCommitTx) Commit(ctx context.Context) error {
 func TestApplySerializesSharedKillBillAcrossSchemasAndBrands(t *testing.T) {
 	for _, phase := range []string{"planning", "execution"} {
 		t.Run(phase, func(t *testing.T) {
-			dbA, dbB := postgrestest.New(t), postgrestest.New(t)
+			// The lock under test is shared by the schemas of one database, so the
+			// two fixtures must be two schemas of the same database.
+			dbA, dbB := postgrestest.NewSchema(t), postgrestest.NewSchema(t)
 			if dbA.Schema == dbB.Schema {
 				t.Fatal("fixture must use distinct schemas")
 			}

@@ -105,7 +105,7 @@ Migrations use unqualified names, so they apply to the first schema on the conne
 
 Unit tests sit next to the code and need nothing but Go.
 
-Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. Tests in different packages therefore run in parallel against one server without seeing each other's rows. Run the suite in parallel, without `-p 1`.
+Integration tests are in files named `*_integration_test.go` with the `integration` build tag. Each test gets its own Postgres schema, named `zs_test_<random>`, with every migration applied, and the schema is dropped when the test ends. On a container server the harness is faster: the first test of a binary migrates one template database, and every test then gets a clone of it, a database of its own named `zs_test_<random>`, which is dropped when the test ends. A server named by `ZS_TEST_POSTGRES_URL` keeps the schema per test, because its user may not be allowed to create databases. A test whose subject is state that the schemas of one database share, such as a server-wide advisory lock, calls `postgrestest.NewSchema`, which gives schemas of the same database. Tests in different packages therefore run in parallel against one server without seeing each other's rows. Run the suite in parallel, without `-p 1`.
 
 Two rules keep parallel schemas apart on one server:
 
@@ -164,7 +164,7 @@ The tenant stack tests cover the Phase 3 gates with a real Keycloak and Kill Bil
   - Unreachable signing keys give 503.
   - An activation grant of `zs-second` acts in `zs-second` only.
   - Suspension adds the Kill Bill blocking state and disables the Organization, reads continue and writes stop.
-  - Reactivation lifts both, and closure closes the Kill Bill account. A closed tenant cannot be reactivated: `tenant_closed`.
+  - Reactivation lifts both, and the hard close closes the Kill Bill account, where a closure that settles final billing only blocks it. A closed tenant cannot be reactivated: `tenant_closed`.
 - `TestRequiredForStaffBindsBrokeredStaffLoginsOnTheStack` sets `zs-second` to `mfa: required_for_staff` with an extra identity provider. It creates a second realm that plays the provider and signs in through it as a browser would. The staff client is asked for a one-time password, the customer client gets an authorization code, and with `optional` the staff client gets a code too.
 - `TestStaffClientRefusesSSOWithoutSecondFactorOnTheStack` sets `zs-second` to `mfa: required_for_staff`. It signs in to the customer client with a password only, as a browser would, then asks the staff client for a code in the same browser. Keycloak asks for the password and a one-time password instead of reusing the session. Core answers `403 mfa_required` to a staff token without a second factor. With `mfa: required`, a password login reaches the one-time password after the password form.
 
@@ -193,6 +193,13 @@ The tenant stack tests cover the Phase 3 gates with a real Keycloak and Kill Bil
 - The entitlement of `api-call` shows the month quota and the usage. `GET /v1/tenants/{id}/usage/billed` shows Kill Bill's total.
 - An invoice run past the end of the first period bills the usage as a `USAGE` item that lists both tracking IDs. Kill Bill's test clock cannot move on the stack, so the run names a target date.
 - The client reads those tracking IDs, and the dates of the usage item, from Kill Bill's invoices, and the invoiced usage reconciles with no new finding.
+
+The closure stack tests run a tenant closure on Kill Bill 0.24.22. The tenant has a usage-only subscription made three days back, because Kill Bill bills the usage of a subscription that is created and cancelled on one UTC day in a window of zero length. The tenant sweeper drives the closure with `tenant.EngineClosureSteps` and the metering service as the drain. Run them on the host network like the other stack tests, with `-run TestClosure`.
+
+- `TestClosureOnTheStack` sends six calls of usage to Kill Bill through the drain, cancels the subscription IMMEDIATELY, and finds the usage on the invoice of the cancel as a `USAGE` item of six minor units that lists the tracking ID of the rollup. The sweeper invoices what is left, blocks the account with `ZS_TENANT_CLOSED`, which leaves billing open, and closes the tenant. The account takes no new subscription and is not closed, the final invoice can still be paid, and another sweep changes nothing.
+- `TestClosureWithALostUsageAnswerOnTheStack` loses the answer to the usage record: Kill Bill holds it and Core has an unconfirmed send. The closure cancels, the account is blocked, and the tenant waits at `blocking` because completion is refused. The doctor reports `usage_unconfirmed` for the tenant. A `not_billed` decision is refused while the cancel's invoice carries the record, a `forwarded` decision with that invoice is accepted and replays, the tenant closes, the doctor is clear, and nothing was sent to Kill Bill again.
+
+The first two tests do the cancel first and wait eight seconds for Kill Bill to invoice it, so that they stay deterministic. The sweeper goes from the cancel to the finance step in one pass, so the dry run and the trigger of the finance step come within about a second of the cancel. When Kill Bill's own invoice for the cancel lands between them, the trigger answers a bare 404. The finance step reads that 404 against a second dry run and the invoices of the account, so the closure still completes without a person. `TestClosureFinancesRightAfterTheCancelOnTheStack` runs closures in a loop with no wait, six by default and `ZS_TEST_CLOSURE_LOOPS` sets the number, and checks that none needs a person and that the usage is billed once. Its log says in how many closures the trigger answered 404.
 
 The Phase 5 tests cover plugin deployment, invoices and brand isolation:
 

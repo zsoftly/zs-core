@@ -10,11 +10,13 @@
 //	zs-core grant revoke   take a scope away from a staff principal
 //	zs-core grant list     list the staff grants of a brand
 //	zs-core tenant suspend|reactivate|close  change a tenant's status in Core and the engines
+//	zs-core tenant start-closure  start the closure of a tenant and settle its final billing
 //	zs-core tenant sweep   run one pass of the tenant sweeper
 //	zs-core credit-code add|list|disable  manage the promo and voucher codes of a brand
 //	zs-core credit sweep   run one pass of the credit expiry sweeper
 //	zs-core wallet sweep   expire reservations past their lease and reconcile wallets once
 //	zs-core usage forward  forward recorded usage to Kill Bill once
+//	zs-core usage resolve-rollup  confirm that Kill Bill holds an unconfirmed usage rollup
 //	zs-core plugin ddl show|apply  print or apply a pinned plugin's DDL
 //	zs-core plugin mirror sync     download the pinned plugin jars into the mirror
 //
@@ -65,6 +67,7 @@ Commands:
   grant list     list the staff grants of a brand
                    --brand <slug>
   tenant suspend|reactivate|close  change a tenant's status in Core, Kill Bill and Keycloak
+  tenant start-closure  start a tenant's closure; the sweeper then settles its final billing
                    --brand <slug> --tenant <tnt_...> --reason <text> --operator <name>
   tenant sweep   complete interrupted tenant creations and correct Keycloak Organizations once
   credit-code add      add a promo or voucher code to a brand; only its digest is stored
@@ -78,6 +81,7 @@ Commands:
   credit sweep   expire the credits Core issued that are past their expiry, once
   wallet sweep   expire reservations past their lease and reconcile every wallet with Kill Bill, once
   usage forward  forward recorded usage to Kill Bill as usage records, once
+  usage resolve-rollup  confirm, against a Kill Bill invoice, a rollup whose send was never confirmed
   plugin ddl show <name>   print the DDL of a pinned plugin's jar, read from the mirror or the repository
                    --components <file>    components file (default components.yaml)
   plugin ddl apply <name>|--all  create the plugin's missing tables in the Kill Bill database
@@ -200,7 +204,7 @@ func serve(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	if err := startNotifications(ctx, pool, api.BrandDeps.Secrets, log); err != nil {
 		return err
 	}
-	startTenantSweeper(ctx, pool, api.Tenants, cfg.TenantSweepInterval, log)
+	startTenantSweeper(ctx, pool, api.Tenants, api.Metering, cfg.TenantSweepInterval, log)
 	startCreditSweeper(ctx, api.Billing, cfg.CreditSweepInterval, log)
 	startExtensions(ctx, pool, api, cfg, log)
 

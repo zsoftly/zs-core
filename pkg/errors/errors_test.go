@@ -89,6 +89,9 @@ func TestStatusMapping(t *testing.T) {
 		CodeDatabaseUnavailable:       http.StatusServiceUnavailable,
 		CodeIdempotencyKeyInProgress:  http.StatusConflict,
 		CodeIdempotencyResultTooLarge: http.StatusInternalServerError,
+		CodeTenantBusy:                http.StatusConflict,
+		CodeTenantClosing:             http.StatusConflict,
+		CodeClosureCancelReview:       http.StatusConflict,
 	}
 	for code, want := range cases {
 		status, env := ToEnvelope(New(code, ""))
@@ -109,5 +112,14 @@ func TestIsCode(t *testing.T) {
 	var nilErr *Error
 	if nilErr.Error() != "<nil>" || nilErr.Unwrap() != nil {
 		t.Fatal("nil receiver handling")
+	}
+}
+
+func TestTenantBusyIsRetryableAndTenantClosingIsNot(t *testing.T) {
+	if _, env := ToEnvelope(New(CodeTenantBusy, "")); !env.Error.Retryable || env.Error.Code != "tenant_busy" {
+		t.Errorf("tenant_busy = %+v, want retryable", env.Error)
+	}
+	if _, env := ToEnvelope(New(CodeTenantClosing, "")); env.Error.Retryable || env.Error.Code != "tenant_closing" {
+		t.Errorf("tenant_closing = %+v, want not retryable", env.Error)
 	}
 }

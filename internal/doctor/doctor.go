@@ -145,6 +145,9 @@ type Options struct {
 	// BillingRecipients reads actual account email against current Core membership.
 	// It must not repair either system or return recipient addresses.
 	BillingRecipients func(context.Context) ([]Finding, error)
+	// Closures lists the tenant closures that wait for a person. It is left out
+	// of the report when it is nil.
+	Closures func(context.Context) ([]Finding, error)
 }
 
 // Run performs every check and returns the report. Checks of different
@@ -179,6 +182,13 @@ func Run(ctx context.Context, opts Options) Report {
 		r.Findings = append(r.Findings, Finding{"core", "billing_recipients", Fail, "cannot establish billing recipient drift; check database, migration and billing engine availability"})
 	} else {
 		r.Findings = append(r.Findings, findings...)
+	}
+	if opts.Closures != nil {
+		if findings, err := opts.Closures(ctx); err != nil {
+			r.Findings = append(r.Findings, Finding{"core", "closures", Fail, "cannot establish the state of tenant closures; check database and migration availability"})
+		} else {
+			r.Findings = append(r.Findings, findings...)
+		}
 	}
 	r.OK = !r.Failed() && !r.Skipped()
 	return r

@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,8 +78,10 @@ type Fake struct {
 	accounts map[string]map[string]*Account
 	// tenantSecrets are the Kill Bill API secrets by API key.
 	tenantSecrets map[string]string
-	env           map[string]string
-	server        *httptest.Server
+	// tenantIDs are the Kill Bill tenant UUIDs by API key.
+	tenantIDs map[string]string
+	env       map[string]string
+	server    *httptest.Server
 	// rejectedAccounts counts account creations refused for a column limit.
 	rejectedAccounts int
 	// billing is the billing state of each Kill Bill tenant, by API key.
@@ -87,9 +90,20 @@ type Fake struct {
 	nodes []killbill.NodeInfo
 	// requests records the audit headers of every Kill Bill write.
 	requests []KillBillWrite
+	// reads records the path of every Kill Bill read.
+	reads []string
 	// lose counts the next writes, by path prefix, that take effect and
 	// then answer 503, as a lost answer looks to Core.
 	lose map[string]int
+	// drop counts the next writes, by path prefix, that take effect and
+	// then lose the connection without an answer.
+	drop map[string]int
+	// usageBodies are the exact bytes of every usage POST the fake received,
+	// by API key, oldest first.
+	usageBodies map[string][][]byte
+	// cancelRequests are the subscription cancels the fake received, by API
+	// key of the Kill Bill tenant.
+	cancelRequests map[string][]CancelRequest
 	// afterWrite is called after every Kill Bill write the fake took.
 	afterWrite func(method, path string)
 	// dryRunDown makes dry-run invoices answer 500.
@@ -157,6 +171,62 @@ func (f *Fake) LoseAnswers(prefix string, n int) {
 	f.lose[prefix] = n
 }
 
+// DropAnswers makes the next n Kill Bill writes whose path starts with
+// prefix, such as /1.0/kb/usages, take effect and then close the connection
+// without an answer, as when Kill Bill resets the connection after it wrote.
+// The client sees a transport error, not a status.
+func (f *Fake) DropAnswers(prefix string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.drop == nil {
+		f.drop = map[string]int{}
+	}
+	f.drop[prefix] = n
+}
+
+// UsageBodies returns the exact request bodies of every POST /1.0/kb/usages
+// the fake received with the API key of a Kill Bill tenant, oldest first. A
+// POST the fake refused, lost or dropped is included, since it reached the
+// fake. The slices are copies.
+func (f *Fake) UsageBodies(apiKey string) [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]byte, 0, len(f.usageBodies[apiKey]))
+	for _, b := range f.usageBodies[apiKey] {
+		out = append(out, append([]byte(nil), b...))
+	}
+	return out
+}
+
+// CancelRequest is one DELETE of a subscription that reached the fake.
+type CancelRequest struct {
+	Path   string
+	Query  url.Values
+	Header http.Header
+}
+
+func cloneValues(v url.Values) url.Values {
+	out := make(url.Values, len(v))
+	for k, vs := range v {
+		out[k] = append([]string(nil), vs...)
+	}
+	return out
+}
+
+// CancelRequests returns every subscription cancel the fake received with the
+// API key of a Kill Bill tenant, oldest first, with its path, query and
+// headers. A cancel the fake refused, lost or dropped is included, since it
+// reached the fake. The values are copies.
+func (f *Fake) CancelRequests(apiKey string) []CancelRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]CancelRequest, 0, len(f.cancelRequests[apiKey]))
+	for _, c := range f.cancelRequests[apiKey] {
+		out = append(out, CancelRequest{Path: c.Path, Query: cloneValues(c.Query), Header: c.Header.Clone()})
+	}
+	return out
+}
+
 // AfterWrite calls fn after every Kill Bill write the fake took, with the
 // method and the path, while the fake is locked. fn must not call the fake.
 func (f *Fake) AfterWrite(fn func(method, path string)) {
@@ -185,7 +255,7 @@ func (f *Fake) RejectedAccounts() int {
 func New(t testing.TB) *Fake {
 	t.Helper()
 	f := &Fake{orgs: map[string]*organization{}, accounts: map[string]map[string]*Account{},
-		tenantSecrets: map[string]string{}, env: map[string]string{}, billing: map[string]*kbTenant{},
+		tenantSecrets: map[string]string{}, tenantIDs: map[string]string{}, env: map[string]string{}, billing: map[string]*kbTenant{},
 		nodes: []killbill.NodeInfo{{NodeName: "fake-node-1", KBVersion: "0.24.22", PluginsInfo: []killbill.PluginInfo{
 			{PluginName: "org.kill-bill.billing.killbill-platform-osgi-bundles-kpm", State: "RUNNING"}}}}}
 	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
@@ -207,6 +277,19 @@ func (f *Fake) Keycloak(t testing.TB) *keycloak.Client {
 func (f *Fake) KillBill(t testing.TB) *killbill.Client {
 	t.Helper()
 	kb, err := killbill.New(killbill.Config{URL: f.server.URL + "/kb", AdminUser: "admin", AdminPassword: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kb
+}
+
+// KillBillThrough returns a client of the fake Kill Bill whose HTTP transport
+// is wrap of the default one, so a test can answer some requests itself and
+// pass the others to the fake.
+func (f *Fake) KillBillThrough(t testing.TB, wrap func(http.RoundTripper) http.RoundTripper) *killbill.Client {
+	t.Helper()
+	kb, err := killbill.New(killbill.Config{URL: f.server.URL + "/kb", AdminUser: "admin", AdminPassword: "pw",
+		HTTPClient: &http.Client{Transport: wrap(http.DefaultTransport)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,6 +395,20 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		path := strings.TrimPrefix(r.URL.Path, "/kb")
+		if r.Method == http.MethodPost && path == "/1.0/kb/usages" {
+			if f.usageBodies == nil {
+				f.usageBodies = map[string][][]byte{}
+			}
+			key := r.Header.Get(killbill.HeaderAPIKey)
+			f.usageBodies[key] = append(f.usageBodies[key], append([]byte(nil), body...))
+		}
+		if r.Method == http.MethodDelete && strings.HasPrefix(path, "/1.0/kb/subscriptions/") {
+			if f.cancelRequests == nil {
+				f.cancelRequests = map[string][]CancelRequest{}
+			}
+			key := r.Header.Get(killbill.HeaderAPIKey)
+			f.cancelRequests[key] = append(f.cancelRequests[key], CancelRequest{Path: path, Query: cloneValues(r.URL.Query()), Header: r.Header.Clone()})
+		}
 		for prefix, fl := range f.fail {
 			if fl.n > 0 && r.Method != http.MethodGet && strings.HasPrefix(path, prefix) {
 				f.fail[prefix] = failure{n: fl.n - 1, status: fl.status}
@@ -330,7 +427,19 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 				lost = true
 			}
 		}
-		if lost {
+		dropped := false
+		for prefix, n := range f.drop {
+			if n > 0 && r.Method != http.MethodGet && strings.HasPrefix(path, prefix) {
+				f.drop[prefix] = n - 1
+				dropped = true
+			}
+		}
+		if dropped {
+			f.serveKillBill(httptest.NewRecorder(), r, path, body)
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		} else if lost {
 			f.serveKillBill(httptest.NewRecorder(), r, path, body)
 			http.Error(w, "answer lost", http.StatusServiceUnavailable)
 		} else {
@@ -450,13 +559,38 @@ func (f *Fake) serveOrganization(w http.ResponseWriter, r *http.Request, o *orga
 	}
 }
 
+// serveTenantLookup answers GET /1.0/kb/tenants?apiKey= with the admin
+// credentials. Kill Bill 0.24.22 answers an unknown API key with HTTP 500 and
+// a message that names the tenant cache, not 404.
+func (f *Fake) serveTenantLookup(w http.ResponseWriter, r *http.Request) {
+	user, pass, ok := r.BasicAuth()
+	if !ok || user != "admin" || pass != "pw" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	apiKey := r.URL.Query().Get("apiKey")
+	id, found := f.tenantIDs[apiKey]
+	if !found {
+		reply(w, http.StatusInternalServerError, map[string]string{"message": "TenantCacheLoader cannot find value for key " + apiKey})
+		return
+	}
+	reply(w, http.StatusOK, killbill.Tenant{TenantID: id, ExternalKey: apiKey, APIKey: apiKey})
+}
+
 func (f *Fake) serveKillBill(w http.ResponseWriter, r *http.Request, path string, body []byte) {
+	if r.Method == http.MethodGet {
+		f.reads = append(f.reads, path)
+	}
 	if r.Method != http.MethodGet {
 		f.requests = append(f.requests, KillBillWrite{Method: r.Method, Path: path, APIKey: r.Header.Get(killbill.HeaderAPIKey),
 			CreatedBy: r.Header.Get(killbill.HeaderCreatedBy), Reason: r.Header.Get(killbill.HeaderReason), Comment: r.Header.Get(killbill.HeaderComment)})
 	}
 	if path == "/1.0/kb/nodesInfo" {
 		f.serveNodes(w, r, body)
+		return
+	}
+	if path == "/1.0/kb/tenants" && r.Method == http.MethodGet {
+		f.serveTenantLookup(w, r)
 		return
 	}
 	apiKey := r.Header.Get(killbill.HeaderAPIKey)
@@ -562,13 +696,15 @@ func (f *Fake) InsertBrand(t testing.TB, pool *pgxpool.Pool, slug string, permis
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(context.Background(), `INSERT INTO brands (id, slug, name, keycloak_realm, killbill_api_key,
+	// The fake uses the brand UUID as its stable Kill Bill tenant identity.
+	if _, err := pool.Exec(context.Background(), `INSERT INTO brands (id, slug, name, keycloak_realm, killbill_tenant_id, killbill_api_key,
     killbill_api_secret_ref, manifest, manifest_digest, applied_at)
-VALUES ($1, $2, $2, $2, $2, $3, $4, $5, now())`, b.ID, slug, ref, manifest, m.Digest()); err != nil {
+VALUES ($1, $2, $2, $2, $1, $2, $3, $4, $5, now())`, b.ID, slug, ref, manifest, m.Digest()); err != nil {
 		t.Fatal(err)
 	}
 	f.AddKillBillTenant(slug, "kb-secret-"+slug)
 	f.mu.Lock()
+	f.tenantIDs[slug] = b.ID.String()
 	f.env[strings.TrimPrefix(ref, "env://")] = "kb-secret-" + slug
 	f.mu.Unlock()
 	return b
@@ -580,6 +716,9 @@ func (f *Fake) AddKillBillTenant(apiKey, secret string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tenantSecrets[apiKey] = secret
+	if f.tenantIDs[apiKey] == "" {
+		f.tenantIDs[apiKey] = idgen.MustNewV7().String()
+	}
 	if f.accounts[apiKey] == nil {
 		f.accounts[apiKey] = map[string]*Account{}
 	}

@@ -42,11 +42,11 @@ func TestCancelVerdict(t *testing.T) {
 		want     string
 	}{
 		"still active, nothing said":   {active, false, false, nil, ""},
-		"still active after a refusal": {active, true, false, nil, "conflict"},
-		"not found":                    {active, false, true, nil, "conflict"},
-		"cancelled for a later day":    {cancelled, false, false, nil, "conflict"},
+		"still active after a refusal": {active, true, false, nil, "closure_cancel_review"},
+		"not found":                    {active, false, true, nil, "closure_cancel_review"},
+		"cancelled for a later day":    {cancelled, false, false, nil, "closure_cancel_review"},
 		"a failed cancel":              {active, false, false, boom, "internal_error"},
-		"a refusal wins over an error": {active, true, false, boom, "conflict"},
+		"a refusal wins over an error": {active, true, false, boom, "closure_cancel_review"},
 	} {
 		err := cancelVerdict(tc.receipt, tc.refused, tc.notFound, tc.err)
 		got := ""

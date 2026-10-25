@@ -449,3 +449,46 @@ func TestClosureCompletesAfterStaffConfirmUnconfirmedUsage(t *testing.T) {
 		t.Fatalf("after the confirmation tenant %q settlement %q, want closed and completed", status, settlement)
 	}
 }
+
+// forceReason gives a rollup an unconfirmed reason the guard of the table would
+// only give it in the case that makes it true, by turning the guard off for the
+// one statement, as a fixture.
+func (e *env) forceReason(sc scope.Scope, reason string) {
+	e.t.Helper()
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`ALTER TABLE usage_rollups DISABLE TRIGGER usage_rollups_possible_send_immutable`,
+		`UPDATE usage_rollups SET closure_unresolved_reason = '` + reason + `', last_error = '` + reason + `' WHERE tenant_id = '` + sc.Tenant.String() + `'`,
+		`ALTER TABLE usage_rollups ENABLE ALWAYS TRIGGER usage_rollups_possible_send_immutable`,
+	} {
+		if _, err := e.db.Pool.Exec(ctx, stmt); err != nil {
+			e.t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+}
+
+// A send that started and is marked as unconfirmed because of a mixed cutoff is
+// handled like the other unconfirmed sends: it does not hold the drain, it blocks
+// completion, and staff can resolve it. No pending started rollup is left
+// without a way out.
+func TestMixedCutoffUnconfirmedSendHasAResolutionPath(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	b := e.brand("zs-resolve-mixed")
+	rollup, sc, account := unconfirmedRollup(t, e, b, "Mixed Co")
+	e.forceReason(sc, "mixed_cutoff_send_unconfirmed")
+	e.closing(tenant.Tenant{BrandID: sc.Brand, ID: sc.Tenant})
+	if done, err := e.svc.Drained(ctx, sc); err != nil || !done {
+		t.Fatalf("drained with a mixed cutoff send = %v %v, want true", done, err)
+	}
+	if blocked := count(t, e.db, `SELECT count(*) FROM (SELECT tenant_closure_review_blocker($1, $2) AS b) q WHERE b IS NOT NULL`, sc.Brand, sc.Tenant); blocked != 1 {
+		t.Fatal("completion is not blocked by a mixed cutoff send nobody resolved")
+	}
+	e.fake.InvoiceUsage(b.Slug, account, e.clock.Now().AddDate(0, 0, -2), e.clock.Now().AddDate(0, 0, 2))
+	if _, _, err := e.svc.ResolveUnconfirmedRollup(ctx, sc, staffCall, rollup, metering.ResolveDecisionForwarded); err != nil {
+		t.Fatalf("resolve = %v", err)
+	}
+	if blocked := count(t, e.db, `SELECT count(*) FROM (SELECT tenant_closure_review_blocker($1, $2) AS b) q WHERE b IS NOT NULL`, sc.Brand, sc.Tenant); blocked != 0 {
+		t.Fatal("completion is still blocked after the resolution")
+	}
+}

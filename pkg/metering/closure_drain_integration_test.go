@@ -194,3 +194,32 @@ func TestSweeperClosesATenantAfterDrainingItsUsage(t *testing.T) {
 		t.Fatal("the Kill Bill account was closed")
 	}
 }
+
+// One call of Drained does a bounded amount of work. When the events are more
+// than its rounds roll up, it says the tenant is not drained and the next call
+// goes on; with enough rounds it says drained.
+func TestDrainedIsBoundedByItsRounds(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	b := e.brand("zs-drain-rounds")
+	tn := e.tenant(b, "Drain Rounds")
+	e.subscribe(b, tn, enginetest.PlanMetered)
+	for i := 0; i < 5; i++ {
+		if _, _, err := e.record(tn.Scope(), metering.Event{Meter: "api-calls", EventID: "round-" + string(rune('a'+i)), QuantityMicro: 1_000_000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.closing(tn)
+	restore := metering.SetDrainLimitsForTest(2, 1)
+	t.Cleanup(restore)
+	if done, err := e.svc.Drained(ctx, tn.Scope()); err != nil || done {
+		t.Fatalf("drained after one round of two events out of five = %v %v, want false", done, err)
+	}
+	if n := count(t, e.db, `SELECT count(*) FROM usage_events WHERE tenant_id = $1 AND rollup_id IS NULL`, tn.ID); n != 3 {
+		t.Fatalf("unrolled events after one round = %d, want 3", n)
+	}
+	metering.SetDrainLimitsForTest(2, 3)
+	if done, err := e.svc.Drained(ctx, tn.Scope()); err != nil || !done {
+		t.Fatalf("drained with three rounds = %v %v, want true", done, err)
+	}
+}

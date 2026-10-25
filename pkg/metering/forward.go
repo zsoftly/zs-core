@@ -26,11 +26,13 @@ import (
 // ForwarderActor is the audit actor of the forwarder.
 var ForwarderActor = events.Actor{Type: events.ActorSystem}
 
+// rollupBatch is the most events one rollup pass of a tenant reads. With
+// MaxQuantityMicro per event, their sum fits an int64. It is a variable only so
+// that a test can make it small.
+var rollupBatch = 5000
+
 // Forwarding limits.
 const (
-	// rollupBatch is the most events one rollup pass of a tenant reads.
-	// With MaxQuantityMicro per event, their sum fits an int64.
-	rollupBatch = 5000
 	// sendBatch is the most rollups one pass claims at a time. A claim is
 	// the durable record that a send may follow and an expired claim is
 	// never taken over, so a pass claims one rollup and sends it before it

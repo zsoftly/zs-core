@@ -6,8 +6,9 @@ import (
 	"github.com/zsoftly/zs-core/pkg/scope"
 )
 
-// maxDrainRounds bounds how many batches of events one Drained call rolls up.
-const maxDrainRounds = 50
+// maxDrainRounds bounds how many batches of events one Drained call rolls up. It
+// is a variable only so that a test can make it small.
+var maxDrainRounds = 50
 
 // Drained is what a closure asks before it invoices: it rolls up the tenant's
 // events and sends every rollup that is due to Kill Bill, and it answers true
@@ -46,7 +47,7 @@ func (s *Service) Drained(ctx context.Context, sc scope.Scope) (bool, error) {
 	if err := s.DB.QueryRow(ctx, `SELECT
     EXISTS (SELECT 1 FROM usage_events WHERE brand_id = $1 AND tenant_id = $2 AND acceptance_protocol = 1 AND rollup_id IS NULL AND reservation_id IS NULL)
  OR EXISTS (SELECT 1 FROM usage_rollups u WHERE u.brand_id = $1 AND u.tenant_id = $2 AND u.send_protocol = 1 AND u.status IN ('pending', 'rejected')
-    AND NOT (u.status = 'pending' AND u.send_started_at IS NOT NULL AND u.closure_unresolved_reason IN ('usage_send_unconfirmed', 'usage_duplicate_unconfirmed', 'usage_transport_unconfirmed'))
+    AND NOT (u.status = 'pending' AND u.send_started_at IS NOT NULL AND u.closure_unresolved_reason IN ('usage_send_unconfirmed', 'usage_duplicate_unconfirmed', 'usage_transport_unconfirmed', 'mixed_cutoff_send_unconfirmed'))
     AND NOT EXISTS (SELECT 1 FROM usage_rollup_resolutions x WHERE x.rollup_id = u.id))
  OR EXISTS (SELECT 1 FROM reservations WHERE brand_id = $1 AND tenant_id = $2 AND status = 'held')`, args...).Scan(&left); err != nil {
 		return false, unavailable(err)

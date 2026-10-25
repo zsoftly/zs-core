@@ -92,6 +92,7 @@ Clients branch on `code`. `message` is safe to show. It never carries database, 
 | ZS-1610 | `tenant_closed` | 409 | no |
 | ZS-1611 | `tenant_busy` | 409 | yes |
 | ZS-1612 | `tenant_closing` | 409 | no |
+| ZS-1613 | `closure_cancel_review` | 409 | no |
 | ZS-1700 | `api_key_invalid` | 401 | no |
 | ZS-1701 | `api_key_owner_removed` | 401 | no |
 | ZS-1800 | `billing_rejected` | 422 | no |

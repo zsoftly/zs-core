@@ -54,9 +54,10 @@ func cancelVerdict(receipt killbill.CancelReceipt, refused, notFound bool, first
 }
 
 // errClosureCancelReview says a subscription cannot be cancelled by the
-// closure and needs a person.
+// closure and needs a person. It has a code of its own, so that the last error
+// of the settlement says so.
 func errClosureCancelReview() error {
-	return zserrors.New(zserrors.CodeConflict, "A subscription of the closing tenant cannot be cancelled without a person.")
+	return zserrors.New(zserrors.CodeClosureCancelReview, "")
 }
 
 func cancellableState(state string) bool {

@@ -29,7 +29,7 @@ A step that waits is looked at again after five minutes. A step that fails backs
 
 **Drain.** `metering.Service.Drained` rolls up the tenant's events and sends every due rollup to Kill Bill. It answers true when no protocol 1 event is unrolled, no protocol 1 rollup is pending, claimed or rejected, and no reservation is held. A send that started and whose outcome Kill Bill never confirmed does not hold the drain, because nothing more will ever be sent for it and no invoice shows its tracking ID before the cancel bills it. It gates completion instead. A claim that never started a send does hold the drain. Usage accepted before dispatch protocol 1 is read-only and never rolled up, and goes to the closure review.
 
-**Cancel.** The drain goes first so that the usage is in the repair invoice that the cancel produces. The sweep cancels each subscription that does not satisfy `CancelledOn`, base subscriptions first, which take their add-ons with them. A cancel is never repeated blindly. A lost answer is settled by the read that follows. A cancel that did not take effect is an error, and the next pass reads first. A cancel Kill Bill refused because of the subscription's state, a subscription that is gone, and one cancelled for a day after today all end as a `conflict` that needs a person.
+**Cancel.** The drain goes first so that the usage is in the repair invoice that the cancel produces. The sweep cancels each subscription that does not satisfy `CancelledOn`, base subscriptions first, which take their add-ons with them. A cancel is never repeated blindly. A lost answer is settled by the read that follows. A cancel that did not take effect is an error, and the next pass reads first. A cancel Kill Bill refused because of the subscription's state, a subscription that is gone, and one cancelled for a day after today all end as `closure_cancel_review`, a `409` that needs a person.
 
 **Finance.** `RunClosureInvoice` records the invoice intent once, in an immutable attempt, and checks the live Kill Bill tenant against the one stored for the brand. A dry run that answers nothing to invoice is the outcome `no_invoice`. Otherwise it triggers one invoice and reads the account to find it. A trigger whose outcome is unknown is `post_unknown` and is never posted again: it goes to manual review.
 
@@ -66,9 +66,14 @@ The rules fire in every session replication role. A restore or a logical replica
 
 - An invoice trigger with nothing to invoice answers a bare HTML 404 page. A dry run answers 204.
 - A cancel with the IMMEDIATE policy answers 204. A repeat answers 500 with code 1031. Cancelling a base subscription cancels its add-ons.
-- A subscription of another Kill Bill tenant answers 500 to a cancel.
+- A subscription of another Kill Bill tenant answers 500 on the read, and Core does not send the cancel.
 - A cancel by requested date needs `useRequestedDateForBilling=true`.
-- A tracking ID appears on an invoice only once the usage is billed, at the period end or at the cancel.
+- A tracking ID appears on an invoice only once the usage is billed, at the period end or at the cancel, and only when the invoice is read with its components (`includeInvoiceComponents=true`). The plain list leaves it out.
+- The first record wins for a tracking ID. A repeat with another amount answers 400 or 500 and records nothing.
+- The invoice of a cancel appears about 3.5 seconds after the cancel, and a dry run in that window shows it as pending. An invoice trigger generates it at once, which is why the finance step gates a `not_billed` decision.
+- A `BLOCKED` subscription still accepts usage, with 201, and cancels, with 204.
+- A period under a billing block is never billed, even after billing reopens.
+- The blocking-state POST takes one JSON object.
 - Kill Bill accepts and bills usage on a cancelled subscription on the next invoice run.
 - Usage dated on the day a subscription was both created and cancelled falls in a window of zero length and is never billed, measured on an account in the default timezone.
 - A blocking state that leaves billing open keeps the final invoice collectible.
@@ -81,6 +86,7 @@ The rules fire in every session replication role. A restore or a logical replica
 - A real-stack test of the closure on Kill Bill is written by the integrations owner.
 - A `not_billed` decision relies on an invoice dated on or after the cancellation day, in UTC, and Kill Bill makes the invoice of a cancel a little after the cancel, which is why it also needs the finance step to be done. An account in another timezone can differ by a day.
 - The closure never calls the Kill Bill account close, so the account of a closed tenant stays blocked for ever.
+- The match of the `subscriptionId` of a `REPAIR_ADJ` item with the subscription of the rollup, which the `not_billed` decision uses, is not yet verified on a real stack. The match of a `USAGE` item is.
 
 ## Where the code is
 

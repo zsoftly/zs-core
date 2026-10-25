@@ -43,7 +43,7 @@ var (
 	errCarried        = zserrors.New(zserrors.CodeConflict, "A committed invoice carries the tracking ID of this rollup: confirm it as forwarded.")
 	// confirmableReasons are the reasons of a send that started: the usage may
 	// be in Kill Bill. A claim that never started sent nothing.
-	confirmableReasons = []string{"usage_send_unconfirmed", "usage_duplicate_unconfirmed", "usage_transport_unconfirmed"}
+	confirmableReasons = []string{"usage_send_unconfirmed", "usage_duplicate_unconfirmed", "usage_transport_unconfirmed", "mixed_cutoff_send_unconfirmed"}
 )
 
 type rollupState struct {
@@ -167,6 +167,8 @@ func (s *Service) ResolveUnconfirmedRollup(ctx context.Context, sc scope.Scope, 
 		}
 		if st.cancelDay != "" && len(in.InvoiceDate) >= 10 && in.InvoiceDate[:10] >= st.cancelDay {
 			for _, item := range in.Items {
+				// The USAGE item of the subscription is verified on a real stack. The
+				// subscriptionId of a REPAIR_ADJ item is not yet.
 				if (item.ItemType == "REPAIR_ADJ" || item.ItemType == "USAGE") && st.subscription != "" && item.SubscriptionID == st.subscription {
 					later = true
 				}

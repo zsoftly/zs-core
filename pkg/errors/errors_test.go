@@ -91,6 +91,7 @@ func TestStatusMapping(t *testing.T) {
 		CodeIdempotencyResultTooLarge: http.StatusInternalServerError,
 		CodeTenantBusy:                http.StatusConflict,
 		CodeTenantClosing:             http.StatusConflict,
+		CodeClosureCancelReview:       http.StatusConflict,
 	}
 	for code, want := range cases {
 		status, env := ToEnvelope(New(code, ""))

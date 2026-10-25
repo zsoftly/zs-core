@@ -145,6 +145,7 @@ Built-in permissions: `tenant:read`, `tenant:update`, `tenant:transfer`, `member
 | ZS-1610 | `tenant_closed` | 409 |
 | ZS-1611 | `tenant_busy` | 409 |
 | ZS-1612 | `tenant_closing` | 409 |
+| ZS-1613 | `closure_cancel_review` | 409 |
 | ZS-1700 | `api_key_invalid` | 401 |
 | ZS-1701 | `api_key_owner_removed` | 401 |
 

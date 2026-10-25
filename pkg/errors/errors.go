@@ -93,6 +93,7 @@ const (
 	CodeTenantClosed            Code = "ZS-1610"
 	CodeTenantBusy              Code = "ZS-1611"
 	CodeTenantClosing           Code = "ZS-1612"
+	CodeClosureCancelReview     Code = "ZS-1613"
 
 	CodeAPIKeyInvalid      Code = "ZS-1700"
 	CodeAPIKeyOwnerRemoved Code = "ZS-1701"
@@ -174,6 +175,7 @@ var definitions = []Definition{
 	{CodeTenantClosed, "tenant_closed", http.StatusConflict, false, "The tenant is closed. Closing is final."},
 	{CodeTenantBusy, "tenant_busy", http.StatusConflict, true, "Another change to this tenant is in progress. Retry."},
 	{CodeTenantClosing, "tenant_closing", http.StatusConflict, false, "The tenant is closing, and its closure settles it."},
+	{CodeClosureCancelReview, "closure_cancel_review", http.StatusConflict, false, "A subscription of the closing tenant cannot be cancelled without a person."},
 	{CodeAPIKeyInvalid, "api_key_invalid", http.StatusUnauthorized, false, "The API key is invalid, expired or revoked."},
 	{CodeAPIKeyOwnerRemoved, "api_key_owner_removed", http.StatusUnauthorized, false, "The member who created this API key is no longer active."},
 	{CodeBillingRejected, "billing_rejected", http.StatusUnprocessableEntity, false, "The billing engine rejected the request."},

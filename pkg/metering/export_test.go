@@ -67,3 +67,11 @@ func NewTenantIDs() tenantIDs { return tenantIDs{} }
 func (c tenantIDs) Get(ctx context.Context, acct *billing.TenantAccount) (string, error) {
 	return c.get(ctx, acct)
 }
+
+// SetDrainLimitsForTest makes a call of Drained roll up at most batch events a
+// round for at most rounds rounds, and returns what puts the limits back.
+func SetDrainLimitsForTest(batch, rounds int) func() {
+	oldBatch, oldRounds := rollupBatch, maxDrainRounds
+	rollupBatch, maxDrainRounds = batch, rounds
+	return func() { rollupBatch, maxDrainRounds = oldBatch, oldRounds }
+}

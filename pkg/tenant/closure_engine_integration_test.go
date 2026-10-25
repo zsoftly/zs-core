@@ -344,14 +344,14 @@ func TestEnginePrepareSendsARefusedCancelThatChangedNothingToAPerson(t *testing.
 	})
 	steps := tenant.EngineClosureSteps{Engines: engines, Drain: &fakeDrain{done: true}, Today: func() string { return enginetest.CancelDay }}
 	got, err := steps.Prepare(ctx, e.db.Pool, tn.Scope())
-	if code(err) != "conflict" || got.Cancelled || refused == 0 {
-		t.Fatalf("prepare = %+v %v, refused cancels %d, want the manual-review conflict", got, err, refused)
+	if code(err) != "closure_cancel_review" || got.Cancelled || refused == 0 {
+		t.Fatalf("prepare = %+v %v, refused cancels %d, want the closure_cancel_review answer", got, err, refused)
 	}
 	if sub, err := e.fake.KillBill(t).Subscription(ctx, engineCreds(e), base); err != nil || sub.State == "CANCELLED" {
 		t.Fatalf("the subscription is %+v %v, want it left as it was", sub, err)
 	}
 	// It is the same answer on the next call: the closure does not wait quietly.
-	if _, err := steps.Prepare(ctx, e.db.Pool, tn.Scope()); code(err) != "conflict" {
-		t.Fatalf("second prepare = %v, want conflict again", err)
+	if _, err := steps.Prepare(ctx, e.db.Pool, tn.Scope()); code(err) != "closure_cancel_review" {
+		t.Fatalf("second prepare = %v, want closure_cancel_review again", err)
 	}
 }

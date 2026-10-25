@@ -84,4 +84,4 @@ The rules fire in every session replication role. A restore or a logical replica
 
 ## Where the code is
 
-`pkg/tenant/closure_start.go`, `closure_sweep.go`, `closure_engine.go`, `closure_run.go`, `closure_state.go`, `closure_review.go`, `lifecycle.go` and `lifecycle_guard.go`. `pkg/metering/closure_drain.go` and `rollup_resolution.go`. `internal/doctor/closures.go`. The migrations are 22 to 37 for the settlement, and 35 and 37 for the rollup resolutions.
+`pkg/tenant/closure_start.go`, `closure_sweep.go`, `closure_engine.go`, `closure_run.go`, `closure_state.go`, `closure_review.go`, `lifecycle.go` and `lifecycle_guard.go`. `pkg/metering/closure_drain.go` and `rollup_resolution.go`. `internal/doctor/closures.go`. The migrations are 22 to 38, and 35, 37 and 38 are the ones for the rollup resolutions.

@@ -1126,10 +1126,14 @@ func TestLifecycleSweepBusyChildKeepsTheGlobalLock(t *testing.T) {
 	if err != nil || got || child != nil {
 		t.Fatalf("busy child = %v %v %v, want it skipped", child, got, err)
 	}
-	if contender, got, err := tenant.AcquireLifecycleSweep(ctx, db.Pool); err != nil || got || contender != nil {
+	// The checks that follow run under a short deadline, so a parent that was
+	// let go by the busy child fails here with a message and does not hang.
+	quick, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if contender, got, err := tenant.AcquireLifecycleSweep(quick, db.Pool); err != nil || got || contender != nil {
 		t.Fatalf("another sweep took the global lock while a child was busy: %v %v %v", contender, got, err)
 	}
-	if err := parent.QueryRow(ctx, `SELECT 1`).Scan(new(int)); err != nil {
+	if err := parent.QueryRow(quick, `SELECT 1`).Scan(new(int)); err != nil {
 		t.Fatalf("the parent is not usable after a busy child: %v", err)
 	}
 	if err := holder.Release(); err != nil {

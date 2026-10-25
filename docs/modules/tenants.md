@@ -18,7 +18,7 @@ A tenant is a personal or organization account inside one brand. The contract is
 | `billing_admin` | `billing:*` only. |
 | `member` | Nothing. A member has what its teams grant. |
 
-A tenant is `active`, `suspended` or `closed`. A membership is `active`, `suspended` or `removed`. Only an active membership in an active tenant writes. A suspended tenant keeps its reads. Closed is terminal.
+A tenant is `active`, `suspended`, `closing` or `closed`, where `closing` is a closure in progress. A membership is `active`, `suspended` or `removed`. Only an active membership in an active tenant writes. A suspended tenant keeps its reads. Closed is terminal.
 
 A suspended tenant still makes the writes that only give back what it holds. It may settle, release and extend its reservations, and release its quota leases, so the work it already runs can finish and pay. It never reserves, grows a reservation, consumes a quota or records usage over HTTP. See [wallet.md](wallet.md#reservations) and [quotas.md](quotas.md#leases).
 

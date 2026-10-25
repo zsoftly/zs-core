@@ -6,13 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,6 +44,8 @@ import (
 type invoiceCalls struct {
 	t    *testing.T
 	next http.RoundTripper
+	// triggerNotFound counts the invoice triggers Kill Bill answered with 404.
+	triggerNotFound *atomic.Int64
 }
 
 func (l invoiceCalls) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -50,6 +55,9 @@ func (l invoiceCalls) RoundTrip(r *http.Request) (*http.Response, error) {
 		status := 0
 		if resp != nil {
 			status = resp.StatusCode
+		}
+		if status == http.StatusNotFound && r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/1.0/kb/invoices") {
+			l.triggerNotFound.Add(1)
 		}
 		l.t.Logf("%s %s -> %d %v (%s) at %s", r.Method, r.URL.Path, status, err, time.Since(start).Round(time.Millisecond), start.UTC().Format("15:04:05.000"))
 	}
@@ -71,6 +79,8 @@ type closureStack struct {
 	// from and to bound the days Kill Bill's usage is read over.
 	from, to time.Time
 	today    time.Time
+	// triggerNotFound counts the invoice triggers Kill Bill answered with 404.
+	triggerNotFound *atomic.Int64
 }
 
 func newClosureStack(t *testing.T) closureStack {
@@ -83,8 +93,9 @@ func newClosureStack(t *testing.T) closureStack {
 	meter := &metering.Service{DB: db.Pool, Billing: svc}
 	wal := &wallet.Service{DB: db.Pool, Billing: svc, Metering: meter}
 	quo := &quota.Service{DB: db.Pool, Billing: svc}
+	var notFound atomic.Int64
 	logged, err := killbill.New(killbill.Config{URL: os.Getenv("ZS_TEST_KILLBILL_URL"), AdminUser: "admin", AdminPassword: os.Getenv("ZS_TEST_KILLBILL_ADMIN_PASSWORD"),
-		HTTPClient: &http.Client{Transport: invoiceCalls{t, http.DefaultTransport}}})
+		HTTPClient: &http.Client{Transport: invoiceCalls{t, http.DefaultTransport, &notFound}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +150,7 @@ func newClosureStack(t *testing.T) closureStack {
 		}
 	}
 	today := time.Now().UTC().Truncate(24 * time.Hour)
-	c := closureStack{s: s, db: db, engines: engines, tenant: tn, creds: creds, subID: subID, from: today.AddDate(0, 0, -1), to: today.AddDate(0, 0, 2), today: today}
+	c := closureStack{s: s, db: db, engines: engines, tenant: tn, creds: creds, subID: subID, from: today.AddDate(0, 0, -1), to: today.AddDate(0, 0, 2), today: today, triggerNotFound: &notFound}
 	if got := kbUsage(t, creds, subID, c.from, c.to); got != 0 {
 		t.Fatalf("Kill Bill holds %d micro-units before the closure", got)
 	}
@@ -161,10 +172,10 @@ func (c closureStack) start(t *testing.T) {
 // the cancel. The sweeper moves from the cancel to the finance step in one
 // pass, so its dry run and its trigger come within about a second of the
 // cancel, and when Kill Bill's own invoice lands between them the trigger
-// answers a bare 404, which the finance step records as an unknown outcome for
-// manual review (seen in about one run in four on the stack). These tests do
-// the cancel first and let Kill Bill invoice it, so that they test the closure
-// and not that race.
+// answers a bare 404. The finance step settles that: see
+// TestClosureFinancesRightAfterTheCancelOnTheStack. The tests that use settle
+// do the cancel first and let Kill Bill invoice it, so that they stay
+// deterministic and do not depend on that race.
 const settle = 8 * time.Second
 
 // cancelFirst runs the cancelling step, with its drain, until it reports the
@@ -472,4 +483,92 @@ func TestClosureWithALostUsageAnswerOnTheStack(t *testing.T) {
 	if got := kbUsage(t, c.creds, c.subID, c.from, c.to); got != 6_000_000 {
 		t.Fatalf("Kill Bill holds %d micro-units after the closure, want 6000000: nothing was sent again", got)
 	}
+}
+
+// outcomes lists the kinds of the closure invoice outcomes, in order.
+func (c closureStack) outcomes(t *testing.T) []string {
+	t.Helper()
+	rows, err := c.db.Pool.Query(context.Background(), `SELECT o.kind FROM tenant_closure_invoice_outcomes o JOIN tenant_closure_invoice_attempts a ON a.id = o.attempt_id WHERE a.tenant_id = $1 ORDER BY o.id`, c.tenant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var kinds []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			t.Fatal(err)
+		}
+		kinds = append(kinds, k)
+	}
+	return kinds
+}
+
+// The finance step runs right after the cancel, with no wait for Kill Bill's
+// invoice of the cancel, and closes the tenant. Kill Bill makes that invoice
+// about three and a half seconds after the cancel, so the dry run and the
+// trigger of the finance step either both come before it, or the invoice lands
+// between them and the trigger answers a bare 404. In both cases the closure
+// completes without a person: the invoice that carries the usage is found,
+// recorded and read back strictly, and the usage is billed once. It is looped
+// because the race is a matter of a second; ZS_TEST_CLOSURE_LOOPS sets how
+// many closures run, six by default, and the log says in how many the trigger
+// answered 404.
+func TestClosureFinancesRightAfterTheCancelOnTheStack(t *testing.T) {
+	loops := 6
+	if v := os.Getenv("ZS_TEST_CLOSURE_LOOPS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			t.Fatalf("ZS_TEST_CLOSURE_LOOPS = %q, want a positive number", v)
+		}
+		loops = n
+	}
+	notFound := 0
+	for i := range loops {
+		t.Run(fmt.Sprintf("closure-%d", i), func(t *testing.T) {
+			c := newClosureStack(t)
+			meter := &metering.Service{DB: c.db.Pool, Billing: &billing.Service{DB: c.db.Pool, KillBill: c.s.kb, Secrets: secrets.Default{}}}
+			steps := tenant.EngineClosureSteps{Engines: c.engines, Drain: meter}
+			c.start(t)
+			if !c.sweep(t, steps, 15) {
+				c.stuck(t)
+			}
+			kinds := c.outcomes(t)
+			for _, k := range kinds {
+				if k == "post_unknown" || k == "read_mismatch" {
+					t.Fatalf("the finance step needs a person: outcomes %v", kinds)
+				}
+			}
+			// Either the dry run came before the invoice of the cancel and the
+			// trigger made or found it, or the invoice was there first and the dry
+			// run found nothing left to invoice.
+			if !slices.Equal(kinds, []string{"started", "invoice_id", "evidenced"}) && !slices.Equal(kinds, []string{"no_invoice"}) {
+				t.Fatalf("outcomes = %v, want started, invoice_id, evidenced or only no_invoice", kinds)
+			}
+			var tracking string
+			if err := c.db.Pool.QueryRow(context.Background(), `SELECT tracking_id FROM usage_rollups WHERE tenant_id = $1`, c.tenant.ID).Scan(&tracking); err != nil {
+				t.Fatal(err)
+			}
+			carrying, usageMinor := 0, int64(0)
+			for _, in := range c.invoices(t) {
+				if slices.Contains(in.TrackingIDs, tracking) {
+					carrying++
+				}
+				for _, item := range in.Items {
+					if item.ItemType == "USAGE" && item.SubscriptionID == c.subID {
+						v, err := billing.ToMinor(item.Amount, in.Currency)
+						if err != nil {
+							t.Fatal(err)
+						}
+						usageMinor += v
+					}
+				}
+			}
+			if carrying != 1 || usageMinor != 6 {
+				t.Fatalf("%d invoices carry the tracking ID and bill %d minor units of usage, want 1 and 6: %s", carrying, usageMinor, mustJSON(c.invoices(t)))
+			}
+			notFound += int(c.triggerNotFound.Load())
+		})
+	}
+	t.Logf("the invoice trigger answered 404 in %d of %d closures", notFound, loops)
 }
